@@ -1,0 +1,6 @@
+# Weights are per-problem adjustable but must be fixed across workflows for a given problem.
+novelty: 0.25
+step_complexity_product: 0.25
+generalizability: 0.20
+lean_compilability: 0.20
+elementary_compliance: 0.10

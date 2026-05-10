@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Lean / Lake
+.lake/
+build/
+lake-packages/
+lakefile.olean
+*.olean
+*.ilean
+*.c
+*.o
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary experiment logs
+tmp/
+temp/
+logs/
+*.log
+*.tmp
+experiments/tmp/
+run_outputs/tmp/

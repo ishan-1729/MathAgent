@@ -1,0 +1,9 @@
+[project]
+name = "mathagent"
+version = "0.1.0"
+description = "Repository skeleton for agentic discovery of elementary Diophantine proofs."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.mathagent]
+status = "skeleton"
