@@ -9,3 +9,5 @@ Method files bias agents by exposing reusable transformations, trigger patterns,
 Examples are separated from target problems. Examples can show solved method usage; problem folders should usually contain only statements and allowed context to reduce contamination during evaluation.
 
 Lean verification matters because informal proof sketches can hide gaps. Even partial formalization records where the argument first stops being mechanically checkable.
+
+The `papers/` folder collects systems literature on Lean agents, proof-search infrastructure, refinement loops, evolutionary search, and automated research workflows. Its role is architectural: it helps MathAgent design coherent workflow configurations and evaluation protocols. It should not be loaded as default mathematical proof context for target problems.

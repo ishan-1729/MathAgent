@@ -11,3 +11,7 @@ wf/vierzahlensatz-first/x2-plus-1-y3
 ```
 
 Keep prompt exposure, loaded methods, and loaded library identities explicit in each run record.
+
+When a workflow is inspired by systems in `papers/`, record the paper or software configuration explicitly. A useful workflow configuration should say which components are being permuted, for example planner, prover, verifier, retrieval layer, refinement loop, evaluator, or Lean interface.
+
+Do not compare paper-inspired workflows unless they are run on the same fixed problem with the same allowed mathematical context and metric weights.

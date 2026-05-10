@@ -1,0 +1,239 @@
+\begin{thebibliography}{46}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Baba et~al.(2025)Baba, Liu, Kurita, and Sannai]{baba2025prover}
+Kaito Baba, Chaoran Liu, Shuhei Kurita, and Akiyoshi Sannai.
+\newblock Prover agent: An agent-based framework for formal mathematical proofs.
+\newblock \emph{arXiv preprint arXiv:2506.19923}, 2025.
+
+\bibitem[Bouzenia et~al.(2024)Bouzenia, Devanbu, and Pradel]{bouzenia2024repairagent}
+Islem Bouzenia, Premkumar Devanbu, and Michael Pradel.
+\newblock Repairagent: An autonomous, llm-based agent for program repair.
+\newblock \emph{arXiv preprint arXiv:2403.17134}, 2024.
+
+\bibitem[Cao et~al.(2025)Cao, Song, Li, Le, Zhang, Xue, and Yang]{cao2025reviving}
+Chenrui Cao, Liangcheng Song, Zenan Li, Xinyi Le, Xian Zhang, Hui Xue, and Fan Yang.
+\newblock Reviving dsp for advanced theorem proving in the era of reasoning models.
+\newblock \emph{arXiv preprint arXiv:2506.11487}, 2025.
+
+\bibitem[Chen et~al.(2025)Chen, Gu, Huang, Huang, Jiang, Jie, Jin, Jin, Li, Ma, Ren, Shen, Shi, Sun, Sun, Wang, Wang, Wang, Wei, Wei, Wu, Wu, Xia, Xin, Yang, Ying, Yuan, Yuan, Zhan, Zhang, Zhang, Zhang, Zhao, Zhao, Zhou, and Zhu]{chen2025seedproverdeepbroadreasoning}
+Luoxin Chen, Jinming Gu, Liankai Huang, Wenhao Huang, Zhicheng Jiang, Allan Jie, Xiaoran Jin, Xing Jin, Chenggang Li, Kaijing Ma, Cheng Ren, Jiawei Shen, Wenlei Shi, Tong Sun, He~Sun, Jiahui Wang, Siran Wang, Zhihong Wang, Chenrui Wei, Shufa Wei, Yonghui Wu, Yuchen Wu, Yihang Xia, Huajian Xin, Fan Yang, Huaiyuan Ying, Hongyi Yuan, Zheng Yuan, Tianyang Zhan, Chi Zhang, Yue Zhang, Ge~Zhang, Tianyun Zhao, Jianqiu Zhao, Yichi Zhou, and Thomas~Hanwen Zhu.
+\newblock Seed-prover: Deep and broad reasoning for automated theorem proving, 2025.
+\newblock URL \url{https://arxiv.org/abs/2507.23726}.
+
+\bibitem[Chen et~al.(2024)Chen, Lin, Sch{\"a}rli, and Zhou]{chen2024teaching}
+Xinyun Chen, Maxwell Lin, Nathanael Sch{\"a}rli, and Denny Zhou.
+\newblock Teaching large language models to self-debug.
+\newblock In \emph{The Twelfth International Conference on Learning Representations}, 2024.
+
+\bibitem[Chervonyi et~al.(2025)Chervonyi, Trinh, Ol{\v{s}}{\'a}k, Yang, Nguyen, Menegali, Jung, Verma, Le, and Luong]{chervonyi2025gold}
+Yuri Chervonyi, Trieu~H Trinh, Miroslav Ol{\v{s}}{\'a}k, Xiaomeng Yang, Hoang Nguyen, Marcelo Menegali, Junehyuk Jung, Vikas Verma, Quoc~V Le, and Thang Luong.
+\newblock Gold-medalist performance in solving olympiad geometry with {AlphaGeometry2}.
+\newblock \emph{arXiv preprint arXiv:2502.03544}, 2025.
+
+\bibitem[Comanici et~al.(2025)Comanici, Bieber, Schaekermann, Pasupat, Sachdeva, Dhillon, Blistein, Ram, Zhang, Rosen, et~al.]{comanici2025gemini}
+Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat, Noveen Sachdeva, Inderjit Dhillon, Marcel Blistein, Ori Ram, Dan Zhang, Evan Rosen, et~al.
+\newblock Gemini 2.5: Pushing the frontier with advanced reasoning, multimodality, long context, and next generation agentic capabilities.
+\newblock \emph{arXiv preprint arXiv:2507.06261}, 2025.
+
+\bibitem[Dang et~al.(2025)Dang, Baek, Kolter, and Raghunathan]{dang2025assessing}
+Xingyu Dang, Christina Baek, J~Zico Kolter, and Aditi Raghunathan.
+\newblock Assessing diversity collapse in reasoning.
+\newblock In \emph{Scaling Self-Improving Foundation Models without Human Supervision}, 2025.
+
+\bibitem[De~Moura et~al.(2015)De~Moura, Kong, Avigad, Van~Doorn, and von Raumer]{de2015lean}
+Leonardo De~Moura, Soonho Kong, Jeremy Avigad, Floris Van~Doorn, and Jakob von Raumer.
+\newblock The lean theorem prover (system description).
+\newblock In \emph{Automated Deduction-CADE-25: 25th International Conference on Automated Deduction, Berlin, Germany, August 1-7, 2015, Proceedings 25}, pp.\  378--388. Springer, 2015.
+
+\bibitem[Dong \& Ma(2025)Dong and Ma]{dong2025stp}
+Kefan Dong and Tengyu Ma.
+\newblock {STP}: Self-play {LLM} theorem provers with iterative conjecturing and proving.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2025.
+
+\bibitem[First et~al.(2023)First, Rabe, Ringer, and Brun]{first2023baldur}
+Emily First, Markus~N Rabe, Talia Ringer, and Yuriy Brun.
+\newblock {Baldur}: Whole-proof generation and repair with large language models.
+\newblock In \emph{ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering (ESEC/FSE)}, 2023.
+
+\bibitem[Gloeckle et~al.(2024)Gloeckle, Limperg, Synnaeve, and Hayat]{gloeckle2024abel}
+Fabian Gloeckle, Jannis Limperg, Gabriel Synnaeve, and Amaury Hayat.
+\newblock Abel: Sample efficient online reinforcement learning for neural theorem proving.
+\newblock In \emph{The 4th Workshop on Mathematical Reasoning and AI at NeurIPS'24}, 2024.
+
+\bibitem[{Google DeepMind}(2024)]{alphaproof}
+{Google DeepMind}.
+\newblock {AI} achieves silver-medal standard solving international mathematical olympiad problems.
+\newblock \url{https://deepmind.google/discover/blog/ai-solves-imo-problems-at-silver-medal-level/}, 2024.
+
+\bibitem[Guo et~al.(2025)Guo, Yang, Zhang, Song, Zhang, Xu, Zhu, Ma, Wang, Bi, et~al.]{guo2025deepseek}
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma, Peiyi Wang, Xiao Bi, et~al.
+\newblock Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2501.12948}, 2025.
+
+\bibitem[Jaech et~al.(2024)Jaech, Kalai, Lerer, Richardson, El-Kishky, Low, Helyar, Madry, Beutel, Carney, et~al.]{jaech2024openai}
+Aaron Jaech, Adam Kalai, Adam Lerer, Adam Richardson, Ahmed El-Kishky, Aiden Low, Alec Helyar, Aleksander Madry, Alex Beutel, Alex Carney, et~al.
+\newblock Openai o1 system card.
+\newblock \emph{arXiv preprint arXiv:2412.16720}, 2024.
+
+\bibitem[Ji et~al.(2025)Ji, Liu, Wang, Zhang, Yue, Shi, Sun, Zhang, Zhou, and Gai]{ji2025leanabell}
+Xingguang Ji, Yahui Liu, Qi~Wang, Jingyuan Zhang, Yang Yue, Rui Shi, Chenxi Sun, Fuzheng Zhang, Guorui Zhou, and Kun Gai.
+\newblock Leanabell-prover-v2: Verifier-integrated reasoning for formal theorem proving via reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2507.08649}, 2025.
+
+\bibitem[Jiang et~al.(2023)Jiang, Welleck, Zhou, Lacroix, Liu, Li, Jamnik, Lample, and Wu]{jiang2023draft}
+Albert~Qiaochu Jiang, Sean Welleck, Jin~Peng Zhou, Timothee Lacroix, Jiacheng Liu, Wenda Li, Mateja Jamnik, Guillaume Lample, and Yuhuai Wu.
+\newblock Draft, sketch, and prove: Guiding formal theorem provers with informal proofs.
+\newblock In \emph{The Eleventh International Conference on Learning Representations}, 2023.
+
+\bibitem[Li et~al.(2024)Li, Du, Song, Li, Wang, Yang, and Mi]{li2024hunyuanprover}
+Yang Li, Dong Du, Linfeng Song, Chen Li, Weikang Wang, Tao Yang, and Haitao Mi.
+\newblock Hunyuanprover: A scalable data synthesis framework and guided tree search for automated theorem proving.
+\newblock \emph{arXiv preprint arXiv:2412.20735}, 2024.
+
+\bibitem[Lin et~al.(2023{\natexlab{a}})Lin, Lin, Xiong, Diao, Liu, Zhang, Pan, Wang, Hu, Zhang, et~al.]{lin2023mitigating}
+Yong Lin, Hangyu Lin, Wei Xiong, Shizhe Diao, Jianmeng Liu, Jipeng Zhang, Rui Pan, Haoxiang Wang, Wenbin Hu, Hanning Zhang, et~al.
+\newblock Mitigating the alignment tax of rlhf.
+\newblock \emph{arXiv preprint arXiv:2309.06256}, 2023{\natexlab{a}}.
+
+\bibitem[Lin et~al.(2023{\natexlab{b}})Lin, Tan, Hao, Wong, Dong, Zhang, Yang, and Zhang]{lin2023spurious}
+Yong Lin, Lu~Tan, Yifan Hao, Honam Wong, Hanze Dong, Weizhong Zhang, Yujiu Yang, and Tong Zhang.
+\newblock Spurious feature diversification improves out-of-distribution generalization.
+\newblock \emph{arXiv preprint arXiv:2309.17230}, 2023{\natexlab{b}}.
+
+\bibitem[Lin et~al.(2025)Lin, Tang, Lyu, Wu, Lin, Yang, Li, Xia, Chen, Arora, et~al.]{lin2025goedel}
+Yong Lin, Shange Tang, Bohan Lyu, Jiayun Wu, Hongzhou Lin, Kaiyu Yang, Jia Li, Mengzhou Xia, Danqi Chen, Sanjeev Arora, et~al.
+\newblock {Goedel-Prover}: A frontier model for open-source automated theorem proving.
+\newblock \emph{arXiv preprint arXiv:2502.07640}, 2025.
+
+\bibitem[Liu et~al.(2024)Liu, Feng, Xue, Wang, Wu, Lu, Zhao, Deng, Zhang, Ruan, et~al.]{liu2024deepseek}
+Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et~al.
+\newblock Deepseek-v3 technical report.
+\newblock \emph{arXiv preprint arXiv:2412.19437}, 2024.
+
+\bibitem[Liu et~al.(2025)Liu, Chen, Li, Qi, Pang, Du, Lee, and Lin]{liu2025understanding}
+Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee~Sun Lee, and Min Lin.
+\newblock Understanding r1-zero-like training: A critical perspective.
+\newblock \emph{arXiv preprint arXiv:2503.20783}, 2025.
+
+\bibitem[Moura \& Ullrich(2021)Moura and Ullrich]{moura2021lean}
+Leonardo~de Moura and Sebastian Ullrich.
+\newblock The {Lean} 4 theorem prover and programming language.
+\newblock In \emph{International Conference on Automated Deduction (CADE)}, 2021.
+
+\bibitem[Olausson et~al.(2024)Olausson, Inala, Wang, Gao, and Solar-Lezama]{olausson2024is}
+Theo~X. Olausson, Jeevana~Priya Inala, Chenglong Wang, Jianfeng Gao, and Armando Solar-Lezama.
+\newblock Is self-repair a silver bullet for code generation?
+\newblock In \emph{The Twelfth International Conference on Learning Representations}, 2024.
+
+\bibitem[Peng et~al.(2024)Peng, Quesnelle, Fan, and Shippole]{peng2024yarn}
+Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole.
+\newblock Ya{RN}: Efficient context window extension of large language models.
+\newblock In \emph{The Twelfth International Conference on Learning Representations}, 2024.
+\newblock URL \url{https://openreview.net/forum?id=wHBfxhZu1u}.
+
+\bibitem[Petrov et~al.(2025)Petrov, Dekoninck, Baltadzhiev, Drencheva, Minchev, Balunovi{\'c}, Jovanovi{\'c}, and Vechev]{petrov2025proof}
+Ivo Petrov, Jasper Dekoninck, Lyuben Baltadzhiev, Maria Drencheva, Kristian Minchev, Mislav Balunovi{\'c}, Nikola Jovanovi{\'c}, and Martin Vechev.
+\newblock Proof or bluff? evaluating llms on 2025 usa math olympiad.
+\newblock \emph{arXiv preprint arXiv:2503.21934}, 2025.
+
+\bibitem[Ren et~al.(2025)Ren, Shao, Song, Xin, Wang, Zhao, Zhang, Fu, Zhu, Yang, et~al.]{ren2025deepseek}
+ZZ~Ren, Zhihong Shao, Junxiao Song, Huajian Xin, Haocheng Wang, Wanjia Zhao, Liyue Zhang, Zhe Fu, Qihao Zhu, Dejian Yang, et~al.
+\newblock Deepseek-prover-v2: Advancing formal mathematical reasoning via reinforcement learning for subgoal decomposition.
+\newblock \emph{arXiv preprint arXiv:2504.21801}, 2025.
+
+\bibitem[Shao et~al.(2024)Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu, et~al.]{shao2024deepseekmath}
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, YK~Li, Y~Wu, et~al.
+\newblock Deepseekmath: Pushing the limits of mathematical reasoning in open language models.
+\newblock \emph{arXiv preprint arXiv:2402.03300}, 2024.
+
+\bibitem[Sheng et~al.(2024)Sheng, Zhang, Ye, Wu, Zhang, Zhang, Peng, Lin, and Wu]{sheng2024hybridflow}
+Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu, Wang Zhang, Ru~Zhang, Yanghua Peng, Haibin Lin, and Chuan Wu.
+\newblock Hybridflow: A flexible and efficient rlhf framework.
+\newblock \emph{arXiv preprint arXiv: 2409.19256}, 2024.
+
+\bibitem[Shinn et~al.(2023)Shinn, Cassano, Gopinath, Narasimhan, and Yao]{shinn2023reflexion}
+Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik~R Narasimhan, and Shunyu Yao.
+\newblock Reflexion: language agents with verbal reinforcement learning.
+\newblock In \emph{Thirty-seventh Conference on Neural Information Processing Systems}, 2023.
+
+\bibitem[Trinh et~al.(2024)Trinh, Wu, Le, He, and Luong]{trinh2024solving}
+Trieu~H Trinh, Yuhuai Wu, Quoc~V Le, He~He, and Thang Luong.
+\newblock Solving olympiad geometry without human demonstrations.
+\newblock \emph{Nature}, 625\penalty0 (7995):\penalty0 476--482, 2024.
+
+\bibitem[Tsoukalas et~al.(2024)Tsoukalas, Lee, Jennings, Xin, Ding, Jennings, Thakur, and Chaudhuri]{tsoukalas2024putnambench}
+George Tsoukalas, Jasper Lee, John Jennings, Jimmy Xin, Michelle Ding, Michael Jennings, Amitayush Thakur, and Swarat Chaudhuri.
+\newblock Putnambench: Evaluating neural theorem-provers on the putnam mathematical competition.
+\newblock \emph{arXiv preprint arXiv:2407.11214}, 2024.
+
+\bibitem[Wang et~al.(2025)Wang, Unsal, Lin, Baksys, Liu, Santos, Sung, Vinyes, Ying, Zhu, et~al.]{wang2025kimina}
+Haiming Wang, Mert Unsal, Xiaohan Lin, Mantas Baksys, Junqi Liu, Marco~Dos Santos, Flood Sung, Marina Vinyes, Zhenzhe Ying, Zekai Zhu, et~al.
+\newblock Kimina-prover preview: Towards large formal reasoning models with reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2504.11354}, 2025.
+
+\bibitem[Wortsman et~al.(2022{\natexlab{a}})Wortsman, Ilharco, Gadre, Roelofs, Gontijo-Lopes, Morcos, Namkoong, Farhadi, Carmon, Kornblith, et~al.]{wortsman2022model}
+Mitchell Wortsman, Gabriel Ilharco, Samir~Ya Gadre, Rebecca Roelofs, Raphael Gontijo-Lopes, Ari~S Morcos, Hongseok Namkoong, Ali Farhadi, Yair Carmon, Simon Kornblith, et~al.
+\newblock Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time.
+\newblock In \emph{International conference on machine learning}, pp.\  23965--23998. PMLR, 2022{\natexlab{a}}.
+
+\bibitem[Wortsman et~al.(2022{\natexlab{b}})Wortsman, Ilharco, Kim, Li, Kornblith, Roelofs, Lopes, Hajishirzi, Farhadi, Namkoong, et~al.]{wortsman2022robust}
+Mitchell Wortsman, Gabriel Ilharco, Jong~Wook Kim, Mike Li, Simon Kornblith, Rebecca Roelofs, Raphael~Gontijo Lopes, Hannaneh Hajishirzi, Ali Farhadi, Hongseok Namkoong, et~al.
+\newblock Robust fine-tuning of zero-shot models.
+\newblock In \emph{Proceedings of the IEEE/CVF conference on computer vision and pattern recognition}, pp.\  7959--7971, 2022{\natexlab{b}}.
+
+\bibitem[Wu et~al.(2024)Wu, Huang, Zhou, Ying, Wang, Lin, and Chen]{wu2024internlm2}
+Zijian Wu, Suozhi Huang, Zhejian Zhou, Huaiyuan Ying, Jiayu Wang, Dahua Lin, and Kai Chen.
+\newblock {InternLM2.5-StepProver}: Advancing automated theorem proving via expert iteration on large-scale lean problems.
+\newblock \emph{arXiv preprint arXiv:2410.15700}, 2024.
+
+\bibitem[Xin et~al.(2024{\natexlab{a}})Xin, Guo, Shao, Ren, Zhu, Liu, Ruan, Li, and Liang]{xin2024deepseek}
+Huajian Xin, Daya Guo, Zhihong Shao, Zhizhou Ren, Qihao Zhu, Bo~Liu, Chong Ruan, Wenda Li, and Xiaodan Liang.
+\newblock Deepseek-prover: Advancing theorem proving in llms through large-scale synthetic data.
+\newblock \emph{arXiv preprint arXiv:2405.14333}, 2024{\natexlab{a}}.
+
+\bibitem[Xin et~al.(2024{\natexlab{b}})Xin, Ren, Song, Shao, Zhao, Wang, Liu, Zhang, Lu, Du, et~al.]{xin2024deepseekv15}
+Huajian Xin, ZZ~Ren, Junxiao Song, Zhihong Shao, Wanjia Zhao, Haocheng Wang, Bo~Liu, Liyue Zhang, Xuan Lu, Qiushi Du, et~al.
+\newblock Deepseek-prover-v1. 5: Harnessing proof assistant feedback for reinforcement learning and monte-carlo tree search.
+\newblock \emph{arXiv preprint arXiv:2408.08152}, 2024{\natexlab{b}}.
+
+\bibitem[Xin et~al.(2025)Xin, Xi, Yang, Chen, Wu, Xiao, Sun, Zheng, and Ding]{xin2025bfs}
+Ran Xin, Chenguang Xi, Jie Yang, Feng Chen, Hang Wu, Xia Xiao, Yifan Sun, Shen Zheng, and Ming Ding.
+\newblock {BFS}-prover: Scalable best-first tree search for {LLM}-based automatic theorem proving.
+\newblock In \emph{Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics}, 2025.
+
+\bibitem[Yang et~al.(2024)Yang, Swope, Gu, Chalamala, Song, Yu, Godil, Prenger, and Anandkumar]{yang2024leandojo}
+Kaiyu Yang, Aidan Swope, Alex Gu, Rahul Chalamala, Peiyang Song, Shixing Yu, Saad Godil, Ryan~J Prenger, and Animashree Anandkumar.
+\newblock Leandojo: Theorem proving with retrieval-augmented language models.
+\newblock \emph{Advances in Neural Information Processing Systems}, 36, 2024.
+
+\bibitem[Yao et~al.(2023)Yao, Yu, Zhao, Shafran, Griffiths, Cao, and Narasimhan]{yao2023tree}
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Thomas~L. Griffiths, Yuan Cao, and Karthik~R Narasimhan.
+\newblock Tree of thoughts: Deliberate problem solving with large language models.
+\newblock In \emph{Thirty-seventh Conference on Neural Information Processing Systems}, 2023.
+
+\bibitem[Yu et~al.(2025)Yu, Zhang, Zhu, Yuan, Zuo, Yue, Dai, Fan, Liu, Liu, et~al.]{yu2025dapo}
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu~Yue, Weinan Dai, Tiantian Fan, Gaohong Liu, Lingjun Liu, et~al.
+\newblock Dapo: An open-source llm reinforcement learning system at scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
+
+\bibitem[Yue et~al.(2025)Yue, Chen, Lu, Zhao, Wang, Song, and Huang]{yue2025does}
+Yang Yue, Zhiqi Chen, Rui Lu, Andrew Zhao, Zhaokai Wang, Shiji Song, and Gao Huang.
+\newblock Does reinforcement learning really incentivize reasoning capacity in llms beyond the base model?
+\newblock \emph{arXiv preprint arXiv:2504.13837}, 2025.
+
+\bibitem[Zheng et~al.(2021)Zheng, Han, and Polu]{zheng2021minif2f}
+Kunhao Zheng, Jesse~Michael Han, and Stanislas Polu.
+\newblock Minif2f: a cross-system benchmark for formal olympiad-level mathematics.
+\newblock \emph{arXiv preprint arXiv:2109.00110}, 2021.
+
+\bibitem[Zhou et~al.(2025)Zhou, Zhao, Zhang, Wang, Wang, Chen, Wang, Chen, Jie, Zhang, et~al.]{zhou2025solving}
+Yichi Zhou, Jianqiu Zhao, Yongxin Zhang, Bohan Wang, Siran Wang, Luoxin Chen, Jiahui Wang, Haowei Chen, Allan Jie, Xinbo Zhang, et~al.
+\newblock Solving formal math problems by decomposition and iterative reflection.
+\newblock \emph{arXiv preprint arXiv:2507.15225}, 2025.
+
+\end{thebibliography}

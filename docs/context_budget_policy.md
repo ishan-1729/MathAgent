@@ -9,3 +9,5 @@ Avoid storing trivial algebraic facts already known to models, such as completin
 Keep high-impact identities in `library/`. They should be small enough to load often and important enough to change a search path.
 
 Place unfiltered Kieren notes in `library/untriaged_tagebuch/` first. Promote an item to the main library only after it has a clear trigger pattern, status, and reason to be useful.
+
+Use `papers/` selectively. Do not dump full paper notes into a proof-attempt prompt. Extract compact workflow implications, such as "use Lean feedback after each lemma" or "compare search branches with a fixed evaluator," and record the source in the workflow or run record.
