@@ -1,12 +1,13 @@
 # INDEX
 
-This index summarizes the current contents of `D:\Projects\Math\MathAgent\Papers`. It covers both finished Markdown dossiers and folders that currently contain only source artifacts.
+This index summarizes the current contents of `D:\Projects\Math\MathAgent\papers`. It covers both finished Markdown dossiers and folders that currently contain only source artifacts.
 
 ## Comparison table
 
 | Tool | Type | Lean-native? | Primary role | Main mechanism / design | Public surface |
 | --- | --- | --- | --- | --- | --- |
 | AlphaEvolve (+ `OpenEvolve.md`) | paper / white-paper style note + companion repo dossier | No | Autonomous scientific and algorithmic discovery | AlphaEvolve gives the research framing; OpenEvolve gives a public implementation surface around evaluator-driven evolutionary code search | white paper + companion repo note |
+| AlphaProof Nexus (`AlphaProof_Nexus`) | paper + system note | Yes | AI-driven formal proof search for research-level mathematics | LLM prover agents refine Lean sketches under compiler feedback, optionally call AlphaProof on generated subgoals, and use an evolutionary population/rating layer for search coordination | paper source + Markdown dossier |
 | Aristotle | product + paper hybrid | Partly Lean-centered | Informal-to-formal theorem proving system | Generates informal lemmas or subgoals, formalizes them, and uses Lean-based proving in an iterative loop | paper + product / company material |
 | AutoReason (`AutoReason`) | paper / method note | No | Structured iterative self-refinement | Three-way tournament between incumbent, adversarial revision, and synthesis, judged by fresh agents with Borda aggregation and stop conditions | paper-style note + repo link |
 | AutoResearch | repo / method dossier | No | Autonomous research workflow scaffold | Program-driven experiment loop for iterative prompting, coding, evaluation, and logging | GitHub repo / README |
@@ -35,6 +36,7 @@ This index summarizes the current contents of `D:\Projects\Math\MathAgent\Papers
 
 ### Lean theorem-proving systems and training stacks
 
+- **AlphaProof Nexus (`AlphaProof_Nexus`)** focuses on research-level Lean proof discovery rather than benchmark-only proving. It combines repo-style proof sketches, LLM editing loops, Lean validation, optional AlphaProof calls for subgoals, and an evolutionary sketch/rating database.
 - **BFS-Prover-V2 (`BFSProverV2`)** is a current-generation step prover focused on scaling both training-time RL and inference-time search. Its distinctive move is to pair off-policy expert iteration with a planner-enhanced multi-agent prover architecture.
 - **GoedelProverV2** focuses on strong whole-proof generation with verifier-guided self-correction, scaffolded statement synthesis, reinforcement learning, and model averaging. Its emphasis is efficiency: strong Lean proving at smaller model scales and lower test-time budgets.
 - **LongCat-Flash-Prover (`LongCatFlashProver`)** emphasizes native formal reasoning as a model capability, splitting the task into auto-formalization, sketching, and proving, then training these capacities with tool-integrated reinforcement learning.
@@ -60,7 +62,7 @@ This index summarizes the current contents of `D:\Projects\Math\MathAgent\Papers
 ## Reading guide
 
 - Read **LeanDojo-v2 (`LeanDojov2`)**, **Pantograph**, **LeanAgent**, **LeanNavigator**, and **LeanProgress** for the strongest coverage of Lean-native training, search, and interface infrastructure.
-- Read **BFS-Prover-V2**, **GoedelProverV2**, and **LongCat-Flash-Prover** for recent open theorem-prover systems that push different combinations of RL, search, self-correction, and tool-integrated reasoning.
+- Read **AlphaProof Nexus**, **BFS-Prover-V2**, **GoedelProverV2**, and **LongCat-Flash-Prover** for recent theorem-prover systems that push different combinations of RL, search, self-correction, tool-integrated reasoning, and Lean-verified agent loops.
 - Read **Leanstral**, **OpenGauss**, and **MathCode** for newer agent-style or repo-oriented workflows built around interactive Lean use.
 - Read **BRIDGE** and **Aristotle** when the focus is the bridge from natural-language or program-synthesis structure into formally verified Lean artifacts.
 - Read **AlphaEvolve** together with **OpenEvolve** when you want both layers: the paper-level framing and the practical open-source implementation surface.
