@@ -76,7 +76,12 @@ def main() -> int:
     retriever = None
     if args.retrieval:
         from agent.tools.retrieval import LoogleRetriever
-        retriever = LoogleRetriever()
+        from agent.tools.semantic_retrieval import SemanticRetriever, HybridRetriever
+        rs = [LoogleRetriever()]                 # Loogle: exact names from compile errors
+        sem = SemanticRetriever()
+        if sem.available():
+            rs.append(sem)                       # BM25: relevance from the claim's meaning words
+        retriever = HybridRetriever(rs) if len(rs) > 1 else rs[0]
 
     if args.direct:
         res = RalphLoop(prover, toolkit=toolkit, budget=budget, trace=trace,

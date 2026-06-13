@@ -67,8 +67,17 @@ so it isn't a dependency.
   silently emitting a `sorryAx`-rejected "compiled" proof), and the loop now **repairs on an audit
   reject** (incomplete/non-elementary), not only on hard compile errors.
 
+## Semantic retrieval (added)
+[`tools/semantic_retrieval.py`](../../agent/tools/semantic_retrieval.py) adds a **local BM25 index over
+the elementary Mathlib source** (Data/Nat, Data/Int, Data/ZMod by default), with namespace-aware
+fully-qualified names and on-disk caching (builds in ~2.5s, cached under `.lake/`). `HybridRetriever`
+combines it with Loogle (Loogle = exact names from compile errors; BM25 = relevance from the claim's
+meaning words). The CLI `--retrieval` now uses the hybrid. BM25 is the standard local lexical-IR
+baseline and the backend is pluggable; **true neural embeddings remain future work** — BM25 is lexical,
+so an abbreviation like `gcd` won't match the phrase "greatest common divisor" (it matches `findGreatest*`).
+
 ## Caveats
 - Repair improves the rate but does not guarantee compilation on hard NT statements; the loop reports
   honest failure with the last Lean error after exhausting the budget.
-- Loogle is name/type-pattern based; semantic NL retrieval (a local embedding index over Mathlib, or a
-  LeanSearch backend if a stable API appears) would help for claims with no obvious identifier overlap.
+- Retrieval is lexical (Loogle name/type patterns + BM25 token overlap); a neural embedding backend
+  would close abbreviation/synonym gaps.
