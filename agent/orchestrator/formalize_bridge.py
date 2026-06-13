@@ -46,6 +46,7 @@ class FormalizeAuditResult:
     audit: Optional[LeanAuditResult] = None
     faithfulness: Optional[FaithfulnessVerdict] = None
     error: Optional[str] = None
+    attempts: int = 1   # formalization attempts used (1 + repair iterations consumed)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -85,31 +86,68 @@ def formalize_and_audit(ledger_text: str, formalizer: Formalizer,
                         timeout_s: int = 600,
                         informal_claim: Optional[str] = None,
                         faithfulness_checker: Optional[FaithfulnessChecker] = None,
-                        server: Optional[object] = None) -> FormalizeAuditResult:
+                        server: Optional[object] = None,
+                        retriever: Optional[object] = None,
+                        repair_iters: int = 0) -> FormalizeAuditResult:
+    """Formalize -> compile+audit, with an optional Lean-error repair loop.
+
+    When `repair_iters > 0`, each failed compile feeds the Lean errors (and, if a `retriever` is given,
+    retrieved real Mathlib lemmas) back to the formalizer for another attempt. Pass a persistent
+    `server` so each compile is ~0.1s instead of a full Mathlib reload.
+    """
     toolkit = toolkit or load_toolkit()
     if project_dir is None and server is None:
         project_dir = lean_bridge.find_mathlib_project()
+    claim = informal_claim if informal_claim is not None else _claim_of(ledger_text)
+
     fr = formalizer.formalize(ledger_text)
     if not fr.ok:
         return FormalizeAuditResult(formalized=False, notes=fr.notes)
+    source, name = fr.lean_source, fr.theorem_name
+    last_error: Optional[str] = None
 
-    try:
-        audit = lean_bridge.audit_lean_source(
-            fr.lean_source, fr.theorem_name, toolkit=toolkit,
-            project_dir=project_dir, timeout_s=timeout_s, server=server)
-    except (lean_bridge.LeanBridgeError, lean_bridge.LeanUnavailable) as e:
-        return FormalizeAuditResult(formalized=True, compiled=False,
-                                    theorem_name=fr.theorem_name, lean_source=fr.lean_source,
-                                    error=str(e))
+    for i in range(repair_iters + 1):
+        attempts = i + 1
+        try:
+            audit = lean_bridge.audit_lean_source(
+                source, name, toolkit=toolkit,
+                project_dir=project_dir, timeout_s=timeout_s, server=server)
+        except lean_bridge.LeanUnavailable as e:
+            return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
+                                        lean_source=source, error=str(e), attempts=attempts)
+        except lean_bridge.LeanBridgeError as e:
+            last_error = str(e)
+            if i >= repair_iters:
+                break
+            lemmas = retriever.retrieve(claim, last_error) if retriever is not None else []
+            fr2 = formalizer.formalize(ledger_text, prior_source=source,
+                                       errors=[last_error], lemmas=lemmas)
+            if not fr2.ok:
+                break
+            source, name = fr2.lean_source, fr2.theorem_name
+            continue
 
-    faith: Optional[FaithfulnessVerdict] = None
-    if faithfulness_checker is not None:
-        claim = informal_claim if informal_claim is not None else _claim_of(ledger_text)
-        faith = faithfulness_checker.check(claim, fr.lean_source, fr.theorem_name)
+        # Compiled. If the audit REJECTED (sorry / non-elementary dependency) and we still have repair
+        # budget, feed the reject reasons back and try for a complete, elementary proof.
+        if not audit.passed and i < repair_iters:
+            last_error = "; ".join(str(f) for f in audit.rejects())
+            lemmas = retriever.retrieve(claim, last_error) if retriever is not None else []
+            fr2 = formalizer.formalize(ledger_text, prior_source=source,
+                                       errors=[last_error], lemmas=lemmas)
+            if fr2.ok:
+                source, name = fr2.lean_source, fr2.theorem_name
+                continue
 
-    return FormalizeAuditResult(formalized=True, compiled=True,
-                                theorem_name=fr.theorem_name, lean_source=fr.lean_source,
-                                audit=audit, faithfulness=faith)
+        # Accepted, or out of repair budget. Check statement faithfulness on the final proof.
+        faith: Optional[FaithfulnessVerdict] = None
+        if faithfulness_checker is not None:
+            faith = faithfulness_checker.check(claim, source, name)
+        return FormalizeAuditResult(formalized=True, compiled=True, theorem_name=name,
+                                    lean_source=source, audit=audit, faithfulness=faith,
+                                    attempts=attempts)
+
+    return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
+                                lean_source=source, error=last_error, attempts=repair_iters + 1)
 
 
 @dataclass
@@ -133,7 +171,9 @@ def full_verify(ledger_text: str, formalizer: Formalizer,
                 project_dir: Optional[str | Path] = None,
                 timeout_s: int = 600,
                 faithfulness_checker: Optional[FaithfulnessChecker] = None,
-                server: Optional[object] = None) -> FullVerifyResult:
+                server: Optional[object] = None,
+                retriever: Optional[object] = None,
+                repair_iters: int = 0) -> FullVerifyResult:
     toolkit = toolkit or load_toolkit()
     gate = evaluate(ledger_text, toolkit)
     if gate.rejected:
@@ -141,7 +181,8 @@ def full_verify(ledger_text: str, formalizer: Formalizer,
     lean = formalize_and_audit(ledger_text, formalizer, toolkit=toolkit,
                                project_dir=project_dir, timeout_s=timeout_s,
                                informal_claim=_claim_of(ledger_text),
-                               faithfulness_checker=faithfulness_checker, server=server)
+                               faithfulness_checker=faithfulness_checker, server=server,
+                               retriever=retriever, repair_iters=repair_iters)
     return FullVerifyResult(gate=gate, lean=lean)
 
 
@@ -149,11 +190,14 @@ def make_terminal_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None
                        faithfulness_checker: Optional[FaithfulnessChecker] = None,
                        project_dir: Optional[str | Path] = None,
                        server: Optional[object] = None,
+                       retriever: Optional[object] = None,
+                       repair_iters: int = 0,
                        timeout_s: int = 600) -> Callable[[str, str], FormalizeAuditResult]:
     """A terminal gate for DagDriver: (root_goal, proof_text) -> FormalizeAuditResult.
 
-    Formalizes the assembled proof, audits it (Layer 4), and checks the statement faithfully captures
-    the root goal. The DagDriver treats the run as authoritatively elementary iff this passes.
+    Formalizes the assembled proof (with an optional Lean-error repair loop + Mathlib retrieval),
+    audits it (Layer 4), and checks the statement faithfully captures the root goal. The DagDriver
+    treats the run as authoritatively elementary iff this passes.
     """
     toolkit = toolkit or load_toolkit()
 
@@ -161,6 +205,7 @@ def make_terminal_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None
         return formalize_and_audit(proof_text, formalizer, toolkit=toolkit,
                                    project_dir=project_dir, timeout_s=timeout_s,
                                    informal_claim=root_goal,
-                                   faithfulness_checker=faithfulness_checker, server=server)
+                                   faithfulness_checker=faithfulness_checker, server=server,
+                                   retriever=retriever, repair_iters=repair_iters)
 
     return gate

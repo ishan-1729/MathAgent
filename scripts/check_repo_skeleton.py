@@ -56,6 +56,7 @@ KEY_FILES = [
     "agent/tools/numeric.py",
     "agent/tools/codex_prover.py",
     "agent/tools/formalizer.py",
+    "agent/tools/retrieval.py",
     "agent/orchestrator/formalize_bridge.py",
     "agent/orchestrator/faithfulness.py",
     "agent/orchestrator/driver.py",

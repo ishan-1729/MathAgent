@@ -110,6 +110,54 @@ def test_formalize_failure_short_circuits():
 
 # ---- full_verify: informal gate + Lean audit ----
 
+def test_repair_loop_recovers(monkeypatch):
+    from agent.gates.lean_bridge import LeanBridgeError
+    from agent.tools.retrieval import ScriptedRetriever
+    calls = {"n": 0}
+
+    def audit(source, name, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LeanBridgeError("error: unknown identifier 'Nat.add_zer'")
+        return _passing_audit()
+
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", audit)
+    formalizer = fz.ScriptedFormalizer(["BAD lean", "GOOD lean"])
+    retriever = ScriptedRetriever(["Nat.add_zero : n + 0 = n"])
+    res = fb.formalize_and_audit(VALID_LEDGER, formalizer, toolkit=TOOLKIT,
+                                 retriever=retriever, repair_iters=2)
+    assert res.compiled and res.elementary_verified
+    assert res.attempts == 2                       # failed once, repaired, succeeded
+    assert formalizer.repair_calls == 1            # one repair invocation
+    assert "unknown identifier" in retriever.calls[0][1]  # the Lean error reached the retriever
+
+
+def test_repair_on_audit_reject(monkeypatch):
+    # A proof can COMPILE but be rejected by the audit (sorry / non-elementary); the loop should
+    # repair on that too, not only on hard compile errors.
+    calls = {"n": 0}
+
+    def audit(source, name, **k):
+        calls["n"] += 1
+        return _rejecting_audit() if calls["n"] == 1 else _passing_audit()
+
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", audit)
+    formalizer = fz.ScriptedFormalizer(["compiles-but-sorry", "elementary-and-complete"])
+    res = fb.formalize_and_audit(VALID_LEDGER, formalizer, toolkit=TOOLKIT, repair_iters=2)
+    assert res.elementary_verified and res.attempts == 2 and formalizer.repair_calls == 1
+
+
+def test_repair_loop_exhausts(monkeypatch):
+    from agent.gates.lean_bridge import LeanBridgeError
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source",
+                        lambda *a, **k: (_ for _ in ()).throw(LeanBridgeError("compile error")))
+    res = fb.formalize_and_audit(VALID_LEDGER, fz.ScriptedFormalizer(["always bad"]),
+                                 toolkit=TOOLKIT, repair_iters=2)
+    assert res.formalized and not res.compiled
+    assert res.attempts == 3                       # initial + 2 repairs
+    assert "compile error" in res.error
+
+
 def test_full_verify_authoritative(monkeypatch):
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
     fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")

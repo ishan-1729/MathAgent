@@ -144,11 +144,14 @@ class LeanServer:
         _imports, body = _split_imports(proof_src)  # Mathlib already in the base env; drop re-imports
         cmd = body.strip() + f"\n#audit {theorem_name}"
         resp = self._command(cmd, timeout_s, env=self.base_env)
+        # A proof with ERROR diagnostics is broken even if Lean error-recovered a declaration (and
+        # thus still emitted a report): treat it as a compile failure so the repair loop engages.
+        if any(m.get("severity") == "error" for m in resp.get("messages", [])):
+            raise LeanBridgeError(f"lean-server: compile error: {response_errors(resp)}")
         rep = report_from_response(resp)
         if rep is not None:
             return rep
-        raise LeanBridgeError(
-            f"lean-server: no audit JSON (proof failed to compile?): {response_errors(resp)}")
+        raise LeanBridgeError(f"lean-server: no audit JSON: {response_errors(resp)}")
 
     def close(self) -> None:
         if self.proc is not None:

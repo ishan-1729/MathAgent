@@ -53,23 +53,47 @@ class CodexFormalizer:
         self.toolkit = toolkit
         self.cfg = cfg or CodexConfig()
 
-    def _prompt(self, ledger_text: str) -> str:
+    _RULES = (
+        "Use ELEMENTARY methods only — the proof is machine-audited and will be REJECTED if it "
+        "transitively depends on class groups, Dedekind domains, number fields, elliptic curves, "
+        "modular forms, cyclotomic theory, Mihailescu/Catalan, or Baker's theorem.\n"
+        "Prefer core/Std and elementary Mathlib lemmas (`Nat`/`Int` arithmetic, `Nat.gcd`, `ZMod`, "
+        "`Int.ModEq`, `omega`, `decide`, `interval_cases`, `Nat.Prime`). If you need Mathlib, put "
+        "`import Mathlib` as the FIRST line. Keep the statement faithful to the informal claim.\n"
+        "No `sorry`, no `admit`, no new `axiom`s, no `unsafe`/`native_decide`.\n"
+    )
+
+    def _fresh_prompt(self, ledger_text: str) -> str:
         return (
             "You are formalizing an ALREADY-VERIFIED elementary number-theory proof into Lean 4.\n"
-            f"Produce a Lean 4 theorem named `{DEFAULT_THEOREM_NAME}` with a COMPLETE, compiling proof: "
-            "no `sorry`, no `admit`, no new `axiom`s, no `unsafe`/`native_decide`.\n"
-            "Use ELEMENTARY methods only — the proof is machine-audited and will be REJECTED if it "
-            "transitively depends on class groups, Dedekind domains, number fields, elliptic curves, "
-            "modular forms, cyclotomic theory, Mihailescu/Catalan, or Baker's theorem.\n"
-            "Prefer core/Std and elementary Mathlib lemmas (`Nat`/`Int` arithmetic, `Nat.gcd`, `ZMod`, "
-            "`Int.ModEq`, `omega`, `decide`, `interval_cases`, `Nat.Prime`). If you need Mathlib, put "
-            "`import Mathlib` as the FIRST line. Keep the statement faithful to the informal claim.\n\n"
-            "Output ONLY one fenced ```lean code block (imports + the theorem). No prose.\n\n"
+            f"Produce a Lean 4 theorem named `{DEFAULT_THEOREM_NAME}` with a COMPLETE, compiling proof.\n"
+            + self._RULES +
+            "\nOutput ONLY one fenced ```lean code block (imports + the theorem). No prose.\n\n"
             f"INFORMAL STEP-LEDGER (a gate-passed elementary proof):\n{ledger_text}\n"
         )
 
-    def formalize(self, ledger_text: str) -> FormalizationResult:
-        raw = _run_codex(self._prompt(ledger_text), self.cfg)
+    def _repair_prompt(self, ledger_text: str, prior_source: str,
+                       errors: list[str], lemmas: Optional[list[str]]) -> str:
+        err = "\n".join(f"- {e}" for e in (errors or [])[:8])
+        lem = ("\nReal Mathlib declarations you may use (retrieved — these EXIST, prefer them over "
+               "guessed names):\n" + "\n".join(f"- {x}" for x in lemmas[:15]) if lemmas else "")
+        return (
+            "Your previous Lean 4 formalization FAILED to compile. Fix it.\n" + self._RULES +
+            f"\nPREVIOUS ATTEMPT:\n```lean\n{prior_source}\n```\n\n"
+            f"LEAN COMPILER ERRORS:\n{err}\n{lem}\n\n"
+            "Return the CORRECTED, complete, compiling theorem. Keep the name and the (faithful) "
+            f"statement; only fix what's broken. Output ONLY one fenced ```lean code block.\n\n"
+            f"INFORMAL STEP-LEDGER (the proof to formalize):\n{ledger_text}\n"
+        )
+
+    def formalize(self, ledger_text: str, prior_source: Optional[str] = None,
+                  errors: Optional[list[str]] = None,
+                  lemmas: Optional[list[str]] = None) -> FormalizationResult:
+        if prior_source:
+            prompt = self._repair_prompt(ledger_text, prior_source, errors or [], lemmas)
+        else:
+            prompt = self._fresh_prompt(ledger_text)
+        raw = _run_codex(prompt, self.cfg)
         src = extract_lean(raw)
         if not src:
             return FormalizationResult(ok=False, raw=raw, notes=["no Lean code block found"])
@@ -78,13 +102,22 @@ class CodexFormalizer:
 
 
 class ScriptedFormalizer:
-    """Returns a fixed Lean source (for tests/offline demos)."""
+    """Returns a fixed Lean source, or a SEQUENCE (one per formalize call) to drive a repair loop."""
 
-    def __init__(self, lean_source: str, theorem_name: str = DEFAULT_THEOREM_NAME, ok: bool = True):
-        self.lean_source = lean_source
+    def __init__(self, lean_source: str | list[str], theorem_name: str = DEFAULT_THEOREM_NAME,
+                 ok: bool = True):
+        self._sources = [lean_source] if isinstance(lean_source, str) else list(lean_source)
         self.theorem_name = theorem_name
         self.ok = ok
+        self.calls = 0
+        self.repair_calls = 0
 
-    def formalize(self, ledger_text: str) -> FormalizationResult:
-        return FormalizationResult(ok=self.ok, lean_source=self.lean_source,
+    def formalize(self, ledger_text: str, prior_source: Optional[str] = None,
+                  errors: Optional[list[str]] = None,
+                  lemmas: Optional[list[str]] = None) -> FormalizationResult:
+        if prior_source:
+            self.repair_calls += 1
+        idx = min(self.calls, len(self._sources) - 1)
+        self.calls += 1
+        return FormalizationResult(ok=self.ok, lean_source=self._sources[idx],
                                    theorem_name=self.theorem_name)

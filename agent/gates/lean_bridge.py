@@ -28,6 +28,9 @@ _SENTINEL = "MATHAGENT_AUDIT_JSON"
 # The report JSON is one line (Json.compress); capture it after the sentinel from either `lean`
 # stdout diagnostics or a REPL message.
 _AUDIT_RE = re.compile(r"MATHAGENT_AUDIT_JSON\s+(\{.*\})")
+# Lean diagnostic format: `file:line:col: error: ...` — distinguishes a real compile error from a
+# (recoverable) warning like "declaration uses 'sorry'" (which the axiom gate catches separately).
+_ERROR_RE = re.compile(r":\s*error:")
 
 
 def extract_report_json(text: str) -> Optional[str]:
@@ -136,9 +139,10 @@ def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300,
         )
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
         report = extract_report_json(combined)
-        if report is not None:
+        # ERROR diagnostics => broken even if Lean error-recovered a declaration and emitted a report.
+        if report is not None and not _ERROR_RE.search(combined):
             return report
-        # No sentinel => the proof did not compile (or the decl was absent); surface diagnostics.
+        # No sentinel, or errors present => the proof did not compile; surface diagnostics.
         tail = combined.strip()[-1200:]
         raise LeanBridgeError(f"no audit JSON emitted (proof failed to compile?):\n{tail}")
     except subprocess.TimeoutExpired as e:

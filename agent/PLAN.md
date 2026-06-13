@@ -159,6 +159,8 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Adversarial faithfulness panel** | Multi-lens adversarial check that the Lean statement faithfully captures the informal claim. | **built + live** ([`orchestrator/faithfulness.py`](orchestrator/faithfulness.py)) | autoformalization-faithfulness wall (Goedel/AlphaProof_Nexus) |
 | **Layer-4 terminal gate (DAG)** | After the DAG proves the root, formalize+audit+faithfulness as the authoritative gate. | **built** (`DagDriver.terminal_gate`, `make_terminal_gate`) | PLAN §5 Layer 4 |
 | **Persistent Lean server** | Keep Mathlib + `#audit` loaded; ~0.1s/audit after a one-time load. | **built + live** ([`gates/lean_server.py`](gates/lean_server.py), community REPL) | LeanDojo/Pantograph |
+| **Autoformalization repair loop** | Feed Lean compile errors / audit rejects back to the formalizer to iterate. | **built + live** (`formalize_and_audit(repair_iters=...)`) | LEAP/Aristotle compiler-feedback |
+| **Mathlib lemma retrieval** | Loogle queries (unknown-identifier + claim keywords) to fix hallucinated lemmas. | **built + live** ([`tools/retrieval.py`](tools/retrieval.py)) | LeanSearch/Loogle, LEAP premise retrieval |
 | **Tools** ([`tools/`](tools/)) | Numeric/witness search, Codex prover, elementary auditor, retrieval, CAS, Lean bridge. | numeric + Codex + Lean built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))
@@ -313,8 +315,14 @@ instance projections. So:
 > (`DagDriver(terminal_gate=...)`), and a **persistent Lean server** (Mathlib loads once: 76s, then
 > ~0.1s/audit — a >500× speedup). See
 > [`research/docs/formalization_bridge.md`](../research/docs/formalization_bridge.md) and
-> [`lean_layer4_and_population.md`](../research/docs/lean_layer4_and_population.md). Remaining: raise
-> autoformalization success on hard NT statements (Lean-error repair loop, lemma retrieval).
+> [`lean_layer4_and_population.md`](../research/docs/lean_layer4_and_population.md).
+> **Also built (autoformalization):** a Lean-error **repair loop** (`repair_iters`) that feeds compile
+> errors / audit rejects back to the formalizer, with **Mathlib lemma retrieval** (Loogle) to fix
+> hallucinated lemma names — see [`autoformalization_repair.md`](../research/docs/autoformalization_repair.md).
+> (A deep dive concluded Codex's `/goal` agentic mode should NOT own the loop: the persistent server's
+> ~0.1s compile beats Codex re-running `lean` at ~60s/iter, and a Python loop keeps control of
+> retrieval/denylist/budget/audit.) Remaining: lift the success rate on hard NT statements
+> (semantic retrieval, proof-skeleton transfer from the ledger).
 
 Note: **Lean/elan/lake run natively on Windows**; the real constraint is that some *harness binaries and
 tracing tooling* (OpenGauss/MathCode) are Linux-only — mine their ideas, don't depend on them.

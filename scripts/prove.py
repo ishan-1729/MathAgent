@@ -42,6 +42,10 @@ def main() -> int:
                     help="run the adversarial statement-faithfulness panel during Layer-4 verification")
     ap.add_argument("--server", action="store_true",
                     help="use the persistent Lean server (loads Mathlib once) for audits")
+    ap.add_argument("--repair", type=int, default=0, metavar="N",
+                    help="autoformalization Lean-error repair iterations (feed compile errors back)")
+    ap.add_argument("--retrieval", action="store_true",
+                    help="retrieve real Mathlib lemmas (Loogle) to guide repair")
     args = ap.parse_args()
 
     if not CodexProver.available():
@@ -69,6 +73,10 @@ def main() -> int:
     if args.faithfulness:
         from agent.tools.codex_prover import CodexFaithfulnessChecker
         faith = CodexFaithfulnessChecker(cfg)
+    retriever = None
+    if args.retrieval:
+        from agent.tools.retrieval import LoogleRetriever
+        retriever = LoogleRetriever()
 
     if args.direct:
         res = RalphLoop(prover, toolkit=toolkit, budget=budget, trace=trace,
@@ -87,7 +95,8 @@ def main() -> int:
             from agent.tools.formalizer import CodexFormalizer
             from agent.orchestrator.formalize_bridge import make_terminal_gate
             terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
-                                               faithfulness_checker=faith, server=server)
+                                               faithfulness_checker=faith, server=server,
+                                               retriever=retriever, repair_iters=args.repair)
         driver = DagDriver(
             prover,
             decomposer=CodexDecomposer(toolkit, cfg),
@@ -113,7 +122,8 @@ def main() -> int:
         from agent.orchestrator.formalize_bridge import formalize_and_audit
         print("\n# Formalizing the ledger to Lean and running the Layer-4 audit...")
         fa = formalize_and_audit(winning_ledger, CodexFormalizer(toolkit, cfg), toolkit=toolkit,
-                                 faithfulness_checker=faith, server=server)
+                                 faithfulness_checker=faith, server=server,
+                                 retriever=retriever, repair_iters=args.repair)
         print("formalize + audit:", fa.summary())
         print("authoritative_elementary:", fa.authoritative)
         if fa.lean_source:
