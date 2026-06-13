@@ -23,6 +23,7 @@ from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.toolkit import Toolkit, load_toolkit
 from agent.orchestrator.dag import ProofDAG, goal_hash, CycleError
 from agent.orchestrator.driver import Prover, Judge
+from agent.orchestrator.population import Comparator, EloPopulation, Candidate
 from agent.orchestrator.ralph import RalphLoop
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.trace import RunTrace
@@ -86,6 +87,9 @@ class DagDriver:
         max_depth: int = 4,
         max_decomp_attempts: int = 2,
         ralph_episodes: int = 3,
+        comparator: Optional[Comparator] = None,
+        population_k: int = 0,
+        population_rounds: int = 1,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -97,6 +101,12 @@ class DagDriver:
         self.max_depth = max_depth
         self.max_decomp_attempts = max_decomp_attempts
         self.ralph_episodes = ralph_episodes
+        # Population/Elo search (AlphaProof_Nexus): when population_k>0 and a comparator is given,
+        # generate K candidate decompositions, rank them by a pairwise-comparison Elo tournament, and
+        # try them best-first instead of in arbitrary order.
+        self.comparator = comparator
+        self.population_k = population_k
+        self.population_rounds = population_rounds
         self.dag = ProofDAG()
 
     def run(self, goal: str) -> DagResult:
@@ -150,68 +160,109 @@ class DagDriver:
 
         feedback = list(res.lessons)
         child_ancestors = ancestors | {key}
-        for _attempt in range(self.max_decomp_attempts):
+
+        if self.population_k and self.comparator is not None:
+            if self._prove_via_population(goal, feedback, child_ancestors, depth):
+                return True
+        else:
+            for _attempt in range(self.max_decomp_attempts):
+                if not self.budget.can_call():
+                    break
+                self.budget.spend_call()
+                sketch, children = self.decomposer.decompose(goal, feedback or None)
+                self.trace.emit("decompose", goal=goal[:80], children=len(children))
+                ok, notes = self._try_decomposition(goal, sketch, children, child_ancestors, depth)
+                if ok:
+                    return True
+                feedback = notes + feedback
+
+        self.dag.mark_failed(goal)
+        return False
+
+    def _try_decomposition(self, goal: str, sketch: str, children: list[str],
+                           child_ancestors: set[str], depth: int) -> tuple[bool, list[str]]:
+        """Validate + commit + recurse one candidate decomposition. Returns (success, feedback)."""
+        if not children:
+            return False, ["decomposition proposed no sub-lemmas"]
+
+        # The sketch's `lemma` steps must exactly match the declared children (honest decomposition).
+        claims = _lemma_claims(sketch)
+        if claims is None:
+            return False, ["decomposition sketch did not parse as a ledger"]
+        if claims != {goal_hash(c) for c in children}:
+            return False, ["sketch `lemma` steps do not match the declared child goals"]
+
+        # LEAP reviewer + elementary judge (before committing).
+        if self.reviewer is not None:
+            if not self.budget.can_call():
+                return False, ["budget exhausted before review"]
+            self.budget.spend_call()
+            review = self.reviewer.review(goal, sketch, children)
+            self.trace.emit("review", goal=goal[:80], useful=review.useful,
+                            elementary=review.elementary)
+            if not review.ok:
+                return False, review.notes
+
+        # Acyclicity guard.
+        if self.dag.would_create_cycle(goal, children, child_ancestors):
+            return False, ["proposed decomposition is cyclic"]
+
+        # The sketch itself must be a valid ledger (children admitted via `lemma` steps).
+        sketch_report = evaluate(sketch, self.toolkit)
+        if sketch_report.rejected:
+            return False, [str(f) for f in sketch_report.rejects()]
+
+        try:
+            self.dag.commit_decomposition(goal, sketch, children, child_ancestors)
+        except CycleError:
+            return False, ["commit detected a cycle"]
+
+        # Recurse on children (DFS).
+        for child_goal in children:
+            if not self._prove(child_goal, child_ancestors, depth + 1):
+                self.trace.emit("backtrack", goal=goal[:80])
+                return False, []
+        self.dag.mark_proven_via_children(goal)
+        self.trace.emit("prove_node", goal=goal[:80], proof_kind="decomposition")
+        return True, []
+
+    def _compare_budget_ok(self) -> bool:
+        """One pairwise comparison costs one model call (checked + spent atomically)."""
+        if self.budget.can_call():
+            self.budget.spend_call()
+            return True
+        return False
+
+    def _prove_via_population(self, goal: str, feedback: list[str],
+                             child_ancestors: set[str], depth: int) -> bool:
+        """Generate K candidate decompositions, rank them by an Elo comparison tournament, and try
+        them best-first (AlphaProof_Nexus population/Elo over incomplete sketches)."""
+        cands: list[Candidate] = []
+        for i in range(self.population_k):
             if not self.budget.can_call():
                 break
             self.budget.spend_call()
             sketch, children = self.decomposer.decompose(goal, feedback or None)
             self.trace.emit("decompose", goal=goal[:80], children=len(children))
+            if children:
+                cands.append(Candidate(id=f"cand{i}", content=sketch, goal=goal, children=children))
+        if not cands:
+            return False
 
-            if not children:
-                feedback = ["decomposition proposed no sub-lemmas"] + feedback
-                continue
+        pop = EloPopulation()
+        for c in cands:
+            pop.add(c)
+        comparisons = pop.tournament(self.comparator, rounds=self.population_rounds,
+                                     budget_ok=self._compare_budget_ok)
+        self.trace.emit("population", goal=goal[:80], candidates=len(cands), comparisons=comparisons)
 
-            # The sketch's `lemma` steps must exactly match the declared children (honest decomposition).
-            claims = _lemma_claims(sketch)
-            if claims is None:
-                feedback = ["decomposition sketch did not parse as a ledger"] + feedback
-                continue
-            if claims != {goal_hash(c) for c in children}:
-                feedback = ["sketch `lemma` steps do not match the declared child goals"] + feedback
-                continue
-
-            # LEAP reviewer + elementary judge (before committing).
-            if self.reviewer is not None:
-                if not self.budget.can_call():
-                    break
-                self.budget.spend_call()
-                review = self.reviewer.review(goal, sketch, children)
-                self.trace.emit("review", goal=goal[:80], useful=review.useful,
-                                elementary=review.elementary)
-                if not review.ok:
-                    feedback = review.notes + feedback
-                    continue
-
-            # Acyclicity guard.
-            if self.dag.would_create_cycle(goal, children, child_ancestors):
-                feedback = ["proposed decomposition is cyclic"] + feedback
-                continue
-
-            # The sketch itself must be a valid ledger (children admitted via `lemma` steps).
-            sketch_report = evaluate(sketch, self.toolkit)
-            if sketch_report.rejected:
-                feedback = [str(f) for f in sketch_report.rejects()] + feedback
-                continue
-
-            try:
-                self.dag.commit_decomposition(goal, sketch, children, child_ancestors)
-            except CycleError:
-                feedback = ["commit detected a cycle"] + feedback
-                continue
-
-            # Recurse on children (DFS).
-            all_ok = True
-            for child_goal in children:
-                if not self._prove(child_goal, child_ancestors, depth + 1):
-                    all_ok = False
-                    break
-            if all_ok:
-                self.dag.mark_proven_via_children(goal)
-                self.trace.emit("prove_node", goal=goal[:80], proof_kind="decomposition")
+        for tried, cand in enumerate(pop.ranking()):
+            if tried >= self.max_decomp_attempts:
+                break
+            ok, _notes = self._try_decomposition(goal, cand.content, cand.children,
+                                                 child_ancestors, depth)
+            if ok:
                 return True
-            self.trace.emit("backtrack", goal=goal[:80])
-
-        self.dag.mark_failed(goal)
         return False
 
 

@@ -1,0 +1,21 @@
+{
+  "theorem": "ma_add_zero",
+  "toolchain": "leanprover/lean4:v4.30.0",
+  "axioms": [],
+  "constants": [
+    {"name": "ma_add_zero", "kind": "theorem"},
+    {"name": "Nat.add_zero", "kind": "theorem"},
+    {"name": "Nat", "kind": "inductive"},
+    {"name": "Nat.zero", "kind": "ctor"},
+    {"name": "Nat.succ", "kind": "ctor"},
+    {"name": "Nat.rec", "kind": "recursor"},
+    {"name": "Nat.add", "kind": "definition"},
+    {"name": "HAdd.hAdd", "kind": "definition"},
+    {"name": "instHAdd", "kind": "definition"},
+    {"name": "Add.add", "kind": "definition"},
+    {"name": "instAddNat", "kind": "definition"},
+    {"name": "OfNat.ofNat", "kind": "definition"},
+    {"name": "instOfNatNat", "kind": "definition"},
+    {"name": "Eq", "kind": "inductive"}
+  ]
+}

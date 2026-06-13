@@ -72,3 +72,25 @@ lean_infrastructure_allowlist:
   - SizeOf
   - instHAdd
   - instHMul
+
+# Heavy-IMPLEMENTATION-but-elementary-RESULT APIs: their *internal* dependency closure is exempt from
+# the content denylist (re-proving them elementarily is too costly for v1). Keep this list small and
+# explicit; it documents the trust boundary (PLAN.md Section 5, Layer 4, item B3).
+lean_elementary_by_fiat:
+  - Nat.gcd
+  - Nat.Coprime
+  - Int.gcd
+  - Nat.Prime
+  - Nat.factorization
+  - legendreSym
+  - jacobiSym
+  - ZMod.legendreSym
+  - Nat.ModEq
+  - Int.ModEq
+
+# The ONLY axioms a sorry-free elementary proof may transitively use. Anything else (notably sorryAx)
+# is a hard reject (PLAN.md Section 5, Layer 4, item 2; kernel `collectAxioms`).
+lean_axiom_whitelist:
+  - propext
+  - Classical.choice
+  - Quot.sound

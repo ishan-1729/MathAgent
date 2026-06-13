@@ -153,8 +153,9 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Decomposition reviewer** | Gate a blueprint on "does it simplify?" + "is it elementary?" before commit. | **built** | LEAP reviewer |
 | **Revision controller** | Incumbent tournament; "do nothing" first-class; failure-analysis *before* revision; k=2 stop. | P2 TODO | Autoreason |
 | **Evaluation cascade** | Cheap structural + numeric checks gate expensive judge/Lean passes. | built (P1) | AlphaEvolve |
-| **Population / Elo over sketches** | Rank incomplete sketches to steer search. | not built (v2 scaling) | AlphaProof_Nexus/AlphaEvolve |
-| **Tools** ([`tools/`](tools/)) | Numeric/witness search, retrieval, elementary auditor, CAS, Lean bridge. | numeric built | Axplorer, MathCode, LeanDojo/Pantograph |
+| **Population / Elo over sketches** | Generate K candidate decompositions, rank by a pairwise-comparison Elo tournament (+ Bradley-Terry MLE, PUCT), try best-first. | **built** ([`population.py`](orchestrator/population.py)) | AlphaProof_Nexus/AlphaEvolve |
+| **Lean Layer-4 auditor** | Proof-term dependency + axiom audit (the authoritative gate). | **built + live-validated** ([`gates/lean_audit.py`](gates/lean_audit.py), [`lean_bridge.py`](gates/lean_bridge.py), [`lean/Audit.lean`](gates/lean/Audit.lean)) | AlphaProof_Nexus SafeVerify, AXLE |
+| **Tools** ([`tools/`](tools/)) | Numeric/witness search, Codex prover, elementary auditor, retrieval, CAS, Lean bridge. | numeric + Codex + Lean built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))
 v1 uses the **bold** two; the rest are added in Phase 2. All are written as separate prompts now.
@@ -242,7 +243,14 @@ and **re-runs the finite case-checks** the ledger claims rather than trusting pr
 false statements/lemmas but gives little assurance for true sparse-solution targets and can miss subtle
 misformalizations — expert statement validation remains mandatory (§8.3).
 
-### Layer 4 — Lean dependency audit (deterministic, **authoritative**; spiked in Phase 1, scaled later)
+### Layer 4 — Lean dependency audit (deterministic, **authoritative**) — ✅ BUILT + LIVE-VALIDATED
+> **Status:** implemented and validated against **Lean 4.30.0**. [`gates/lean/Audit.lean`](gates/lean/Audit.lean)
+> walks a compiled proof's transitive constant closure + `collectAxioms` and emits a JSON report;
+> [`gates/lean_audit.py`](gates/lean_audit.py) (the toolchain-independent decision logic) classifies it;
+> [`gates/lean_bridge.py`](gates/lean_bridge.py) runs the whole pipeline. Confirmed live: `n+0=n`
+> **passes**; a `sorry` proof is **rejected** by the axiom gate (`sorryAx`). The content-denylist path
+> (Mathlib namespaces) is unit-tested with synthetic reports (needs a Mathlib build to trigger live).
+
 The only non-gameable gate. **Design it correctly — a naive transitive-closure / namespace-prefix filter
 over-rejects nearly every elementary proof**, because elementary Mathlib lemmas internally depend on
 `WellFounded.fix`/`Acc.rec`/`Nat.rec`, `Decidable`/`DecidableEq` instances, `SizeOf`, and algebra-hierarchy

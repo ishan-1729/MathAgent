@@ -29,6 +29,7 @@ from typing import Optional
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.orchestrator.dag import goal_hash
 from agent.orchestrator.dag_driver import ReviewVerdict
+from agent.orchestrator.population import Candidate
 
 _ROLE_DIR = Path(__file__).resolve().parents[1] / "roles"
 
@@ -221,3 +222,30 @@ class CodexReviewer:
             elementary=bool(obj.get("elementary", False)),
             notes=list(obj.get("notes", []) or []),
         )
+
+
+class CodexComparator:
+    """Pairwise judge for the population/Elo search: which candidate decomposition is more promising?"""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None):
+        self.cfg = cfg or CodexConfig()
+
+    def compare(self, a: Candidate, b: Candidate) -> int:
+        prompt = (
+            "You are ranking two candidate DECOMPOSITIONS of the same number-theory goal. Pick the one "
+            "more likely to lead to a correct, fully ELEMENTARY proof: prefer sub-lemmas that are "
+            "genuinely easier than the goal, a non-circular split, and standard elementary techniques "
+            "(divisibility, congruence, descent, gcd, bounding). Penalize trivial/circular splits and "
+            "any reliance on heavy machinery.\n\n"
+            f"GOAL:\n{a.goal}\n\n=== CANDIDATE A ===\n{a.content}\n\n=== CANDIDATE B ===\n{b.content}\n\n"
+            'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}'
+        )
+        raw = _run_codex(prompt, self.cfg)
+        m = _VERDICT_RE.search(raw)
+        if not m:
+            return 0
+        try:
+            w = str(json.loads(m.group(0)).get("winner", "tie")).strip().lower()
+        except json.JSONDecodeError:
+            return 0
+        return 1 if w == "a" else (-1 if w == "b" else 0)

@@ -12,6 +12,9 @@ from agent.orchestrator.driver import (
     ScriptedJudge,
 )
 from agent.orchestrator.dag import ProofDAG, OrNode, goal_hash, CycleError
+from agent.orchestrator.population import (
+    Candidate, Comparator, EloPopulation, KeyComparator, ScriptedComparator, fit_bradley_terry,
+)
 from agent.orchestrator.ralph import RalphLoop, RalphResult
 from agent.orchestrator.dag_driver import (
     DagDriver,
@@ -40,6 +43,12 @@ __all__ = [
     "OrNode",
     "goal_hash",
     "CycleError",
+    "Candidate",
+    "Comparator",
+    "EloPopulation",
+    "KeyComparator",
+    "ScriptedComparator",
+    "fit_bradley_terry",
     "RalphLoop",
     "RalphResult",
     "DagDriver",

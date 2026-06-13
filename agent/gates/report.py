@@ -26,6 +26,7 @@ LAYER_STRUCTURE = "1a-structure"   # deterministic typed-ledger validation
 LAYER_SCAN = "1b-scan"             # soft prose denylist router
 LAYER_OBLIGATION = "1a-obligation"  # deterministic obligation presence/shape
 LAYER_NUMERIC = "3-numeric"        # deterministic numeric grounding
+LAYER_LEAN = "4-lean"              # authoritative Lean proof-term dependency / axiom audit
 
 
 @dataclass(frozen=True)

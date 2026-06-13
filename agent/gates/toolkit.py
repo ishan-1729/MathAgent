@@ -40,6 +40,8 @@ class Toolkit:
     allow_context_terms: list[str] = field(default_factory=list)
     lean_denylist_decls: list[str] = field(default_factory=list)
     lean_infrastructure_allowlist: list[str] = field(default_factory=list)
+    lean_elementary_by_fiat: list[str] = field(default_factory=list)
+    lean_axiom_whitelist: list[str] = field(default_factory=list)
 
     # --- queries ---
     def allowed_keys(self) -> set[str]:
@@ -105,4 +107,6 @@ def load_toolkit(
         allow_context_terms=[t.lower() for t in (ddata.get("allow_context_terms") or [])],
         lean_denylist_decls=list(ddata.get("lean_denylist_decls") or []),
         lean_infrastructure_allowlist=list(ddata.get("lean_infrastructure_allowlist") or []),
+        lean_elementary_by_fiat=list(ddata.get("lean_elementary_by_fiat") or []),
+        lean_axiom_whitelist=list(ddata.get("lean_axiom_whitelist") or ["propext", "Classical.choice", "Quot.sound"]),
     )

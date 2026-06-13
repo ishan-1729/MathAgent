@@ -41,6 +41,11 @@ For the v1 (informal-first) plan, the hard gate operates over the informal proof
 **method-ledger** check, with the Lean dependency audit prototyped as the Lean track matures. See
 `../PLAN.md` §5 for the full design, the denylist seed, and the v1-vs-later split.
 
+> **Layer 4 is now built + live-validated (Lean 4.30.0).** `lean/Audit.lean` (extractor),
+> `lean_audit.py` (the decision logic), and `lean_bridge.py` (the runner) implement the proof-term
+> dependency + axiom audit. Confirmed: an elementary core proof passes; a `sorry` proof is rejected
+> via the axiom whitelist. See `../../research/docs/lean_layer4_and_population.md`.
+
 ## Artifacts that live here (as they are built)
 - `denylist.md` / `denylist.yaml` — banned methods, Mathlib namespaces, and lemma families.
 - `allowed_toolkit.md` — the positive elementary toolkit (mirrors `agent/instructions/elementary_proof_rules.md`).
