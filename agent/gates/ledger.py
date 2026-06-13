@@ -105,9 +105,11 @@ def parse_ledger(source: Any) -> Ledger:
     return Ledger(problem=_nfc(obj["problem"]), claim=_nfc(obj["claim"]), steps=steps)
 
 
-def _reachable_from(ledger: Ledger, start_ids: list[str]) -> set[str]:
+def reachable_from(ledger: Ledger, start_ids: list[str]) -> set[str]:
+    """Transitive depends_on closure of start_ids (includes start_ids). Iterative (heap-bounded)."""
+    id_set = {s.id for s in ledger.steps}
     seen: set[str] = set()
-    stack = list(start_ids)
+    stack = [sid for sid in start_ids]
     while stack:
         cur = stack.pop()
         if cur in seen:
@@ -115,44 +117,36 @@ def _reachable_from(ledger: Ledger, start_ids: list[str]) -> set[str]:
         seen.add(cur)
         step = ledger.by_id(cur)
         if step:
-            stack.extend(d for d in step.depends_on if d in {s.id for s in ledger.steps})
+            stack.extend(d for d in step.depends_on if d in id_set)
     return seen
 
 
 def _find_cycle(ledger: Ledger) -> Optional[list[str]]:
-    """Return a cycle (list of ids) in the depends_on graph, or None if acyclic."""
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {s.id: WHITE for s in ledger.steps}
-    parent: dict[str, Optional[str]] = {}
+    """Return the ids participating in a dependency cycle, or None if acyclic.
 
-    def dfs(u: str) -> Optional[list[str]]:
-        color[u] = GRAY
-        step = ledger.by_id(u)
-        for v in (step.depends_on if step else ()):
-            if v not in color:
-                continue  # dangling handled elsewhere
-            if color[v] == WHITE:
-                parent[v] = u
-                cyc = dfs(v)
-                if cyc:
-                    return cyc
-            elif color[v] == GRAY:
-                # reconstruct cycle u -> ... -> v -> u
-                cyc = [v, u]
-                p = parent.get(u)
-                while p is not None and p != v:
-                    cyc.append(p)
-                    p = parent.get(p)
-                return list(reversed(cyc))
-        color[u] = BLACK
+    Iterative Kahn's topological peel (no recursion, so a long acyclic chain cannot blow the stack).
+    A cycle exists iff some node is never peeled; we return those remaining nodes.
+    """
+    id_set = {s.id for s in ledger.steps}
+    adj = {s.id: [d for d in s.depends_on if d in id_set] for s in ledger.steps}
+    indeg = {sid: 0 for sid in adj}
+    for vs in adj.values():
+        for v in vs:
+            indeg[v] += 1
+
+    queue = [n for n, d in indeg.items() if d == 0]
+    removed = 0
+    while queue:
+        u = queue.pop()
+        removed += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                queue.append(v)
+
+    if removed == len(adj):
         return None
-
-    for s in ledger.steps:
-        if color[s.id] == WHITE:
-            cyc = dfs(s.id)
-            if cyc:
-                return cyc
-    return None
+    return sorted(n for n, d in indeg.items() if d > 0)
 
 
 # Obligation kind -> the key expected under step.obligations
@@ -196,7 +190,7 @@ def validate_structure(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
     cycle = _find_cycle(ledger)
     if cycle:
         findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "cycle",
-                                "dependency cycle: " + " -> ".join(cycle)))
+                                "dependency cycle involves steps: " + ", ".join(cycle)))
 
     # 5. exactly one terminal 'conclusion' step
     conclusions = [s for s in ledger.steps if s.justification == "conclusion"]
@@ -207,9 +201,16 @@ def validate_structure(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
         findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "multi_conclusion",
                                 f"ledger has {len(conclusions)} 'conclusion' steps; expected exactly one"))
 
+    # 5b. a lone conclusion that depends on nothing, while other steps exist, "proves itself".
+    if len(conclusions) == 1 and len(ledger.steps) > 1 and not conclusions[0].depends_on:
+        findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "disconnected_conclusion",
+                                "conclusion has empty depends_on while other steps exist "
+                                "(the proof body is disconnected from the conclusion)",
+                                conclusions[0].id))
+
     # 6. orphan steps (not in the conclusion's dependency closure) -> advisory only
     if len(conclusions) == 1 and not cycle:
-        reachable = _reachable_from(ledger, [conclusions[0].id])
+        reachable = reachable_from(ledger, [conclusions[0].id])
         for s in ledger.steps:
             if s.id not in reachable:
                 findings.append(Finding(LAYER_STRUCTURE, Severity.INFO, "orphan_step",

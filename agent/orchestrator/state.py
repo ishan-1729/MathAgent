@@ -64,6 +64,10 @@ class Budget:
         return self.repairs_spent < self.max_repair_iters
 
     def spend_repair(self) -> None:
+        if self.repairs_spent >= self.max_repair_iters:
+            raise BudgetExceeded(
+                f"repair budget exhausted ({self.repairs_spent}/{self.max_repair_iters})"
+            )
         self.repairs_spent += 1
 
     # --- re-plans (Phase 2; tracked now for completeness) ---

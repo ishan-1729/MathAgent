@@ -70,7 +70,7 @@ class RunResult:
 
 def _classify_gate_failure(report: GateReport) -> NodeState:
     codes = {f.code for f in report.rejects()}
-    if "bad_justification" in codes or "denylist_term" in codes:
+    if "bad_justification" in codes:
         return NodeState.FAILED_ELEMENTARY
     return NodeState.FAILED_GAP
 
@@ -129,6 +129,13 @@ class FlatDriver:
                 feedback = [str(f) for f in report.rejects()]
                 continue
 
+            # Admitted by the deterministic gate. A soft NEEDS_REVIEW with no judge to resolve it
+            # must NOT be marked PROVEN — the scanner exists precisely to force that review.
+            if report.verdict is Verdict.NEEDS_REVIEW and not self.judges:
+                state = NodeState.EXHAUSTED
+                self.trace.emit("review_unhandled", reviews=[f.code for f in report.reviews()])
+                break
+
             # Deterministically admitted -> Layer-2 adversarial review.
             verdicts = []
             for judge in self.judges:
@@ -139,6 +146,12 @@ class FlatDriver:
                 verdicts.append(v)
                 self.trace.emit("judge", judge=v.judge, passed=v.passed,
                                 elementary=v.elementary, no_gaps=v.no_gaps)
+
+            # A proof that was not fully reviewed (panel truncated by budget) is not PROVEN.
+            if self.judges and len(verdicts) < len(self.judges):
+                state = NodeState.EXHAUSTED
+                self.trace.emit("budget", reason="judges_truncated", **self.budget.snapshot())
+                break
 
             if self.judges and any(not v.passed for v in verdicts):
                 non_elem = any(not v.elementary for v in verdicts)

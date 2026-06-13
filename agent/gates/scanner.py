@@ -15,8 +15,11 @@ from agent.gates.ledger import Ledger
 from agent.gates.report import Finding, Severity, LAYER_SCAN
 from agent.gates.toolkit import Toolkit
 
-# Justifications whose content is broad enough to hide a non-elementary step.
-ELASTIC_JUSTIFICATIONS = {"bounding", "factorization", "squeeze"}
+# Justifications whose content is broad enough to hide a non-elementary or unsound step.
+# `descent`/`vieta_jumping` are included because PLAN.md flags them as the central NT method and the
+# prime smuggling site: their decrease/domain obligations are partly self-asserted, so any use is
+# routed to adversarial review even when it passes the deterministic obligation checks.
+ELASTIC_JUSTIFICATIONS = {"bounding", "factorization", "squeeze", "descent", "vieta_jumping"}
 
 
 def _texts(ledger: Ledger):

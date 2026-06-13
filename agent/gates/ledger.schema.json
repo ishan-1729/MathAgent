@@ -20,6 +20,7 @@
     "steps": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 2000,
       "items": { "$ref": "#/definitions/step" }
     }
   },
@@ -60,15 +61,15 @@
     },
     "obligations": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "Structured proof obligations a justification must discharge. The required shape depends on the justification's obligation kind (see allowed_toolkit.yaml).",
+      "additionalProperties": false,
+      "description": "Structured proof obligations a justification must discharge. The required shape depends on the justification's obligation kind (see allowed_toolkit.yaml). Unknown obligation keys are rejected.",
       "properties": {
         "case_cover": {
           "type": "object",
           "additionalProperties": false,
           "required": ["modulus", "residues"],
           "properties": {
-            "modulus": { "type": "integer", "minimum": 1 },
+            "modulus": { "type": "integer", "minimum": 2 },
             "residues": {
               "type": "array",
               "items": { "type": "integer" },

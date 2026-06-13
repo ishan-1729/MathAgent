@@ -74,9 +74,17 @@ def evaluate(source, toolkit: Optional[Toolkit] = None) -> GateReport:
         )
 
     findings: list[Finding] = []
-    findings += validate_structure(ledger, toolkit)   # Layer 1a (deterministic)
-    findings += check_obligations(ledger, toolkit)    # Layer 1a/3 (deterministic)
-    findings += scan_prose(ledger, toolkit)           # Layer 1b (soft)
+    try:
+        findings += validate_structure(ledger, toolkit)   # Layer 1a (deterministic)
+        findings += check_obligations(ledger, toolkit)    # Layer 1a/3 (deterministic)
+        findings += scan_prose(ledger, toolkit)           # Layer 1b (soft)
+    except Exception as e:  # backstop: the gate must never crash open -> fail closed (REJECT)
+        return GateReport(
+            verdict=Verdict.REJECTED,
+            findings=[Finding(LAYER_STRUCTURE, Severity.REJECT, "internal_error",
+                              f"{type(e).__name__}: {e}")],
+            ledger=ledger,
+        )
 
     if any(f.severity is Severity.REJECT for f in findings):
         verdict = Verdict.REJECTED
