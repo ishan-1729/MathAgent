@@ -7,6 +7,13 @@
 > LLMs, no model training in v1; (2) **Lean is soft/advisory** in v1 (the *authoritative* hard gate is a
 > later phase, but a minimal version is spiked early — §7, §9); (3) **tiered target** — IMO-tier NT first as a
 > ladder, then specific research re-proof targets; (4) the repo reorg is done.
+> **Progress (2026-06-14):** Phases 0–1 are **complete**; Phase-2 machinery (AND-OR DAG + memo +
+> population/Elo + Autoreason tournament + retrieval) and the Phase-3 **Layer-4 audit are built and
+> live-validated** — decision (2)'s "spiked early" Layer-4 has **graduated to the authoritative gate**,
+> now certifying real elementary NT theorems end-to-end (`authoritative_elementary=True` on `n²≡0,1 mod 4`
+> and `√2`-irrational/descent). For the current, timestamp-stamped status and live gaps see
+> [`../research/docs/build_status.md`](../research/docs/build_status.md); for the architecture,
+> [`../research/docs/system_design.md`](../research/docs/system_design.md).
 > **Evidence base:** [`../research/docs/literature_design_implications.md`](../research/docs/literature_design_implications.md)
 > (synthesis of 20 systems papers) and [`../research/docs/paper_extractions.md`](../research/docs/paper_extractions.md).
 
@@ -395,9 +402,9 @@ Phase-1 exit criterion ("a gate-passing proof") well-defined. `rubric.yaml` is u
 | Phase | Goal | Key deliverables | Exit criterion |
 | --- | --- | --- | --- |
 | **0 — Foundations** *(done)* | Understand repo; reorganize; plan; literature synthesis. | Reorg ✓, this plan ✓, [`literature_design_implications.md`](../research/docs/literature_design_implications.md) ✓. | — |
-| **1 — MVP slice (flat) + gate + Layer-4 spike** | Minimal end-to-end prover with a working soft+structural gate and a *proven-real* hard gate on the hard case. | (a) `gates/allowed_toolkit.md` (+ §2.1 rulings) + `denylist.yaml`; (b) **frozen step-ledger schema** + deterministic validator (1a) + soft scanner (1b); (c) Prover + Critic/Judge prompts; (d) numeric/witness tool; (e) flat sequential driver + liveness caps + JSONL trace; (f) author 1 T0 + the `imo_1988` (or use `x2_plus_1_eq_y3`) statement, numerically validated; (g) fill `descent.md` + the Lean descent combinator; (h) **Layer-4 spike**: accept a genuine elementary descent/Vieta proof, reject a denylisted one. | A correct, gate-passing proof of ≥1 target **and** the Layer-4 spike demonstrably accepts an elementary proof while rejecting a planted heavy one. |
-| **2 — DAG/memo/swarm (gated on measured reuse) + methods + retrieval** | Promote the heavier harness *only where measurement says it pays*. | AND-OR DAG + memo + goal cache + incumbent tournament + N=3 judges; retrieval over `knowledge/`; author core methods (LTE, orders, QR, `v_p`, pigeonhole, modular/CRT, bounding). | Beats Phase-1 on T1; attempts T2; reproducible workflow comparison; measured sub-lemma reuse justifies the DAG. |
-| **3 — Lean auditor at scale** | Scale Layer 4 from spike to routine gate. | Pantograph bridge; in-Environment dependency audit + `collectAxioms` + AST legality; % compilable on key lemmas. | Audit routinely accepts elementary proofs (≥3, zero false positives) and rejects planted heavy ones. |
+| **1 — MVP slice + gate + Layer-4 spike** *(done)* | Minimal end-to-end prover with a working soft+structural gate and a *proven-real* hard gate on the hard case. | (a) `gates/allowed_toolkit.md` (+ §2.1 rulings) + `denylist.yaml`; (b) **frozen step-ledger schema** + deterministic validator (1a) + soft scanner (1b); (c) Prover + Critic/Judge prompts; (d) numeric/witness tool; (e) flat sequential driver + liveness caps + JSONL trace; (f) author 1 T0 + the `imo_1988` (or use `x2_plus_1_eq_y3`) statement, numerically validated; (g) fill `descent.md` + the Lean descent combinator; (h) **Layer-4 spike**: accept a genuine elementary descent/Vieta proof, reject a denylisted one. | A correct, gate-passing proof of ≥1 target **and** the Layer-4 spike demonstrably accepts an elementary proof while rejecting a planted heavy one. |
+| **2 — DAG/memo/swarm + methods + retrieval** *(machinery built; payoff not yet measured)* | Promote the heavier harness *only where measurement says it pays*. | AND-OR DAG + memo + goal cache + incumbent tournament + N=3 judges; retrieval over `knowledge/`; author core methods (LTE, orders, QR, `v_p`, pigeonhole, modular/CRT, bounding). | Beats Phase-1 on T1; attempts T2; reproducible workflow comparison; measured sub-lemma reuse justifies the DAG. |
+| **3 — Lean auditor at scale** *(spiked: live-validated on 2/3 ladder; not yet routine)* | Scale Layer 4 from spike to routine gate. | Pantograph bridge; in-Environment dependency audit + `collectAxioms` + AST legality; % compilable on key lemmas. | Audit routinely accepts elementary proofs (≥3, zero false positives) and rejects planted heavy ones. |
 | **4 — Research targets + hardening** | Push T3-hard / calibration→research; harden gate; optionally add small helper models. | Specific-`k` Mordell + Ljunggren attempts; hardened denylist/audit; (optional, *hybrid*) an elementary-compliance classifier or method-selector. | A defensible elementary attempt on ≥1 T3-hard target with audit evidence. |
 | **5 — (optional v2) trained prover** | Only if frontier-LLM per-problem cost dominates. | Specialized step-prover + RL with elementary reward + V_leg gate (Goedel/BFS/LongCat patterns). | Lower cost at equal/better gate-passing rate. |
 
@@ -421,15 +428,18 @@ Phase-1 exit criterion ("a gate-passing proof") well-defined. `rubric.yaml` is u
 
 ### Open decisions (need Ishan/Kieren input)
 1. **Frontier model + budget** for the harness (which model(s); per-problem call/$ cap → sets §4.3 defaults).
-2. **Auditor build-vs-adapt** (§7): in-house in-Environment audit vs adapt AXLE/LeanDojo.
-3. **Eval-set sourcing** (which shortlist years; which specific Mordell `k`; who validates statements).
-4. *(Resolved: metrics gate-vs-weight — see §8.2. Resolved: Phase-1 = flat sequential — see §4.)*
+2. **Eval-set sourcing** (which shortlist years; which specific Mordell `k`; who validates statements) —
+   the gating decision for the held-out NT eval set (build_status §7 gap #2).
+3. **Per-problem model + budget policy** (gpt-5.5/xHigh chosen; the call/$ ceiling per problem is unpinned).
+4. *(Resolved: metrics gate-vs-weight — §8.2. Resolved: Phase-1 = flat sequential — §4. Resolved:
+   auditor build-vs-adapt — built in-house: `gates/lean_audit.py` + `lean/Audit.lean` + persistent
+   server, not AXLE/LeanDojo.)*
 
 ---
 
 ## 11. Phase 1 checklist — status
 
-**Built (this branch). Deterministic core is green: `make check` + 88 passing tests + `make demo`.**
+**Phase 1 complete. Deterministic core green: `make check` + 296 passing tests (8 opt-in skipped) + `make demo`.**
 - [x] `gates/allowed_toolkit.yaml` (incl. §2.1 boundary rulings) + `gates/denylist.yaml`.
 - [x] Frozen step-ledger schema (`gates/ledger.schema.json`) + worked example (`gates/examples/squares_mod4.json`);
       deterministic validator 1a (`gates/ledger.py`), obligation checks (`gates/obligations.py`), soft scanner 1b
@@ -442,12 +452,21 @@ Phase-1 exit criterion ("a gate-passing proof") well-defined. `rubric.yaml` is u
       end-to-end `python -m agent.demo`.
 - [x] Applied the §8.2 rubric decision in `rubric.yaml` (elementary compliance = binary gate).
 
-**Remaining for Phase 1 → 2:**
-- [ ] Wire a **real LLM-backed Prover/Judge** behind the `Prover`/`Judge` protocols (replaces the scripted stubs).
-- [ ] Author 1 T0 problem folder + author/numerically-validate `benchmarks/problems/imo_1988_finite_descent/`
-      (or start on the complete `x2_plus_1_eq_y3`).
-- [ ] **Layer-4 spike:** install Lean+Mathlib; accept an elementary descent/Vieta proof, reject a denylisted one.
-- [ ] First real end-to-end run on a branch with a run record.
+**Completed since (Phase 1 → 2/3):**
+- [x] **Real Codex-backed roles** behind the Protocols — Prover / Decomposer / Reviewer / Comparator +
+      the Autoreason Critic / Author / Synthesizer / Judge (`tools/codex_prover.py`).
+- [x] **Layer-4 spike succeeded → now the authoritative gate:** Lean + Mathlib installed; the audit
+      certifies real elementary NT theorems end-to-end (`authoritative_elementary=True` on `n²≡0,1 mod 4`
+      and `√2`-irrational/descent) and rejects a denylisted one (`IsDedekindDomain`).
+- [x] **First real end-to-end runs with run records** — the certification ladder
+      ([`live_certification_runs.md`](../research/docs/live_certification_runs.md)) and the ArXivMath
+      vanilla-vs-harness run ([`runs/2026-06-13_nt_vanilla_vs_harness.md`](../benchmarks/datasets/arxivmath/runs/2026-06-13_nt_vanilla_vs_harness.md)).
+- [x] Local web UI for driving the harness (`ui/`).
+
+**Still open (now tracked live in [`build_status.md`](../research/docs/build_status.md) §7):** lift the
+autoformalization rate (gap #1); a held-out NT eval set + measured lift + filling the 5 placeholder
+problem folders (gap #2); faithfulness cross-model independence (#4); the V_leg AST-legality gate (#8).
+The Phase-2/3 machinery is built — what remains is *measuring* its payoff and scaling Layer-4 to routine.
 
 ---
 

@@ -1,7 +1,6 @@
 # MathAgent — Build Status
 
-> **Snapshot:** `2026-06-13T23:49:58+05:30` · working tree (uncommitted) atop commit `fd7da0d`
-> · stamp `4d9b8faa22d369d1`
+> **Snapshot:** `2026-06-14T04:21:35+05:30` · commit `29ad0da` · stamp `074739e7ecc32578`
 > (`stamp = sha256(timestamp | full-commit-sha)[:16]` — identifies the exact state this doc describes;
 > regenerate on every edit so a stale doc is detectable.) See the canonical
 > **[`system_design.md`](system_design.md)** for the architecture this status tracks against.
