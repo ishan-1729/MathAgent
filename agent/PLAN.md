@@ -156,6 +156,9 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Population / Elo over sketches** | Generate K candidate decompositions, rank by a pairwise-comparison Elo tournament (+ Bradley-Terry MLE, PUCT), try best-first. | **built** ([`population.py`](orchestrator/population.py)) | AlphaProof_Nexus/AlphaEvolve |
 | **Lean Layer-4 auditor** | Proof-term dependency + axiom audit (the authoritative gate). | **built + live-validated** ([`gates/lean_audit.py`](gates/lean_audit.py), [`lean_bridge.py`](gates/lean_bridge.py), [`lean/Audit.lean`](gates/lean/Audit.lean)) | AlphaProof_Nexus SafeVerify, AXLE |
 | **Ledger→Lean formalization bridge** | Formalize a gate-passed ledger to Lean, compile, run Layer 4 → `authoritative_elementary`. | **built + live (Mathlib)** ([`tools/formalizer.py`](tools/formalizer.py), [`orchestrator/formalize_bridge.py`](orchestrator/formalize_bridge.py)) | LEAP, Aristotle informal→formal |
+| **Adversarial faithfulness panel** | Multi-lens adversarial check that the Lean statement faithfully captures the informal claim. | **built + live** ([`orchestrator/faithfulness.py`](orchestrator/faithfulness.py)) | autoformalization-faithfulness wall (Goedel/AlphaProof_Nexus) |
+| **Layer-4 terminal gate (DAG)** | After the DAG proves the root, formalize+audit+faithfulness as the authoritative gate. | **built** (`DagDriver.terminal_gate`, `make_terminal_gate`) | PLAN §5 Layer 4 |
+| **Persistent Lean server** | Keep Mathlib + `#audit` loaded; ~0.1s/audit after a one-time load. | **built + live** ([`gates/lean_server.py`](gates/lean_server.py), community REPL) | LeanDojo/Pantograph |
 | **Tools** ([`tools/`](tools/)) | Numeric/witness search, Codex prover, elementary auditor, retrieval, CAS, Lean bridge. | numeric + Codex + Lean built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))
@@ -305,10 +308,13 @@ instance projections. So:
 > ([`formal/lean/mathagent_formal/`](../formal/lean/mathagent_formal/)). The full loop runs end-to-end:
 > a gate-passed ledger → Codex formalization → compile (`lake env lean`) → Layer-4 dependency audit →
 > `authoritative_elementary` (confirmed `True` on `n+0=n`; `IsDedekindDomain` rejected live against
-> Mathlib). See [`research/docs/formalization_bridge.md`](../research/docs/formalization_bridge.md) and
+> Mathlib). Also added + live-validated: an **adversarial statement-faithfulness panel** (4 diverse
+> lenses; `authoritative` now requires faithful), **Layer 4 wired as the DAG terminal gate**
+> (`DagDriver(terminal_gate=...)`), and a **persistent Lean server** (Mathlib loads once: 76s, then
+> ~0.1s/audit — a >500× speedup). See
+> [`research/docs/formalization_bridge.md`](../research/docs/formalization_bridge.md) and
 > [`lean_layer4_and_population.md`](../research/docs/lean_layer4_and_population.md). Remaining: raise
-> autoformalization success on hard NT statements, statement-faithfulness checks, and wiring Layer-4 as
-> the terminal gate of a DAG run.
+> autoformalization success on hard NT statements (Lean-error repair loop, lemma retrieval).
 
 Note: **Lean/elan/lake run natively on Windows**; the real constraint is that some *harness binaries and
 tracing tooling* (OpenGauss/MathCode) are Linux-only — mine their ideas, don't depend on them.

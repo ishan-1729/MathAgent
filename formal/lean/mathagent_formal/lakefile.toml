@@ -14,5 +14,11 @@ name = "mathlib"
 scope = "leanprover-community"
 rev = "v4.30.0"
 
+# Persistent Lean server backend: the community REPL keeps Mathlib loaded across audits.
+[[require]]
+name = "repl"
+git = "https://github.com/leanprover-community/repl"
+rev = "v4.30.0"
+
 [[lean_lib]]
 name = "MathagentFormal"

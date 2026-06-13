@@ -36,6 +36,12 @@ def main() -> int:
     ap.add_argument("--out", type=Path, help="write the winning ledger / trace JSONL here (prefix)")
     ap.add_argument("--formalize", action="store_true",
                     help="after a direct proof, formalize the ledger to Lean and run the Layer-4 audit")
+    ap.add_argument("--terminal-gate", action="store_true",
+                    help="(dag mode) run Layer 4 as the terminal authoritative gate on the proven root")
+    ap.add_argument("--faithfulness", action="store_true",
+                    help="run the adversarial statement-faithfulness panel during Layer-4 verification")
+    ap.add_argument("--server", action="store_true",
+                    help="use the persistent Lean server (loads Mathlib once) for audits")
     args = ap.parse_args()
 
     if not CodexProver.available():
@@ -51,6 +57,19 @@ def main() -> int:
     print(f"# Proving (model={args.model}, effort={args.effort}, mode={'direct' if args.direct else 'dag'}):")
     print(f"  {args.goal}\n")
 
+    server = None
+    if args.server:
+        from agent.gates.lean_server import LeanServer
+        if LeanServer.available():
+            print("# starting persistent Lean server (loads Mathlib once)...")
+            server = LeanServer().start()
+        else:
+            print("# (--server requested but Lean REPL not built; using per-call lean)")
+    faith = None
+    if args.faithfulness:
+        from agent.tools.codex_prover import CodexFaithfulnessChecker
+        faith = CodexFaithfulnessChecker(cfg)
+
     if args.direct:
         res = RalphLoop(prover, toolkit=toolkit, budget=budget, trace=trace,
                         max_episodes=args.episodes).run(args.goal)
@@ -63,13 +82,19 @@ def main() -> int:
         elif ok and res.ledger:
             print("\n--- ledger ---\n" + res.ledger)
     else:
+        terminal_gate = None
+        if args.terminal_gate:
+            from agent.tools.formalizer import CodexFormalizer
+            from agent.orchestrator.formalize_bridge import make_terminal_gate
+            terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
+                                               faithfulness_checker=faith, server=server)
         driver = DagDriver(
             prover,
             decomposer=CodexDecomposer(toolkit, cfg),
             reviewer=CodexReviewer(toolkit, cfg),
             toolkit=toolkit, budget=budget, trace=trace,
             max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
-            ralph_episodes=args.episodes,
+            ralph_episodes=args.episodes, terminal_gate=terminal_gate,
         )
         res = driver.run(args.goal)
         ok = res.proven
@@ -77,6 +102,9 @@ def main() -> int:
         print(f"dag: {res.dag.stats()}")
         import json as _json
         print("\n--- proof tree ---\n" + _json.dumps(res.proof_tree(), indent=2))
+        if res.terminal is not None:
+            print("\nterminal Layer-4 gate:", res.terminal.summary())
+            print("authoritative_elementary:", res.authoritative_elementary)
 
     # Optional: close the loop — formalize the proven ledger to Lean and run the Layer-4 audit.
     winning_ledger = res.ledger if (args.direct and ok and res.ledger) else None
@@ -84,13 +112,17 @@ def main() -> int:
         from agent.tools.formalizer import CodexFormalizer
         from agent.orchestrator.formalize_bridge import formalize_and_audit
         print("\n# Formalizing the ledger to Lean and running the Layer-4 audit...")
-        fa = formalize_and_audit(winning_ledger, CodexFormalizer(toolkit, cfg), toolkit=toolkit)
+        fa = formalize_and_audit(winning_ledger, CodexFormalizer(toolkit, cfg), toolkit=toolkit,
+                                 faithfulness_checker=faith, server=server)
         print("formalize + audit:", fa.summary())
-        print("authoritative_elementary:", fa.elementary_verified)
+        print("authoritative_elementary:", fa.authoritative)
         if fa.lean_source:
             print("\n--- formalized Lean ---\n" + fa.lean_source)
     elif args.formalize:
         print("\n(--formalize is supported in --direct mode on a proven ledger)")
+
+    if server is not None:
+        server.close()
 
     print(f"\ncalls spent: {budget.calls_spent}/{budget.max_llm_calls}")
     if args.out:

@@ -66,14 +66,16 @@ def auditJson (declName : Name) : CoreM String := do
   return obj.compress
 
 open Lean.Elab.Command in
-/-- `#audit foo` prints the dependency report for `foo` to stdout. -/
+/-- `#audit foo` logs the dependency report for `foo` as an info message (tagged with a sentinel).
+    Using `logInfo` (not `IO.println`) keeps the output in Lean's message channel, so it is captured
+    both by `lean <file>` (stdout diagnostics) and by the persistent REPL server (response messages). -/
 elab "#audit " id:ident : command => do
   let declName := id.getId
-  liftCoreM do
+  let s ← liftCoreM do
     let env ← getEnv
     if !env.contains declName then
       throwError s!"#audit: unknown declaration {declName}"
-    let s ← auditJson declName
-    IO.println ("MATHAGENT_AUDIT_JSON " ++ s)
+    auditJson declName
+  logInfo ("MATHAGENT_AUDIT_JSON " ++ s)
 
 end MathAgent

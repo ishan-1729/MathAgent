@@ -30,6 +30,7 @@ from agent.gates.ledger import parse_ledger, LedgerError
 from agent.orchestrator.dag import goal_hash
 from agent.orchestrator.dag_driver import ReviewVerdict
 from agent.orchestrator.population import Candidate
+from agent.orchestrator.faithfulness import SingleVerdict, PanelFaithfulnessChecker
 
 _ROLE_DIR = Path(__file__).resolve().parents[1] / "roles"
 
@@ -249,3 +250,55 @@ class CodexComparator:
         except json.JSONDecodeError:
             return 0
         return 1 if w == "a" else (-1 if w == "b" else 0)
+
+
+_LENS_FOCUS = {
+    "back_translation": "Translate the Lean statement back into precise English, then check it says "
+                        "EXACTLY the informal claim — no more, no less.",
+    "quantifiers_domain": "Scrutinize quantifiers (∀/∃ and their order), variable domains/types "
+                          "(ℕ vs ℤ vs ℝ, positivity, ranges), and edge values (0, 1, negatives).",
+    "vacuity": "Is the statement vacuously true, are its hypotheses unsatisfiable, or is it a "
+               "trivially-true restatement that does not assert the informal content?",
+    "strength": "Is the Lean statement strictly WEAKER (only a special case) or STRONGER/UNRELATED "
+                "than the informal claim? Either is unfaithful.",
+}
+
+
+class _CodexFaithJudge:
+    def __init__(self, cfg: CodexConfig):
+        self.cfg = cfg
+
+    def __call__(self, claim: str, lean_source: str, name: str, lens: str) -> SingleVerdict:
+        focus = _LENS_FOCUS.get(lens, "Check the Lean statement faithfully captures the claim.")
+        prompt = (
+            "You ADVERSARIALLY check whether a Lean 4 statement faithfully formalizes an informal "
+            "number-theory claim. Your job is to FIND a discrepancy; default to faithful=false if at "
+            "all unsure.\n"
+            f"LENS [{lens}]: {focus}\n\n"
+            f"INFORMAL CLAIM:\n{claim}\n\n"
+            f"LEAN SOURCE (the statement under check is theorem/lemma `{name}`):\n{lean_source}\n\n"
+            'Output ONLY a JSON object: {"faithful": <bool>, "issues": [<short strings>]}'
+        )
+        raw = _run_codex(prompt, self.cfg)
+        m = _VERDICT_RE.search(raw)
+        if not m:
+            return SingleVerdict(lens=lens, faithful=False, issues=["unparseable judge output"])
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return SingleVerdict(lens=lens, faithful=False, issues=["invalid JSON from judge"])
+        return SingleVerdict(lens=lens, faithful=bool(obj.get("faithful", False)),
+                             issues=list(obj.get("issues", []) or []))
+
+
+class CodexFaithfulnessChecker:
+    """Adversarial faithfulness panel backed by Codex (one judge per diverse lens)."""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None, lenses: Optional[list[str]] = None,
+                 max_unfaithful: int = 0):
+        self.cfg = cfg or CodexConfig()
+        self._panel = PanelFaithfulnessChecker(_CodexFaithJudge(self.cfg), lenses=lenses,
+                                               max_unfaithful=max_unfaithful)
+
+    def check(self, informal_claim: str, lean_source: str, theorem_name: str):
+        return self._panel.check(informal_claim, lean_source, theorem_name)

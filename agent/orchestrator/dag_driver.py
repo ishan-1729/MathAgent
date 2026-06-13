@@ -16,7 +16,7 @@ stubs are interchangeable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from agent.gates.gate import evaluate
 from agent.gates.ledger import parse_ledger, LedgerError
@@ -60,9 +60,16 @@ class DagResult:
     dag: ProofDAG
     trace: RunTrace
     budget: Budget
+    terminal: Optional[object] = None   # the terminal-gate result (e.g. FormalizeAuditResult)
 
     def proof_tree(self) -> dict:
         return self.dag.assemble(self.goal)
+
+    @property
+    def authoritative_elementary(self) -> bool:
+        """Proven AND the terminal Layer-4 gate (formalize -> audit -> faithfulness) accepted it."""
+        return bool(self.proven and self.terminal is not None
+                    and getattr(self.terminal, "authoritative", False))
 
 
 def _lemma_claims(sketch: str) -> Optional[set[str]]:
@@ -90,6 +97,7 @@ class DagDriver:
         comparator: Optional[Comparator] = None,
         population_k: int = 0,
         population_rounds: int = 1,
+        terminal_gate: Optional[Callable[[str, str], object]] = None,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -107,16 +115,30 @@ class DagDriver:
         self.comparator = comparator
         self.population_k = population_k
         self.population_rounds = population_rounds
+        # Terminal authoritative gate (PLAN.md §5 Layer 4): (root_goal, proof_text) -> result with an
+        # `.authoritative` attribute. Runs once after the root is proven (formalize -> Lean audit ->
+        # faithfulness). See agent/orchestrator/formalize_bridge.make_terminal_gate.
+        self.terminal_gate = terminal_gate
         self.dag = ProofDAG()
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
+
+        # Terminal authoritative gate: formalize the assembled proof -> Lean Layer-4 audit -> faithfulness.
+        terminal = None
+        if proven and self.terminal_gate is not None:
+            proof_text = self.dag.proof_bundle(goal)
+            self.trace.emit("terminal_gate_start", goal=goal[:80])
+            terminal = self.terminal_gate(goal, proof_text)
+            self.trace.emit("terminal_gate", goal=goal[:80],
+                            authoritative=bool(getattr(terminal, "authoritative", False)))
+
         stats = self.dag.stats()
         self.trace.emit("final", goal=goal[:80], proven=proven,
                         nodes=stats["nodes"], proven_nodes=stats["proven"],
                         cache_hits=stats["cache_hits"], **self.budget.snapshot())
         return DagResult(goal=goal, proven=proven, dag=self.dag, trace=self.trace,
-                         budget=self.budget)
+                         budget=self.budget, terminal=terminal)
 
     def _prove(self, goal: str, ancestors: set[str], depth: int) -> bool:
         node = self.dag.get_or_create(goal)

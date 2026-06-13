@@ -166,6 +166,33 @@ class ProofDAG:
 
         return build(key)
 
+    def proof_bundle(self, goal: str) -> str:
+        """Serialize the proven proof rooted at goal into one informal text (for formalization)."""
+        key = goal_hash(goal)
+        seen: set[str] = set()
+        lines: list[str] = []
+
+        def visit(k: str, depth: int) -> None:
+            node = self.nodes.get(k)
+            if node is None or not node.proven:
+                return
+            pad = "  " * depth
+            lines.append(f"{pad}GOAL: {node.goal}")
+            if k in seen:
+                lines.append(f"{pad}(proven above; reused)")
+                return
+            seen.add(k)
+            if node.proof_kind == "decomposition":
+                lines.append(f"{pad}DECOMPOSITION SKETCH (cites the sub-lemmas below): {node.proof}")
+                lines.append(f"{pad}SUB-LEMMAS:")
+                for ck in node.children:
+                    visit(ck, depth + 1)
+            else:
+                lines.append(f"{pad}PROOF LEDGER: {node.proof}")
+
+        visit(key, 0)
+        return "\n".join(lines)
+
     def stats(self) -> dict:
         proven = sum(1 for n in self.nodes.values() if n.proven)
         return {"nodes": len(self.nodes), "proven": proven, "cache_hits": self.cache_hits}

@@ -30,15 +30,28 @@ step-ledger ──► gate (Layers 0-3) ──► CodexFormalizer ──► lake
   (`n+0=n by simp`) → **PASS** (the allowlists don't over-reject Mathlib's elementary plumbing).
 - **Core (no Mathlib):** `n+0=n := Nat.add_zero n` → PASS; a `sorry` proof → REJECT (axiom gate).
 
+## Added: faithfulness check, DAG terminal gate, persistent server
+
+| Addition | File | What it does |
+| --- | --- | --- |
+| **Adversarial faithfulness panel** | [`faithfulness.py`](../../agent/orchestrator/faithfulness.py) + `CodexFaithfulnessChecker` | Several independent judges (back-translation, quantifiers/domain, vacuity, strength lenses) each told to FIND a discrepancy and default to *unfaithful*; the statement is accepted only if no lens objects. `authoritative` now requires `elementary_verified` AND `faithful`. |
+| **Layer 4 as the DAG terminal gate** | `DagDriver(terminal_gate=...)` + `make_terminal_gate` + `ProofDAG.proof_bundle` | After the DAG proves the root, the assembled proof is formalized → compiled → Layer-4 audited → faithfulness-checked. `DagResult.authoritative_elementary` reflects it. |
+| **Persistent Lean server** | [`lean_server.py`](../../agent/gates/lean_server.py) (drives leanprover-community/repl, built into the Mathlib project) | Loads Mathlib + `#audit` **once**, then reuses the environment. `lean_bridge`/`formalize_bridge` accept a `server=`. |
+
+**Live evidence (Lean 4.30.0 + Mathlib):**
+- Persistent server: startup (Mathlib load) **75.8s**, then `audit#1` (elementary) **0.13s**, `audit#2`
+  (denylisted) **0.03s** — a >500× speedup vs per-call `lake env lean`.
+- Full stack `full_verify` (with server + faithfulness panel) on `n+0=n`:
+  `[informal] passed_deterministic | formalize ok, compiled, lean-audit pass, faithfulness[4/4 lenses faithful], authoritative=True`.
+- CLI: `python scripts/prove.py --terminal-gate --server --faithfulness "<goal>"`.
+
 ## Honest caveats / what's next
 
-- **Autoformalization is the wall.** Codex handled the trivial target; harder NT statements will often
-  fail to compile or be mis-stated. The bridge reports those honestly; raising the formalization
-  success rate (better prompts, retrieval of Mathlib lemma names, a repair loop on Lean errors, feeding
-  the ledger steps as a Lean proof skeleton) is the main open work.
-- **Statement faithfulness** is unchecked — a compiling `ma_target` could formalize the *wrong*
-  statement. Needs an equivalence/expert check (PLAN §3.4, §8.3) before "authoritative" is trustworthy.
-- **Speed:** each `import Mathlib` audit loads all of Mathlib (~40-60s). Fine for validation; a
-  persistent Lean server or narrower imports would speed a real loop.
-- The formalize/audit loop is **not yet wired into the DAG driver** (it runs on a final ledger); making
-  Layer-4 the terminal gate of a DAG run is the natural next step.
+- **Autoformalization is still the wall.** Codex handled trivial targets; harder NT statements will
+  often fail to compile or be mis-stated. The bridge reports those honestly; raising the success rate
+  (Lean-error repair loop, Mathlib lemma retrieval, feeding the ledger as a Lean proof skeleton) is the
+  main open work.
+- **Faithfulness judges share the prover's model family** (Codex) — the panel uses diverse lenses to
+  mitigate shared blind spots, but a different-model judge would be stronger; the protocol allows it.
+- The persistent server keeps **one** Mathlib env; a crash requires a restart (the wrapper raises and
+  callers can fall back to per-call). Narrower imports would cut the 76s startup.

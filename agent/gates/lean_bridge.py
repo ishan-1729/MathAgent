@@ -24,7 +24,15 @@ from agent.gates.lean_audit import LeanAuditResult, audit_json
 from agent.gates.toolkit import Toolkit
 
 _AUDIT_LEAN = Path(__file__).resolve().parent / "lean" / "Audit.lean"
-_SENTINEL = "MATHAGENT_AUDIT_JSON "
+_SENTINEL = "MATHAGENT_AUDIT_JSON"
+# The report JSON is one line (Json.compress); capture it after the sentinel from either `lean`
+# stdout diagnostics or a REPL message.
+_AUDIT_RE = re.compile(r"MATHAGENT_AUDIT_JSON\s+(\{.*\})")
+
+
+def extract_report_json(text: str) -> Optional[str]:
+    m = _AUDIT_RE.search(text)
+    return m.group(1) if m else None
 
 
 class LeanUnavailable(RuntimeError):
@@ -91,12 +99,16 @@ def _assemble_source(proof_src: str, theorem_name: str) -> str:
 
 
 def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300,
-                  project_dir: Optional[str | Path] = None) -> str:
+                  project_dir: Optional[str | Path] = None, server: Optional[object] = None) -> str:
     """Compile `proof_src` and return the raw dependency-report JSON for `theorem_name`.
 
-    With `project_dir` (a lake project, e.g. the Mathlib project) the proof is run via
-    `lake env lean`, so `import Mathlib` resolves; otherwise a bare `lean` runs core-only proofs.
+    - `server` (a LeanServer): reuse a persistent Mathlib-loaded process (fast). Preferred when set.
+    - `project_dir` (a lake project): run `lake env lean` so `import Mathlib` resolves.
+    - otherwise a bare `lean` runs core-only proofs.
     """
+    if server is not None:
+        return server.audit(proof_src, theorem_name, timeout_s=timeout_s)
+
     source = _assemble_source(proof_src, theorem_name)
     workdir = tempfile.mkdtemp(prefix="lean_audit_")
     lean_file = Path(workdir) / "Target.lean"
@@ -123,9 +135,9 @@ def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300,
             env={**os.environ, "MATHAGENT_TOOLCHAIN": os.environ.get("MATHAGENT_TOOLCHAIN", "")},
         )
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        for line in combined.splitlines():
-            if line.startswith(_SENTINEL):
-                return line[len(_SENTINEL):].strip()
+        report = extract_report_json(combined)
+        if report is not None:
+            return report
         # No sentinel => the proof did not compile (or the decl was absent); surface diagnostics.
         tail = combined.strip()[-1200:]
         raise LeanBridgeError(f"no audit JSON emitted (proof failed to compile?):\n{tail}")
@@ -137,9 +149,12 @@ def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300,
 
 def audit_lean_source(proof_src: str, theorem_name: str,
                       toolkit: Optional[Toolkit] = None, timeout_s: int = 300,
-                      project_dir: Optional[str | Path] = None) -> LeanAuditResult:
+                      project_dir: Optional[str | Path] = None,
+                      server: Optional[object] = None) -> LeanAuditResult:
     """Compile + extract + audit a Lean proof. Raises LeanUnavailable/LeanBridgeError on setup issues;
     a compiling-but-non-elementary proof returns a REJECT result (not an exception). Pass `project_dir`
-    (a Mathlib lake project) to audit proofs that `import Mathlib`."""
-    report_json = run_extractor(proof_src, theorem_name, timeout_s=timeout_s, project_dir=project_dir)
+    (a Mathlib lake project) to audit `import Mathlib` proofs, or `server` (a LeanServer) to reuse a
+    persistent Mathlib-loaded process."""
+    report_json = run_extractor(proof_src, theorem_name, timeout_s=timeout_s,
+                                project_dir=project_dir, server=server)
     return audit_json(report_json, toolkit)

@@ -118,6 +118,37 @@ def test_full_verify_authoritative(monkeypatch):
     assert res.authoritative_elementary
 
 
+def test_faithfulness_blocks_authoritative(monkeypatch):
+    from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    # Audit passes, but the statement is judged UNFAITHFUL -> not authoritative.
+    res = fb.formalize_and_audit(VALID_LEDGER, fr, toolkit=TOOLKIT,
+                                 informal_claim="For all integers n, n + 0 = n.",
+                                 faithfulness_checker=ScriptedFaithfulnessChecker(False, ["wrong domain"]))
+    assert res.elementary_verified            # the proof IS elementary...
+    assert not res.faithful and not res.authoritative   # ...but the statement is unfaithful
+    assert res.faithfulness is not None
+
+
+def test_faithfulness_pass_is_authoritative(monkeypatch):
+    from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    res = fb.formalize_and_audit(VALID_LEDGER, fr, toolkit=TOOLKIT,
+                                 informal_claim="claim", faithfulness_checker=ScriptedFaithfulnessChecker(True))
+    assert res.authoritative
+
+
+def test_make_terminal_gate(monkeypatch):
+    from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    gate = fb.make_terminal_gate(fz.ScriptedFormalizer("theorem ma_target : True := trivial"),
+                                 toolkit=TOOLKIT, faithfulness_checker=ScriptedFaithfulnessChecker(True))
+    result = gate("root goal", "proof bundle text")
+    assert result.authoritative
+
+
 def test_full_verify_skips_lean_when_gate_rejects(monkeypatch):
     called = {"n": 0}
 
