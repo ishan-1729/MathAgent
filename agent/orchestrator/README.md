@@ -21,6 +21,13 @@ machinery below is promoted in Phase 2 **only once measured sub-lemma reuse just
   revision; k=2 stop — so a correct elementary proof is never churned into a broken/heavier one.
 - **Evaluation cascade** — cheap structural/numeric checks before expensive judge/Lean passes.
 
-Status: **Phase-1 implemented.** `state.py` (state machine + budgets), `trace.py` (JSONL run trace +
-run-record rendering), and `driver.py` (the flat sequential `FlatDriver` + `Prover`/`Judge` protocols +
-scripted stubs) are built and tested. The Phase-2 machinery above is still design-only.
+Status: **Phase-1 + much of Phase-2 implemented.**
+- `state.py` (state machine + budgets), `trace.py` (JSONL run trace + run-record rendering),
+  `driver.py` (the flat sequential `FlatDriver` + `Prover`/`Judge` protocols + scripted stubs).
+- `dag.py` (LEAP AND-OR DAG + **deep-hash goal cache / memoization** + acyclicity guard),
+  `ralph.py` (the AlphaProof_Nexus per-node Ralph loop), and `dag_driver.py` (the
+  direct→decompose→review→recurse `DagDriver` with DFS/backtracking).
+- The focused prover is **Codex / GPT-5.5-xHigh** ([`../tools/codex_prover.py`](../tools/codex_prover.py)),
+  substituting for AlphaProof. See [`../../research/docs/codex_harness.md`](../../research/docs/codex_harness.md).
+
+Still design-only: the incumbent tournament, retrieval, and the population/Elo search layer.

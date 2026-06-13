@@ -134,15 +134,27 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 > - The v1 state API is designed **parallel-ready from day one** (immutable / compare-and-set node updates,
 >   idempotent attempts) so "single → swarm" is configuration, not a rewrite.
 
+> **Status update (Phase 2 underway).** The AND-OR DAG + deep-hash memoization and the AlphaProof_Nexus
+> Ralph-loop harness are now **built and tested** ([`orchestrator/dag.py`](orchestrator/dag.py),
+> [`ralph.py`](orchestrator/ralph.py), [`dag_driver.py`](orchestrator/dag_driver.py)), with
+> **Codex / GPT-5.5-xHigh wired as the focused-prover tool** ([`tools/codex_prover.py`](tools/codex_prover.py))
+> in place of AlphaProof, plus a CLI ([`scripts/prove.py`](../scripts/prove.py)). See
+> [`research/docs/codex_harness.md`](../research/docs/codex_harness.md). The incumbent tournament, retrieval,
+> and multi-family judge panel remain Phase-2 TODOs.
+
 ### 4.1 Components (and their source patterns)
-| Component | Role | Phase | Source |
+| Component | Role | Status | Source |
 | --- | --- | --- | --- |
-| **Flat driver** | Sequential plan → prove → critique → gate loop. | 1 | — |
-| **AND-OR proof DAG + memo** | Blueprint → sub-lemma tree; proven nodes cached/reused; acyclicity guard. | 2 | LEAP, Aristotle MCGS, Pantograph |
-| **Goal cache** | Dedup by exact-canonical statement match (semantic dedup deferred). | 2 | AlphaProof deep-hash |
-| **Revision controller** | Incumbent tournament; "do nothing" first-class; failure-analysis *before* revision; k=2 stop. | 2 | Autoreason |
-| **Evaluation cascade** | Cheap structural + numeric checks gate expensive judge/Lean passes. | 1 | AlphaEvolve |
-| **Tools** ([`tools/`](tools/)) | Numeric/witness search, retrieval, elementary auditor, CAS, Lean bridge. | 1+ | Axplorer, MathCode, LeanDojo/Pantograph |
+| **Flat driver** | Sequential plan → prove → critique → gate loop. | built (P1) | — |
+| **AND-OR proof DAG + memo** | Blueprint → sub-lemma tree; proven nodes cached/reused; acyclicity guard. | **built** | LEAP, Aristotle MCGS, Pantograph |
+| **Deep-hash goal cache** | Memoize by normalized statement hash; reuse a sub-lemma across branches. | **built** | AlphaProof_Nexus deep-hash |
+| **Focused prover (Codex)** | GPT-5.5-xHigh via `codex exec` proves a node → step-ledger (AlphaProof's role). | **built** | AlphaProof_Nexus (AlphaProof tool) |
+| **Ralph loop** | Per-node episodes: prove → gate → carry "lessons learned" → repeat. | **built** | AlphaProof_Nexus |
+| **Decomposition reviewer** | Gate a blueprint on "does it simplify?" + "is it elementary?" before commit. | **built** | LEAP reviewer |
+| **Revision controller** | Incumbent tournament; "do nothing" first-class; failure-analysis *before* revision; k=2 stop. | P2 TODO | Autoreason |
+| **Evaluation cascade** | Cheap structural + numeric checks gate expensive judge/Lean passes. | built (P1) | AlphaEvolve |
+| **Population / Elo over sketches** | Rank incomplete sketches to steer search. | not built (v2 scaling) | AlphaProof_Nexus/AlphaEvolve |
+| **Tools** ([`tools/`](tools/)) | Numeric/witness search, retrieval, elementary auditor, CAS, Lean bridge. | numeric built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))
 v1 uses the **bold** two; the rest are added in Phase 2. All are written as separate prompts now.

@@ -9,6 +9,7 @@ justifications:
   given:        { obligation: none, desc: "a hypothesis of the problem" }
   assumption:   { obligation: none, desc: "an assumption opened (e.g. for contradiction or a case)" }
   conclusion:   { obligation: none, desc: "the terminal step: restates the theorem" }
+  lemma:        { obligation: none, desc: "cites a sub-lemma proven separately as its own node in the proof DAG (its claim becomes a child goal)" }
   algebra:      { obligation: none, desc: "routine integer/polynomial algebraic manipulation over Z" }
 
   # --- core elementary number theory ---
