@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MathAgent · harness console</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#2b3440;
+    --text:#d6dee7; --dim:#8b97a6; --accent:#34d399; --accent2:#38bdf8;
+    --bad:#f87171; --warn:#f59e0b; --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+  header{padding:13px 20px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{margin:0;font-size:16px;font-weight:650;letter-spacing:.2px}
+  header .sub{color:var(--dim);font-size:12px}
+  main{max-width:1180px;margin:0 auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);font-weight:650}
+
+  /* problem + run */
+  .problem-row{display:flex;gap:12px;align-items:stretch}
+  textarea#goal{flex:1;min-height:64px;resize:vertical;background:var(--panel2);color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:15px/1.45 system-ui;outline:none}
+  textarea#goal:focus{border-color:var(--accent2)}
+  .run-actions{display:flex;flex-direction:column;gap:8px;justify-content:center}
+  button{border:0;border-radius:8px;padding:10px 18px;font-weight:650;cursor:pointer;white-space:nowrap}
+  #run{background:var(--accent);color:#06281c;font-size:15px}
+  #stop{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .badge{font:12px var(--mono);padding:4px 10px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .badge.on{color:#06281c;background:var(--accent);border-color:var(--accent)}
+  .badge.off{color:#2a0d0d;background:var(--bad);border-color:var(--bad)}
+  .badge.run{color:#0b2233;background:var(--accent2);border-color:var(--accent2)}
+
+  /* levers */
+  .lever-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px}
+  .group{border:1px solid var(--line);border-radius:9px;padding:11px 12px;background:var(--panel2)}
+  .group h3{margin:0 0 9px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent2);font-weight:650}
+  .group.dim{opacity:.45}
+  .toggles{display:flex;flex-wrap:wrap;gap:7px}
+  /* boolean lever = clickable pill toggle */
+  .tg{display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border:1px solid var(--line);
+    border-radius:999px;cursor:pointer;background:var(--panel);user-select:none;font-size:12.5px;color:var(--dim)}
+  .tg input{display:none}
+  .tg .dot{width:12px;height:12px;border-radius:50%;border:1.5px solid var(--dim);background:transparent;flex:none}
+  .tg:has(input:checked){border-color:var(--accent);background:rgba(52,211,153,.13);color:var(--accent)}
+  .tg:has(input:checked) .dot{background:var(--accent);border-color:var(--accent)}
+  .tg.big{font-size:13.5px;padding:8px 13px;font-weight:650}
+  /* numeric / select lever rows */
+  .field{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0}
+  .field label{color:var(--dim);font-size:12.5px}
+  input[type=text],input[type=number],select{background:var(--panel);color:var(--text);border:1px solid var(--line);
+    border-radius:6px;padding:5px 8px;font:13px var(--mono);outline:none;width:86px}
+  input[type=text]{width:118px}select{width:130px}
+  input:focus,select:focus{border-color:var(--accent2)}
+
+  pre#log{margin:0;background:#0a0d12;border:1px solid var(--line);border-radius:10px;padding:12px;
+    height:40vh;min-height:220px;overflow:auto;font:12.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word}
+  .l-cmd{color:var(--accent2)} .l-head{color:var(--accent);font-weight:650}
+  .l-ok{color:var(--accent)} .l-bad{color:var(--bad)} .l-key{color:var(--warn)}
+  .hint{color:var(--dim);font-size:11.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>MathAgent</h1>
+  <span class="sub">harness console — type a problem, flip the levers, run it through the harness</span>
+</header>
+
+<main>
+  <!-- problem + run -->
+  <section class="card">
+    <div class="problem-row">
+      <textarea id="goal" placeholder="e.g.  For every integer n, n^2 is congruent to 0 or 1 modulo 4."></textarea>
+      <div class="run-actions">
+        <button id="run">▶ Run</button>
+        <button id="stop" disabled>■ Stop</button>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge" id="b-state">idle</span>
+      <span class="badge" id="b-auth" style="display:none"></span>
+      <span class="badge" id="b-calls" style="display:none"></span>
+      <span class="hint" style="align-self:center">runs live Codex + (if certifying) Lean — ⌘/Ctrl-Enter to run</span>
+    </div>
+  </section>
+
+  <!-- LEVERS: every option is a control here -->
+  <section class="card">
+    <h2>Levers</h2>
+    <div class="lever-grid">
+
+      <div class="group">
+        <h3>Model</h3>
+        <div class="field"><label>model</label><input type="text" id="model" value="gpt-5.5"></div>
+        <div class="field"><label>effort</label>
+          <select id="effort"><option>xhigh</option><option>high</option><option>medium</option><option>low</option></select></div>
+        <div class="field"><label>mode</label>
+          <select id="mode"><option value="dag">DAG (decompose)</option><option value="direct">Direct (one node)</option></select></div>
+      </div>
+
+      <div class="group" id="certgroup">
+        <h3>Certification</h3>
+        <div class="toggles" style="margin-bottom:8px">
+          <label class="tg big"><input type="checkbox" id="certify"><span class="dot"></span>Formalize + Layer-4 certify</label>
+        </div>
+        <div id="certsub">
+          <div class="toggles" style="margin-bottom:7px">
+            <label class="tg"><input type="checkbox" id="server" checked><span class="dot"></span>Lean server</label>
+            <label class="tg"><input type="checkbox" id="faithfulness" checked><span class="dot"></span>faithfulness</label>
+          </div>
+          <div class="field"><label>repair iters</label><input type="number" id="repair" value="3" min="0" max="8"></div>
+        </div>
+        <div class="hint">off → informal proof only · on → Lean compile + proof-term audit + faithfulness</div>
+      </div>
+
+      <div class="group">
+        <h3>Search / revision</h3>
+        <div class="toggles" style="margin-bottom:8px">
+          <label class="tg"><input type="checkbox" id="refine"><span class="dot"></span>Autoreason refine</label>
+        </div>
+        <div class="field"><label>population K</label><input type="number" id="population" value="0" min="0" max="8"></div>
+        <div class="field"><label>judges</label><input type="number" id="judges" value="1" min="1" max="5"></div>
+      </div>
+
+      <div class="group">
+        <h3>Retrieval</h3>
+        <div class="toggles">
+          <label class="tg"><input type="checkbox" id="retrieval"><span class="dot"></span>Loogle + BM25</label>
+          <label class="tg"><input type="checkbox" id="neural"><span class="dot"></span>neural</label>
+          <label class="tg"><input type="checkbox" id="rerank"><span class="dot"></span>rerank</label>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>Budget</h3>
+        <div class="field"><label>max depth</label><input type="number" id="max_depth" value="3" min="0" max="8"></div>
+        <div class="field"><label>max decomp</label><input type="number" id="max_decomp" value="2" min="1" max="6"></div>
+        <div class="field"><label>episodes/node</label><input type="number" id="episodes" value="3" min="1" max="8"></div>
+        <div class="field"><label>max Codex calls</label><input type="number" id="budget" value="40" min="1" max="300"></div>
+        <div class="field"><label>max replan</label><input type="number" id="max_replan" value="2" min="0" max="8"></div>
+        <div class="field"><label>timeout (s)</label><input type="number" id="timeout" value="1500" min="30" max="3600"></div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- output -->
+  <section class="card">
+    <h2>Output</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = $("log");
+let es = null, finished = false;
+
+// the certification sub-options dim when the headline toggle is off
+function syncCert(){ $("certsub").style.opacity = $("certify").checked ? "1" : "0.45"; }
+$("certify").addEventListener("change", syncCert); syncCert();
+
+const CHECKS = ["certify","server","faithfulness","refine","retrieval","neural","rerank"];
+const NUMS   = ["repair","population","judges","max_depth","max_decomp","episodes","budget","max_replan","timeout"];
+
+function params(){
+  const p = new URLSearchParams();
+  p.set("goal", $("goal").value);
+  p.set("model", $("model").value);
+  p.set("effort", $("effort").value);
+  p.set("direct", $("mode").value === "direct" ? "1" : "0");
+  CHECKS.forEach(k => p.set(k, $(k).checked ? "1" : "0"));
+  NUMS.forEach(k => p.set(k, $(k).value));
+  return p;
+}
+
+function addLine(text){
+  const div = document.createElement("div");
+  let cls = "";
+  if(text.startsWith("[ui] running:")) cls = "l-cmd";
+  else if(text.startsWith("# ")) cls = "l-head";
+  else if(/^result:\s*PROVEN/.test(text) || /authoritative_elementary:\s*True/.test(text) || /audit:\s*pass/.test(text)) cls="l-ok";
+  else if(/NOT PROVEN/.test(text) || /authoritative_elementary:\s*False/.test(text) || /failed|error|ERROR/.test(text)) cls="l-bad";
+  else if(/^(terminal Layer-4|dag:|calls spent|trace events)/.test(text)) cls="l-key";
+  if(cls) div.className = cls;
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+function setState(label, kind){ const b=$("b-state"); b.textContent=label; b.className="badge"+(kind?" "+kind:""); }
+function parseBadges(text){
+  let m;
+  if((m = text.match(/^result:\s*(PROVEN|NOT PROVEN)/))) setState(m[1], m[1]==="PROVEN"?"on":"off");
+  if((m = text.match(/authoritative_elementary:\s*(True|False)/))){
+    const ok=m[1]==="True", b=$("b-auth"); b.style.display="";
+    b.textContent="certified-elementary: "+(ok?"yes":"no"); b.className="badge "+(ok?"on":"off");
+  }
+  if((m = text.match(/calls spent:\s*([\d/]+)/))){ const b=$("b-calls"); b.style.display=""; b.textContent="calls "+m[1]; }
+}
+
+function start(path){
+  if(es) es.close();
+  log.textContent=""; finished=false;
+  $("b-auth").style.display="none"; $("b-calls").style.display="none";
+  $("run").disabled=true; $("stop").disabled=false; setState("running","run");
+  es = new EventSource(path);
+  es.onmessage = ev => { addLine(ev.data); parseBadges(ev.data); };
+  es.addEventListener("done", () => { finished=true; finish(); });
+  es.onerror = () => { if(!finished){ addLine("[ui] stream closed"); finish(); } };
+}
+function finish(){
+  if(es){ es.close(); es=null; }
+  $("run").disabled=false; $("stop").disabled=true;
+  if($("b-state").className==="badge run") setState("idle","");
+}
+
+$("run").addEventListener("click", () => {
+  if(!$("goal").value.trim()){ $("goal").focus(); return; }
+  start("/run?" + params().toString());
+});
+$("stop").addEventListener("click", () => { addLine("[ui] stopped by user"); finish(); });
+$("goal").addEventListener("keydown", e => { if((e.ctrlKey||e.metaKey) && e.key==="Enter") $("run").click(); });
+</script>
+</body>
+</html>

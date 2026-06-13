@@ -1,8 +1,12 @@
-.PHONY: check test demo all tree
+.PHONY: check test demo all tree ui
 
 # Repo skeleton + frontmatter check.
 check:
 	python scripts/check_repo_skeleton.py
+
+# Local web UI for the harness (http://127.0.0.1:8765).
+ui:
+	python ui/server.py
 
 # Constraint-engine test suite.
 test:

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mathagent-ui",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["ui/server.py"],
+      "port": 8765
+    }
+  ]
+}
