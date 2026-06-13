@@ -1,9 +1,36 @@
 [project]
 name = "mathagent"
 version = "0.1.0"
-description = "Repository skeleton for agentic discovery of elementary Diophantine proofs."
+description = "Agentic discovery of elementary number-theory proofs: the constraint engine and harness."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0",
+    "sympy>=1.12",
+    "jsonschema>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "hypothesis>=6.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "agent",
+    "agent.gates",
+    "agent.tools",
+    "agent.orchestrator",
+]
+
+[tool.setuptools.package-data]
+"agent.gates" = ["*.yaml", "*.json", "examples/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.mathagent]
-status = "skeleton"
+status = "phase-1"

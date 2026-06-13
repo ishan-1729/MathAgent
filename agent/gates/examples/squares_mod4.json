@@ -1,0 +1,37 @@
+{
+  "problem": "squares_mod4",
+  "claim": "For every integer n, n^2 is congruent to 0 or 1 modulo 4.",
+  "steps": [
+    {
+      "id": "s1",
+      "claim": "Let n be an arbitrary integer.",
+      "justification": "given",
+      "depends_on": []
+    },
+    {
+      "id": "s2",
+      "claim": "Split into the two residue classes of n modulo 2.",
+      "justification": "case_split",
+      "depends_on": ["s1"],
+      "obligations": { "case_cover": { "modulus": 2, "residues": [0, 1] } }
+    },
+    {
+      "id": "s3",
+      "claim": "If n is even, write n = 2k; then n^2 = 4k^2 which is congruent to 0 modulo 4.",
+      "justification": "congruence",
+      "depends_on": ["s2"]
+    },
+    {
+      "id": "s4",
+      "claim": "If n is odd, write n = 2k+1; then n^2 = 4k^2 + 4k + 1 which is congruent to 1 modulo 4.",
+      "justification": "congruence",
+      "depends_on": ["s2"]
+    },
+    {
+      "id": "s5",
+      "claim": "Hence for every integer n, n^2 is congruent to 0 or 1 modulo 4.",
+      "justification": "conclusion",
+      "depends_on": ["s3", "s4"]
+    }
+  ]
+}

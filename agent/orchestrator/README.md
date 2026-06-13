@@ -21,5 +21,6 @@ machinery below is promoted in Phase 2 **only once measured sub-lemma reuse just
   revision; k=2 stop — so a correct elementary proof is never churned into a broken/heavier one.
 - **Evaluation cascade** — cheap structural/numeric checks before expensive judge/Lean passes.
 
-Status: **specification only** (code begins in Phase 1 of `../PLAN.md`; this directory holds the design until
-then).
+Status: **Phase-1 implemented.** `state.py` (state machine + budgets), `trace.py` (JSONL run trace +
+run-record rendering), and `driver.py` (the flat sequential `FlatDriver` + `Prover`/`Judge` protocols +
+scripted stubs) are built and tested. The Phase-2 machinery above is still design-only.

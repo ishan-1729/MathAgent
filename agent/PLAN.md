@@ -383,18 +383,27 @@ Phase-1 exit criterion ("a gate-passing proof") well-defined. `rubric.yaml` is u
 
 ---
 
-## 11. Immediate next actions (Phase 1 checklist)
-- [ ] Write `gates/allowed_toolkit.md` (incl. §2.1 boundary rulings) and `gates/denylist.yaml`.
-- [ ] **Freeze the step-ledger JSON/YAML schema** + a worked T0 example; build the deterministic validator (1a)
-      and the soft euphemism scanner (1b) in `tools/`.
-- [ ] Write the **Prover** and **Critic/Elementary-Judge** role prompts (`roles/`).
-- [ ] Build the **numeric/witness search** tool (`tools/`, Python/SymPy sandbox) incl. case-cover re-checking.
-- [ ] Fill `knowledge/methods/descent.md` + the reusable Lean descent combinator.
-- [ ] Author 1 T0 problem; author + numerically validate `benchmarks/problems/imo_1988_finite_descent/` (or
-      start on the complete `x2_plus_1_eq_y3`).
-- [ ] Stand up the flat sequential driver with liveness caps + the JSONL trace; run T0 → first target on a branch.
+## 11. Phase 1 checklist — status
+
+**Built (this branch). Deterministic core is green: `make check` + 88 passing tests + `make demo`.**
+- [x] `gates/allowed_toolkit.yaml` (incl. §2.1 boundary rulings) + `gates/denylist.yaml`.
+- [x] Frozen step-ledger schema (`gates/ledger.schema.json`) + worked example (`gates/examples/squares_mod4.json`);
+      deterministic validator 1a (`gates/ledger.py`), obligation checks (`gates/obligations.py`), soft scanner 1b
+      (`gates/scanner.py`), composer (`gates/gate.py`).
+- [x] **Prover** + **Critic/Elementary-Judge** role prompts (`roles/prover.md`, `roles/critic_judge.md`).
+- [x] **Numeric/witness search** tool (`tools/numeric.py`, sympy, exact-integer): residue-cover, solution-set,
+      and descent-decrease checks.
+- [x] Filled `knowledge/methods/descent.md` (+ the reusable Lean descent-combinator plan).
+- [x] Flat sequential driver + liveness state machine + budgets (`orchestrator/`) + JSONL run trace;
+      end-to-end `python -m agent.demo`.
+- [x] Applied the §8.2 rubric decision in `rubric.yaml` (elementary compliance = binary gate).
+
+**Remaining for Phase 1 → 2:**
+- [ ] Wire a **real LLM-backed Prover/Judge** behind the `Prover`/`Judge` protocols (replaces the scripted stubs).
+- [ ] Author 1 T0 problem folder + author/numerically-validate `benchmarks/problems/imo_1988_finite_descent/`
+      (or start on the complete `x2_plus_1_eq_y3`).
 - [ ] **Layer-4 spike:** install Lean+Mathlib; accept an elementary descent/Vieta proof, reject a denylisted one.
-- [ ] Apply the §8.2 rubric decision in `rubric.yaml`.
+- [ ] First real end-to-end run on a branch with a run record.
 
 ---
 

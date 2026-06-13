@@ -33,6 +33,7 @@ REQUIRED_TOP_LEVEL_DIRS = [
     "research/papers",
     "research/docs",
     "scripts",
+    "tests",
 ]
 
 KEY_FILES = [
@@ -44,6 +45,14 @@ KEY_FILES = [
     "agent/README.md",
     "agent/PLAN.md",
     "agent/gates/README.md",
+    "agent/gates/allowed_toolkit.yaml",
+    "agent/gates/denylist.yaml",
+    "agent/gates/ledger.schema.json",
+    "agent/gates/gate.py",
+    "agent/tools/numeric.py",
+    "agent/orchestrator/driver.py",
+    "agent/roles/prover.md",
+    "agent/roles/critic_judge.md",
     "research/papers/INDEX.md",
     "research/docs/literature_design_implications.md",
     "knowledge/methods/TEMPLATE.md",

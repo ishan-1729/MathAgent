@@ -1,0 +1,74 @@
+# Denylist of non-elementary final-proof methods. See agent/PLAN.md Section 2 and Section 5.
+#
+# - `prose_terms`        : phrases the Layer-1b scanner looks for in ledger prose. This is a SOFT
+#                          ROUTER TO REVIEW, not a deterministic gate (a euphemism scan cannot be
+#                          sound). Multi-word/specific to avoid false positives.
+# - `allow_context_terms`: overloaded words that are fine in elementary contexts; the scanner does
+#                          NOT flag these on their own.
+# - `lean_denylist_decls`: Layer-4 (Lean) content-bearing declarations/namespaces that are
+#                          dispositive on appearance in a proof-term dependency closure.
+# - `lean_infrastructure_allowlist`: plumbing always permitted (so the closure audit does not
+#                          over-reject — see PLAN.md Section 5 Layer 4).
+
+prose_terms:
+  - class group
+  - class field theory
+  - ideal class
+  - fractional ideal
+  - dedekind domain
+  - ring of integers
+  - algebraic number field
+  - number field
+  - elliptic curve
+  - modular form
+  - modularity theorem
+  - mihailescu
+  - catalan's conjecture
+  - baker's theorem
+  - linear forms in logarithms
+  - unique factorization domain
+  - gauss sum
+  - l-function
+  - cyclotomic field
+  - algebraic geometry
+  - galois cohomology
+  - p-adic completion
+  - newton polygon
+  - hensel's lemma            # beyond first-order lifting; flag for review
+  - étale
+  - scheme-theoretic
+
+allow_context_terms:
+  - order            # order of an element
+  - unit             # units / unit digit
+  - norm             # norm in a bounding argument
+  - valuation        # v_p
+  - descent          # elementary descent
+  - prime ideal      # only flagged via 'ideal class'/'fractional ideal'; bare usage tolerated
+
+lean_denylist_decls:
+  - Mathlib.NumberTheory.ClassNumber
+  - Mathlib.RingTheory.ClassGroup
+  - Mathlib.RingTheory.DedekindDomain
+  - Mathlib.NumberTheory.NumberField
+  - NumberField.RingOfIntegers
+  - IsDedekindDomain
+  - EllipticCurve
+  - Mathlib.NumberTheory.EllipticCurve
+  - Mathlib.NumberTheory.ModularForms
+  - Mathlib.NumberTheory.Cyclotomic
+  - Mathlib.NumberTheory.Catalan
+  - Mathlib.AlgebraicGeometry
+
+lean_infrastructure_allowlist:
+  - WellFounded.fix
+  - WellFounded.recAux
+  - Acc.rec
+  - Nat.rec
+  - Nat.strongRecOn
+  - Decidable
+  - DecidableEq
+  - DecidablePred
+  - SizeOf
+  - instHAdd
+  - instHMul

@@ -1,0 +1,60 @@
+# Allowed elementary toolkit — the closed justification vocabulary for proof-step ledgers.
+# Layer 1a validates every step's `justification` against the keys below.
+# `obligation` names the structured obligation a step with this justification must discharge
+# (one of: none, case_cover, descent, bounding, split_coprimality). See ledger.schema.json.
+# See agent/PLAN.md Section 2 for the prose definition and Section 5 for how this is enforced.
+
+justifications:
+  # --- bookkeeping ---
+  given:        { obligation: none, desc: "a hypothesis of the problem" }
+  assumption:   { obligation: none, desc: "an assumption opened (e.g. for contradiction or a case)" }
+  conclusion:   { obligation: none, desc: "the terminal step: restates the theorem" }
+  algebra:      { obligation: none, desc: "routine integer/polynomial algebraic manipulation over Z" }
+
+  # --- core elementary number theory ---
+  divisibility:          { obligation: none, desc: "divisibility relations" }
+  congruence:            { obligation: none, desc: "modular arithmetic / CRT" }
+  gcd_coprimality:       { obligation: none, desc: "gcd, lcm, Bezout, Euclid's lemma, coprimality" }
+  parity:                { obligation: none, desc: "even/odd arguments" }
+  factorization:         { obligation: none, desc: "elementary integer factorization (use split_coprimality obligation when splitting a coprime product into squares)" }
+  bounding:              { obligation: bounding, desc: "inequalities / size / squeeze arguments" }
+  induction:             { obligation: none, desc: "mathematical induction" }
+  descent:               { obligation: descent, desc: "finite or infinite descent" }
+  well_ordering:         { obligation: none, desc: "well-ordering / minimal counterexample" }
+  extremal:              { obligation: none, desc: "extremal principle" }
+  pigeonhole:            { obligation: none, desc: "pigeonhole principle" }
+  case_split:            { obligation: case_cover, desc: "exhaustive case analysis (often modulo m)" }
+  orders:                { obligation: none, desc: "orders of elements, Fermat-Euler, primitive roots" }
+  lte:                   { obligation: none, desc: "lifting-the-exponent (pin the p=2 clause)" }
+  quadratic_residue:     { obligation: none, desc: "quadratic residues, Legendre/Jacobi symbol, Euler's criterion, quadratic reciprocity" }
+  valuation:             { obligation: none, desc: "p-adic valuation v_p bookkeeping (elementary)" }
+  polynomial_roots:      { obligation: none, desc: "factor theorem, rational-root theorem, a-b | P(a)-P(b)" }
+  multiplicative_function: { obligation: none, desc: "phi, tau, sigma identities" }
+  counting:              { obligation: none, desc: "counting / double counting" }
+
+  # --- named curated methods (knowledge/methods/) ---
+  vieta_jumping:    { obligation: descent, method_ref: knowledge/methods/vieta_jumping.md }
+  vierzahlensatz:   { obligation: none,    method_ref: knowledge/methods/vierzahlensatz.md }
+  pell:             { obligation: none,    method_ref: knowledge/methods/pell_equation.md }
+  squeeze:          { obligation: bounding, method_ref: knowledge/methods/squeeze_sequence.md }
+  cauchy_bezout:    { obligation: none,    method_ref: knowledge/methods/cauchy_bezout_substitution.md }
+  euclid_splitting: { obligation: split_coprimality, method_ref: knowledge/methods/euclid_lemma_factor_splitting.md }
+  euclid_set_extension: { obligation: none, method_ref: knowledge/methods/euclid_style_set_extension.md }
+  invariant_substitution: { obligation: none, method_ref: knowledge/methods/invariant_substitution.md }
+  arithmetic_progression: { obligation: none, method_ref: knowledge/methods/arithmetic_progressions.md }
+  sum_to_product:   { obligation: none,    method_ref: knowledge/methods/sum_to_product.md }
+
+# Boundary rulings for contested tools (PLAN.md Section 2.1). `allowed_with_citation` means the
+# fact may be cited but a per-problem note should record it; `allowed_per_problem_whitelist` means
+# disallowed unless the specific problem.md whitelists it.
+boundary_rulings:
+  pell_fundamental_solution:   { ruling: allowed,            note: "elementary descent/continued-fraction proof exists; citable" }
+  roots_of_unity_filter:       { ruling: allowed,            note: "finite, mechanical, no analysis" }
+  generating_functions:        { ruling: allowed,            note: "formal manipulation; flag if convergence/analysis invoked" }
+  dirichlet_pigeonhole:        { ruling: allowed,            note: "pigeonhole" }
+  zsygmondy:                   { ruling: allowed_with_citation, note: "elementary but hard; cite like LTE" }
+  quadratic_reciprocity_jacobi: { ruling: allowed,          note: "QR + Jacobi + Euler criterion + supplementary laws" }
+  gauss_sum_or_analytic_qr:    { ruling: disallowed,         note: "analytic; not elementary" }
+  higher_reciprocity:          { ruling: allowed_per_problem_whitelist, note: "cubic/quartic reciprocity (needed by Ljunggren); whitelist per problem" }
+  lte:                         { ruling: allowed,            note: "pin exact statement including the p=2 clause" }
+  v_p_valuation:               { ruling: allowed,            note: "integer-valued valuation + LTE elementary; Q_p machinery is not" }
