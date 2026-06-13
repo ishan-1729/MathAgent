@@ -5,7 +5,8 @@ MathAgent is a research repository for an **agentic system that solves mathemati
 Successful arguments are later formalized in Lean. It is a collaboration between Ishan and Kieren, with room
 for multiple AI workflows to explore separate branches.
 
-The build plan for the agent is **[`agent/PLAN.md`](agent/PLAN.md)** — read it first.
+The build plan for the agent is **[`agent/PLAN.md`](agent/PLAN.md)** — read it first. For what is
+actually built and live-validated so far, see **[`research/docs/build_status.md`](research/docs/build_status.md)**.
 
 ## Repository map
 
