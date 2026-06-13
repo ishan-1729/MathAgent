@@ -1,0 +1,5 @@
+{"problem_idx": 1, "problem": "Compute 2 + 2.", "answer": "4", "problem_type": ["Number Theory"]}
+{"problem_idx": 2, "problem": "How many primes are strictly less than 10?", "answer": "4", "problem_type": ["Number Theory"]}
+{"problem_idx": 3, "problem": "Simplify 1/2 + 1/2.", "answer": "1", "problem_type": ["Algebra"]}
+{"problem_idx": 4, "problem": "What is the area of a circle of radius 1?", "answer": "\\pi", "problem_type": ["Geometry"]}
+{"problem_idx": 5, "problem": "Find all integers n with n^2 = 9.", "answer": "{-3, 3}", "problem_type": ["Number Theory", "Algebra"]}

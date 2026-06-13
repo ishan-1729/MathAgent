@@ -1,0 +1,26 @@
+# ArXivMath release configuration. See README.md and agent/benchmarks/arxivmath.py.
+#
+# The harness loads a HuggingFace config (live) or a local JSONL (offline/synthetic). Downloaded data
+# contains the gold answers and is cached OUTSIDE the repo (never committed).
+
+dataset: MathArena/arxivmath          # HuggingFace org/name prefix
+default_release: arxivmath-0326       # the 03/2026 set where GPT-5.5-xHigh scores 77.50%
+aggregate_release: arxivmath          # the pooled set (103 problems, grows monthly)
+split: train
+
+# v1 is number theory only — the default harness subset.
+subset:
+  number_theory_only: true
+  number_theory_label: "Number Theory"   # matched case-insensitively in `problem_type`
+
+# Where to cache downloaded parquet (gitignored). Empty → HuggingFace default cache.
+cache_dir: ""
+
+# Reference: GPT-5.5-xHigh baseline (whole set, for "how much does the harness add" comparison).
+baselines:
+  arxivmath-0326: 0.7750
+  arxivmath_aggregate: 0.7402
+
+scoring: sympy-answer-equivalence       # agent/tools/answer_check.py
+license: CC BY-SA 4.0
+fixture: fixtures/sample.jsonl          # SYNTHETIC (not real ArXivMath) — for offline tests only

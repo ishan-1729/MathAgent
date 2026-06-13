@@ -22,11 +22,96 @@ from typing import Optional
 from agent.orchestrator.state import NodeState
 
 
-def goal_hash(statement: str) -> str:
-    """Deep hash of a goal statement: NFC + whitespace-normalized (case preserved — `x` != `X`)."""
-    s = unicodedata.normalize("NFC", statement)
+# --------------------------------------------------------------------------------------------------
+# Semantic-ish canonicalization for the memo key (see research/docs/system_design.md §7).
+#
+# This key is SOUNDNESS-CRITICAL: a *false hit* (two distinct goals hashing equal) would reuse a proof
+# of the wrong lemma. So canonicalization folds ONLY meaning-preserving surface differences (notation,
+# synonyms, spacing) and DELIBERATELY does NOT rename variables (α-renaming free single letters is
+# unsound — it would merge `x ∣ y` with `y ∣ x`) and does NOT reorder operands. Missing a true match
+# only costs recomputation; a false match would be unsound, so we bias hard toward never merging.
+# --------------------------------------------------------------------------------------------------
+
+_SUPERSCRIPT = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+                "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"}
+_SUBSCRIPT = {"₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+              "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9"}
+
+# Single-character math symbols → a canonical ASCII spelling (meaning-preserving).
+_SYMBOLS = [
+    ("⟺", "<->"), ("⇔", "<->"), ("↔", "<->"),
+    ("⟹", "->"), ("⟶", "->"), ("⇒", "->"), ("→", "->"),
+    ("≤", "<="), ("⩽", "<="), ("≥", ">="), ("⩾", ">="), ("≠", "!="),
+    ("×", "*"), ("⋅", "*"), ("·", "*"),
+    ("−", "-"), ("–", "-"), ("—", "-"),          # U+2212 minus, en-dash, em-dash → '-'
+    ("∤", " notdvd "), ("∣", "|"),               # divisibility
+    ("ℤ", " Int "), ("ℕ", " Nat "), ("ℚ", " Rat "), ("ℝ", " Real "), ("ℂ", " Complex "),
+    ("∀", " forall "), ("∃", " exists "), ("∈", " in "),
+    ("∞", " infinity "), ("√", " sqrt "), ("∑", " sum "), ("∏", " prod "), ("∅", " emptyset "),
+]
+
+# Natural-language phrasings → a canonical spelling. Applied longest-first with word boundaries so
+# "iff" never matches inside "diff" and "less than or equal to" is folded before "less than".
+# NOTE: only ORDER-PRESERVING synonyms are folded; reversing phrases ("is divisible by", "is a
+# multiple of") are intentionally omitted because they would change operand order.
+_PHRASES = [
+    ("if and only if", "<->"),
+    ("greater than or equal to", ">="), ("less than or equal to", "<="),
+    ("is greater than", ">"), ("is less than", "<"),
+    ("greater than", ">"), ("less than", "<"),
+    ("is not equal to", "!="), ("not equal to", "!="),
+    ("is equal to", "="), ("equals", "="),
+    ("for all", "forall"), ("for every", "forall"), ("for each", "forall"), ("for any", "forall"),
+    ("there exists", "exists"), ("there exist", "exists"),
+    ("such that", "s.t."), ("divides", "|"), ("implies", "->"), ("iff", "<->"), ("modulo", "mod"),
+]
+_PHRASE_RES = [
+    (re.compile(r"\b" + re.escape(p) + r"\b", re.IGNORECASE), f" {r} ")
+    for p, r in sorted(_PHRASES, key=lambda x: -len(x[0]))
+]
+
+_LEAD = re.compile(
+    r"^\s*(?:we\s+(?:want|need|must|have)\s+to\s+show\s+that|prove\s+that|show\s+that|"
+    r"prove|show|claim\s+that|claim|it\s+holds\s+that)\s+", re.IGNORECASE)
+_OP_SPACE = re.compile(r"\s*([-+*/^=<>|(){}\[\],!])\s*")
+
+
+def _fold_scripts(s: str) -> str:
+    """Super/subscript runs → `^digits` / `_digits` (so `n²` ≡ `n^2`, `x₁` ≡ `x_1`)."""
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        table = _SUPERSCRIPT if s[i] in _SUPERSCRIPT else (_SUBSCRIPT if s[i] in _SUBSCRIPT else None)
+        if table is None:
+            out.append(s[i]); i += 1
+            continue
+        digits = []
+        while i < n and s[i] in table:
+            digits.append(table[s[i]]); i += 1
+        out.append(("^" if table is _SUPERSCRIPT else "_") + "".join(digits))
+    return "".join(out)
+
+
+def canonical_form(statement: str) -> str:
+    """Conservative semantic canonicalization of a goal statement (see the module note above)."""
+    s = unicodedata.normalize("NFC", statement or "")
+    s = s.replace("$", "").replace("`", "")          # drop math/code delimiters
+    s = _fold_scripts(s)
+    for src, dst in _SYMBOLS:
+        s = s.replace(src, dst)
+    for rx, repl in _PHRASE_RES:
+        s = rx.sub(repl, s)
+    s = _LEAD.sub("", s)                              # drop a leading "prove that"/"show that"/…
     s = re.sub(r"\s+", " ", s).strip()
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+    s = _OP_SPACE.sub(r"\1", s)                       # normalize spacing around operators
+    s = s.rstrip(".")                                 # drop a trailing period
+    return s.strip()
+
+
+def goal_hash(statement: str) -> str:
+    """Deep hash of a goal statement, keyed by its conservative canonical form. Case-preserving
+    (`x` != `X`); folds notation/synonyms/spacing but never renames variables or reorders operands."""
+    return hashlib.sha256(canonical_form(statement).encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass

@@ -11,6 +11,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "hypothesis>=6.0"]
+# Neural retrieval backend (bi-encoder + optional cross-encoder reranker). CPU-friendly.
+neural = ["sentence-transformers>=2.2", "numpy>=1.24"]
+# ArXivMath benchmark loader (HuggingFace datasets).
+benchmark = ["datasets>=2.14"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -22,6 +26,7 @@ packages = [
     "agent.gates",
     "agent.tools",
     "agent.orchestrator",
+    "agent.benchmarks",
 ]
 
 [tool.setuptools.package-data]

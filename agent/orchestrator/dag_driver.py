@@ -26,6 +26,7 @@ from agent.orchestrator.driver import Prover, Judge
 from agent.orchestrator.population import Comparator, EloPopulation, Candidate
 from agent.orchestrator.ralph import RalphLoop
 from agent.orchestrator.state import Budget, NodeState
+from agent.orchestrator.tournament import RevisionController
 from agent.orchestrator.trace import RunTrace
 
 
@@ -97,6 +98,7 @@ class DagDriver:
         comparator: Optional[Comparator] = None,
         population_k: int = 0,
         population_rounds: int = 1,
+        refiner: Optional[RevisionController] = None,
         terminal_gate: Optional[Callable[[str, str], object]] = None,
     ):
         self.prover = prover
@@ -115,6 +117,10 @@ class DagDriver:
         self.comparator = comparator
         self.population_k = population_k
         self.population_rounds = population_rounds
+        # Autoreason incumbent-tournament revision controller (agent/orchestrator/tournament.py).
+        # When set, a directly-proven node's ledger is refined without ever regressing it: a challenger
+        # must beat the incumbent on a blind judge panel AND stay elementary to displace it.
+        self.refiner = refiner
         # Terminal authoritative gate (PLAN.md §5 Layer 4): (root_goal, proof_text) -> result with an
         # `.authoritative` attribute. Runs once after the root is proven (formalize -> Lean audit ->
         # faithfulness). See agent/orchestrator/formalize_bridge.make_terminal_gate.
@@ -168,14 +174,17 @@ class DagDriver:
         res = ralph.run(goal)
         node.attempts += res.episodes
         if res.success:
-            self.dag.mark_proven_direct(goal, res.ledger)
+            ledger = self._refine(goal, res.ledger)   # Autoreason tournament (no-regression refine)
+            self.dag.mark_proven_direct(goal, ledger)
             self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
             return True
         if res.exhausted:
             self.dag.mark_failed(goal)
             return False
 
-        # 2. Decomposition (LEAP), bounded attempts with reviewer gating + backtracking.
+        # 2. Decomposition (LEAP), with reviewer gating + backtracking. The FIRST plan is free; each
+        #    further re-plan consumes the global replan budget, so re-decomposition is bounded both
+        #    per-node (max_decomp_attempts) and globally (Budget.max_replan_depth).
         if self.decomposer is None:
             self.dag.mark_failed(goal)
             return False
@@ -183,13 +192,20 @@ class DagDriver:
         feedback = list(res.lessons)
         child_ancestors = ancestors | {key}
 
-        if self.population_k and self.comparator is not None:
-            if self._prove_via_population(goal, feedback, child_ancestors, depth):
-                return True
-        else:
-            for _attempt in range(self.max_decomp_attempts):
-                if not self.budget.can_call():
+        for attempt in range(self.max_decomp_attempts):
+            if attempt > 0:                                   # attempts after the first are re-plans
+                if not self.budget.can_replan():
+                    self.trace.emit("replan_exhausted", goal=goal[:80],
+                                    replans=self.budget.replans_spent)
                     break
+                self.budget.spend_replan()
+                self.trace.emit("replan", goal=goal[:80], replan=self.budget.replans_spent)
+            if not self.budget.can_call():
+                break
+            if self.population_k and self.comparator is not None:
+                if self._prove_via_population(goal, feedback, child_ancestors, depth):
+                    return True
+            else:
                 self.budget.spend_call()
                 sketch, children = self.decomposer.decompose(goal, feedback or None)
                 self.trace.emit("decompose", goal=goal[:80], children=len(children))
@@ -200,6 +216,29 @@ class DagDriver:
 
         self.dag.mark_failed(goal)
         return False
+
+    def _refine(self, goal: str, ledger: str) -> str:
+        """Optionally refine a directly-proven ledger via the incumbent tournament. Monotone: the
+        returned ledger is never worse than the input (a challenger must beat it on a blind panel AND
+        stay elementary to displace it)."""
+        if self.refiner is None or not self.budget.can_call():
+            return ledger
+        try:
+            result = self.refiner.refine(goal, ledger, is_admissible=self._is_admissible)
+        except Exception:
+            return ledger
+        if result.changed:
+            self.trace.emit("refine", goal=goal[:80], passes=result.passes,
+                            displacements=result.displacements)
+        return result.content
+
+    def _is_admissible(self, ledger: str) -> bool:
+        """A candidate proof is admissible iff it passes the deterministic + soft gate (not rejected).
+        Used by the refiner so a non-elementary 'improvement' can never displace an elementary proof."""
+        try:
+            return not evaluate(ledger, self.toolkit).rejected
+        except Exception:
+            return False
 
     def _try_decomposition(self, goal: str, sketch: str, children: list[str],
                            child_ancestors: set[str], depth: int) -> tuple[bool, list[str]]:
@@ -276,15 +315,22 @@ class DagDriver:
             pop.add(c)
         comparisons = pop.tournament(self.comparator, rounds=self.population_rounds,
                                      budget_ok=self._compare_budget_ok)
+        # Bradley-Terry latent strengths from the tournament win matrix (a stable batch estimate over
+        # noisy online Elo), then PUCT-best-first expansion (exploit strength + explore under-visited).
+        pop.set_ratings_from_bradley_terry()
         self.trace.emit("population", goal=goal[:80], candidates=len(cands), comparisons=comparisons)
 
-        for tried, cand in enumerate(pop.ranking()):
-            if tried >= self.max_decomp_attempts:
+        tried = 0
+        while tried < min(self.max_decomp_attempts, len(cands)):
+            cand = pop.select_puct()
+            if cand is None:
                 break
+            tried += 1
             ok, _notes = self._try_decomposition(goal, cand.content, cand.children,
                                                  child_ancestors, depth)
             if ok:
                 return True
+            cand.alive = False          # don't reselect a failed candidate
         return False
 
 

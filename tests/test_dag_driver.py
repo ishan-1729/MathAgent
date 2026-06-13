@@ -9,7 +9,11 @@ import pytest
 from agent.orchestrator.dag_driver import (
     DagDriver, ReviewVerdict, ScriptedDecomposer, ScriptedReviewer,
 )
+from agent.orchestrator.population import KeyComparator
 from agent.orchestrator.state import Budget, NodeState
+from agent.orchestrator.tournament import (
+    RevisionController, ScriptedCritic, ScriptedAuthor, ScriptedSynthesizer,
+)
 from agent.orchestrator.trace import RunTrace
 from agent.gates.toolkit import load_toolkit
 
@@ -20,6 +24,13 @@ OK_REVIEW = ReviewVerdict(useful=True, elementary=True)
 def valid_ledger(goal: str) -> str:
     return json.dumps({"problem": "p", "claim": goal, "steps": [
         {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+        {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]}]})
+
+
+def valid_ledger2(goal: str) -> str:
+    """A second, structurally-valid ledger for the same goal (a distinct admissible candidate)."""
+    return json.dumps({"problem": "p2", "claim": goal, "steps": [
+        {"id": "s1", "claim": "alt setup", "justification": "given", "depends_on": []},
         {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]}]})
 
 
@@ -175,3 +186,52 @@ def test_trace_has_final_event():
     res = _driver(DictProver({"G": valid_ledger("G")})).run("G")
     assert res.trace.by_kind("final")
     assert res.trace.by_kind("final")[0].data["proven"] is True
+
+
+# ---- Autoreason refiner wired into the driver (no-regression refinement of a direct proof) ----
+
+def _refiner(score_map):
+    judge = KeyComparator(lambda c: score_map.get(c.content, 0.0))
+    return RevisionController(ScriptedCritic([["x"]]), ScriptedAuthor([valid_ledger2("G")]),
+                             ScriptedSynthesizer([valid_ledger2("G")]), [judge], seed=0)
+
+
+def test_refiner_improves_a_direct_proof():
+    a, b = valid_ledger("G"), valid_ledger2("G")
+    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 1.0, b: 5.0})).run("G")
+    assert res.proven
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert node.proof_kind == "direct"
+    assert node.proof == b               # displaced by the judge-preferred admissible candidate
+
+
+def test_refiner_never_regresses_a_direct_proof():
+    a, b = valid_ledger("G"), valid_ledger2("G")
+    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 10.0, b: 1.0})).run("G")
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert node.proof == a               # incumbent held (do-nothing wins)
+
+
+# ---- max_replan_depth bounds re-decomposition globally ----
+
+def test_max_replan_depth_caps_replans():
+    prover = DictProver({})                                   # G fails direct; A is unprovable
+    decomp = DictDecomposer({"G": (sketch("G", ["A"]), ["A"])})
+    budget = Budget(max_replan_depth=1)
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  budget=budget, max_decomp_attempts=5).run("G")
+    assert not res.proven
+    assert budget.replans_spent == budget.max_replan_depth   # the cap was reached, not exceeded
+    assert len(res.trace.by_kind("replan")) == 1
+    assert res.trace.by_kind("replan_exhausted")             # at least one node hit the cap
+
+
+def test_zero_replan_depth_allows_only_the_first_plan():
+    prover = DictProver({})
+    decomp = DictDecomposer({"G": (sketch("G", ["A"]), ["A"])})
+    budget = Budget(max_replan_depth=0)
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  budget=budget, max_decomp_attempts=5).run("G")
+    assert not res.proven
+    assert budget.replans_spent == 0
+    assert res.trace.by_kind("replan") == []

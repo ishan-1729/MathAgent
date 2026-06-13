@@ -90,6 +90,21 @@ class EloPopulation:
         self.candidates.append(c)
         return c
 
+    @property
+    def win_matrix(self) -> dict[tuple[str, str], int]:
+        """A copy of the accumulated pairwise win counts (`[(i, j)] = times i beat j`)."""
+        return dict(self._win_matrix)
+
+    def set_ratings_from_bradley_terry(self, iters: int = 200) -> dict[str, float]:
+        """Refit ratings from the cumulative win matrix via Bradley-Terry (a stable batch estimate
+        over noisy online Elo) and write the latent strengths onto the candidates. Returns them."""
+        ids = [c.id for c in self.candidates]
+        strengths = fit_bradley_terry(ids, self._win_matrix, iters=iters)
+        for c in self.candidates:
+            if c.id in strengths:
+                c.rating = strengths[c.id]
+        return strengths
+
     # --- Elo updates from a single comparison ---
     def record(self, a: Candidate, b: Candidate, outcome_a: float) -> None:
         """outcome_a in {1.0 win, 0.5 tie, 0.0 loss} for candidate a."""

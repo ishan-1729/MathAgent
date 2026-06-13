@@ -31,6 +31,7 @@ from agent.orchestrator.dag import goal_hash
 from agent.orchestrator.dag_driver import ReviewVerdict
 from agent.orchestrator.population import Candidate
 from agent.orchestrator.faithfulness import SingleVerdict, PanelFaithfulnessChecker
+from agent.orchestrator.tournament import RevisionController
 
 _ROLE_DIR = Path(__file__).resolve().parents[1] / "roles"
 
@@ -302,3 +303,123 @@ class CodexFaithfulnessChecker:
 
     def check(self, informal_claim: str, lean_source: str, theorem_name: str):
         return self._panel.check(informal_claim, lean_source, theorem_name)
+
+
+# --------------------------------------------------------------------------------------------------
+# Autoreason incumbent-tournament roles, backed by Codex (the revision controller's critic / author /
+# synthesizer / judge). These are GENERIC over a "candidate" string — a proof ledger (DagDriver
+# refiner) OR a free-form solution (benchmark harness) — so the same tournament drives both. See
+# agent/orchestrator/tournament.py.
+# --------------------------------------------------------------------------------------------------
+
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def _json_array(raw: str) -> list[str]:
+    m = _JSON_ARRAY_RE.search(raw)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    return [str(x) for x in arr] if isinstance(arr, list) else []
+
+
+_NON_ELEM = ("class groups, elliptic curves, modular forms, Baker's theorem, Mihăilescu/Catalan, "
+             "p-adic machinery beyond v_p, algebraic number fields, analytic number theory")
+
+
+class CodexCritic:
+    """Adversarial failure-analysis of a candidate (problems only, no fixes)."""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None):
+        self.cfg = cfg or CodexConfig()
+
+    def critique(self, goal: str, incumbent: str) -> list[str]:
+        prompt = (
+            "You are an adversarial CRITIC of a candidate solution/proof to a number-theory problem. "
+            "Do failure analysis ONLY — list concrete flaws: logical gaps, computational/arithmetic "
+            "errors, unjustified steps, wrong or edge-case-incorrect final answers, and any "
+            f"NON-ELEMENTARY method ({_NON_ELEM}). Propose NO fixes.\n\n"
+            f"PROBLEM:\n{goal}\n\nCANDIDATE:\n{incumbent}\n\n"
+            'Output ONLY a JSON array of short strings (e.g. ["flaw 1","flaw 2"]); use [] if flawless. '
+            "Do not read or modify any files."
+        )
+        return _json_array(_run_codex(prompt, self.cfg))
+
+
+class CodexAuthor:
+    """Revise a candidate to address a critique, preserving its output format."""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None):
+        self.cfg = cfg or CodexConfig()
+
+    def revise(self, goal: str, incumbent: str, critique: list[str]) -> str:
+        issues = "\n".join(f"- {c}" for c in critique) or "(no specific issues; improve rigor/clarity)"
+        prompt = (
+            "You REVISE a candidate solution/proof to a number-theory problem to fix the listed issues, "
+            "using ONLY elementary methods (the IMO toolkit: divisibility, congruences, gcd/coprimality, "
+            "descent, bounding, parity, induction). Keep the SAME output format as the candidate; if it "
+            "ends with a line 'FINAL ANSWER: <answer>', your revision MUST also end with exactly that "
+            "line.\n\n"
+            f"PROBLEM:\n{goal}\n\nCURRENT CANDIDATE:\n{incumbent}\n\nISSUES TO FIX:\n{issues}\n\n"
+            "Output ONLY the revised candidate. Do not read or modify any files."
+        )
+        return _run_codex(prompt, self.cfg)
+
+
+class CodexSynthesizer:
+    """Merge two candidates into a single stronger one (blind to which is the incumbent)."""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None):
+        self.cfg = cfg or CodexConfig()
+
+    def synthesize(self, goal: str, a: str, b: str) -> str:
+        prompt = (
+            "You MERGE two candidate solutions/proofs to a number-theory problem into a single, stronger "
+            "one — combining their correct insights, discarding errors, using ONLY elementary methods. "
+            "Keep the SAME output format; if either ends with a line 'FINAL ANSWER: <answer>', end with "
+            "that line.\n\n"
+            f"PROBLEM:\n{goal}\n\n=== CANDIDATE 1 ===\n{a}\n\n=== CANDIDATE 2 ===\n{b}\n\n"
+            "Output ONLY the merged solution. Do not read or modify any files."
+        )
+        return _run_codex(prompt, self.cfg)
+
+
+class CodexSolutionComparator:
+    """Pairwise judge for the incumbent tournament: which candidate solution/proof is better?"""
+
+    def __init__(self, cfg: Optional[CodexConfig] = None):
+        self.cfg = cfg or CodexConfig()
+
+    def compare(self, a: Candidate, b: Candidate) -> int:
+        prompt = (
+            "You judge two candidate solutions/proofs to the SAME number-theory problem. Pick the one "
+            "more likely to be CORRECT, that is more rigorous, and that is fully ELEMENTARY (penalize "
+            f"any reliance on heavy machinery: {_NON_ELEM}).\n\n"
+            f"PROBLEM:\n{a.goal}\n\n=== CANDIDATE A ===\n{a.content}\n\n=== CANDIDATE B ===\n{b.content}\n\n"
+            'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}. Do not read or modify any files.'
+        )
+        raw = _run_codex(prompt, self.cfg)
+        m = _VERDICT_RE.search(raw)
+        if not m:
+            return 0
+        try:
+            w = str(json.loads(m.group(0)).get("winner", "tie")).strip().lower()
+        except json.JSONDecodeError:
+            return 0
+        return 1 if w == "a" else (-1 if w == "b" else 0)
+
+
+def make_codex_refiner(cfg: Optional[CodexConfig] = None, *, n_judges: int = 1,
+                       budget=None, trace=None, max_passes: int = 2, k_stop: int = 2,
+                       margin: int = 1, seed: int = 0) -> RevisionController:
+    """A fully Codex-backed Autoreason incumbent tournament (critic + author + synthesizer + an
+    n_judges-strong Codex judge panel). PUCT + Bradley-Terry run on the judges' win matrix inside the
+    controller; the caller supplies the admissibility gate (e.g. the elementary gate) to refine()."""
+    cfg = cfg or CodexConfig()
+    judges = [CodexSolutionComparator(cfg) for _ in range(max(1, n_judges))]
+    return RevisionController(CodexCritic(cfg), CodexAuthor(cfg), CodexSynthesizer(cfg), judges,
+                              max_passes=max_passes, k_stop=k_stop, margin=margin,
+                              budget=budget, trace=trace, seed=seed)

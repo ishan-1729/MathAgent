@@ -1,5 +1,11 @@
 # MathAgent — Build Status
 
+> **Snapshot:** `2026-06-13T23:49:58+05:30` · working tree (uncommitted) atop commit `fd7da0d`
+> · stamp `4d9b8faa22d369d1`
+> (`stamp = sha256(timestamp | full-commit-sha)[:16]` — identifies the exact state this doc describes;
+> regenerate on every edit so a stale doc is detectable.) See the canonical
+> **[`system_design.md`](system_design.md)** for the architecture this status tracks against.
+
 > Status vocabulary: **data/docs** (curated, non-executable) · **built** (code present, no test asserted here) · **unit-tested** (offline deterministic tests pass) · **LIVE-validated** (exercised against real Lean/Mathlib/Codex) · **partial** (wired but not end-to-end run) · **planned** (placeholder only).
 
 ---
@@ -17,6 +23,31 @@ MathAgent is a **training-free agentic harness** that attempts to prove **elemen
 | **Lean role** | Soft/advisory in the docs era → **now the authoritative Layer 4**: a dependency + axiom audit is the only non-gameable gate. |
 | **Tiering** | Targets staged IMO → research-grade NT problems. |
 | **Elementary enforcement** | Binary admit/reject **GATE** applied *before* any weighted scoring. |
+
+---
+
+## 1b. Implemented vs. the design memo (adoption-list scorecard)
+
+Measured against the prioritized adoption list in
+[`literature_design_implications.md`](literature_design_implications.md) §4 — the cleanest yardstick for
+"are we building what the literature synthesis prescribed." (The framing — *one LEAP spine + grafted
+components + the elementary gate as the product* — is in [`system_design.md`](system_design.md) §2.)
+
+| Memo priority | Item | Status |
+|---|---|---|
+| **HIGH 1** | Pantograph as Lean substrate | **Substituted** — own `lean_bridge` + community-REPL server + `Audit.lean` (proof-term closure + `collectAxioms`); Pantograph not depended on. |
+| **HIGH 2** | LEAP AND-OR DAG + pre-commit reviewer | **Built + tested** (`dag.py`, `dag_driver.py`). |
+| **HIGH 3** | HARD gate = dependency audit + restricted env + V_leg AST legality | **Partial.** Dependency-closure + axiom-whitelist audit **built + live**; restricted-import env **intentionally skipped** (memo: coarse/brittle, backstopped by the audit); **V_leg AST legality deferred** → gap #8. |
+| **HIGH 4** | Self-correction repair + Autoreason incumbent tournament | **Built.** Repair loop **live**; **Autoreason tournament now built + wired** (`tournament.py`; PUCT + Bradley-Terry; `max_replan_depth` consumed). |
+| **MED 5** | Retrieval bias to an elementary index | **Built.** Loogle + BM25 + **neural bi-encoder (`bge-small-en-v1.5`)** via `HybridRetriever`. |
+| **MED 6** | Construction/witness finder (Axplorer) | **Partial** — `numeric.py` grounding only; no population search-as-tool. |
+| **MED 7** | Skill cards + immutable objective spec | **Partial** — toolkit/denylist YAML + method files; immutability not architecturally enforced. |
+| **MED 8** | AXLE/LeanDojo artifact cleanup + verified-lemma cache | **Not built.** |
+| **LOW 9–12** | Trained prover, LeanProgress reranker, data-gen flywheel, orchestration shells | **Deferred to v2** (a cross-encoder reranker *hook* exists in the neural retriever). |
+
+**MathAgent-original (not on the menu), built:** the typed **step-ledger** gate; the adversarial
+**faithfulness panel**; the **persistent Lean server**; the conservative **semantic `goal_hash`**; and the
+non-contaminative **ArXivMath benchmark** adapter + harness.
 
 ---
 
@@ -142,6 +173,8 @@ MathAgent is a **training-free agentic harness** that attempts to prove **elemen
 | Formalizer | `agent/tools/formalizer.py` | Ledger → Lean 4 (fresh + repair prompts) | built+unit-tested |
 | Loogle retrieval | `agent/tools/retrieval.py` | Mathlib lemma names via Loogle HTTP; graceful degrade | built+unit-tested |
 | Semantic retrieval | `agent/tools/semantic_retrieval.py` | Local BM25 + HybridRetriever over elementary Mathlib subset | built+unit-tested |
+| Neural retrieval | `agent/tools/neural_retrieval.py` | Dense bi-encoder (`bge-small-en-v1.5`) + optional cross-encoder reranker; graceful degrade; offline `HashingEmbedder` for tests | built+unit-tested (model stubbed); **live opt-in** |
+| Answer checker | `agent/tools/answer_check.py` | SymPy answer-equivalence (symbolic / numeric / set-tuple / string) for final-answer benchmarks | built+unit-tested |
 
 ### 3.5 Orchestrator / harness (`agent/orchestrator/`)
 
@@ -150,10 +183,11 @@ MathAgent is a **training-free agentic harness** that attempts to prove **elemen
 | Liveness (NodeState + Budget) | `agent/orchestrator/state.py` | State machine + hard caps (150 calls / 6 repairs / depth 2) | built+unit-tested |
 | RunTrace | `agent/orchestrator/trace.py` | JSONL event log + run-record render | built+unit-tested |
 | FlatDriver | `agent/orchestrator/driver.py` | Phase-1 linear plan→prove→gate→repair→judges | built+unit-tested |
-| ProofDAG | `agent/orchestrator/dag.py` | AND-OR DAG, deep-hash memoization, acyclicity, assemble | built+unit-tested |
+| ProofDAG | `agent/orchestrator/dag.py` | AND-OR DAG, **semantic** deep-hash memoization (`canonical_form`), acyclicity, assemble | built+unit-tested |
 | RalphLoop | `agent/orchestrator/ralph.py` | Per-goal multi-episode loop, gate-rejects → lessons | built+unit-tested (indirect) |
-| DagDriver | `agent/orchestrator/dag_driver.py` | direct→decompose→review→recurse; terminal gate hook | built+unit-tested |
-| Population / Elo | `agent/orchestrator/population.py` | Candidate Elo, tournament, PUCT, Bradley-Terry MLE | built+unit-tested |
+| DagDriver | `agent/orchestrator/dag_driver.py` | direct→decompose→review→recurse; terminal gate hook; **refiner hook + `max_replan_depth` consumed + PUCT/BT candidate selection** | built+unit-tested |
+| Population / Elo | `agent/orchestrator/population.py` | Candidate Elo, tournament, PUCT, Bradley-Terry MLE (now driven by the driver + tournament) | built+unit-tested |
+| Revision tournament | `agent/orchestrator/tournament.py` | **Autoreason incumbent tournament**: critic→author→synth→blind panel; do-nothing wins ties; k=2 stop; margin gate; PUCT + Bradley-Terry; elementary-admissibility guard | built+unit-tested |
 | Faithfulness panel | `agent/orchestrator/faithfulness.py` | 4-lens adversarial check; default-unfaithful | built+unit-tested |
 | Formalize bridge | `agent/orchestrator/formalize_bridge.py` | Terminal L4 gate: formalize→compile→audit→faithfulness | built+unit-tested |
 
@@ -184,12 +218,16 @@ MathAgent is a **training-free agentic harness** that attempts to prove **elemen
 
 | Component | File | Role | Status |
 |---|---|---|---|
-| prove.py | `scripts/prove.py` | Prover CLI; full flag surface; exit-2 if codex absent; pure wiring | built |
+| prove.py | `scripts/prove.py` | Prover CLI; full flag surface (`--neural`/`--rerank` added); exit-2 if codex absent | built |
+| run_benchmark.py | `scripts/run_benchmark.py` | Non-contaminative ArXivMath CLI; vanilla `CodexAnswerSolver` + `--harness` (Codex Autoreason tournament) solver; per-item error isolation | **built+LIVE-validated** (real GPT-5.5-xHigh run) |
+| ArXivMath adapter | `agent/benchmarks/arxivmath.py` | Loader (statement-only `Problem` + held-out `oracle`) + `run_benchmark` + run records | built+unit-tested |
+| ArXivMath dataset dir | `benchmarks/datasets/arxivmath/` | README (provenance/license/CC BY-SA 4.0), `manifest.yaml`, synthetic `fixtures/sample.jsonl` | data/docs |
+| CI workflow | `.github/workflows/ci.yml` | Offline job (skeleton + suite, py3.11/3.12) always-on; **live-Lean suite on `workflow_dispatch`** with `.lake` cache | built |
 | check_repo_skeleton.py | `scripts/check_repo_skeleton.py` | `make check` validator | built |
 | Makefile | `Makefile` | check/test/demo/all/tree | built |
 | pyproject.toml | `pyproject.toml` | py≥3.11; pyyaml/sympy/jsonschema; pytest config | built |
 | conftest.py | `conftest.py` | sys.path bootstrap for `import agent` | built |
-| tests/ (24 files) | `tests/` | Full-stack suite (23 test modules + conftest) | built+unit-tested |
+| tests/ (29 files) | `tests/` | Full-stack suite (28 test modules + conftest) | built+unit-tested |
 | Live-gated tests | `tests/test_lean_mathlib_live.py` (+ bridge/server/formalize/codex) | Opt-in via env flags | **built+LIVE-validated** |
 | demo.py | `agent/demo.py` | `make demo` no-LLM/no-network end-to-end | built |
 | Lean env README | `formal/lean/README.md` | Lean 4.30.0 + Mathlib v4.30.0 build/audit env | data/docs |
@@ -210,8 +248,10 @@ MathAgent is a **training-free agentic harness** that attempts to prove **elemen
 | **Retrieval live** | Loogle HTTP API + local BM25 over an elementary Mathlib subset both produce real Mathlib lemma names. |
 | **Faithfulness panel 4/4 lenses** | back_translation / quantifiers_domain / vacuity / strength each default to "unfaithful"; aggregation rejects on any objection (tolerance 0). |
 | **Core elementary proof passes; `sorry` rejected** | Live: core proof passes; a `sorry` proof is rejected via `sorryAx`. |
+| **Full certification pipeline authoritative on real NT theorems** (2026-06-13) | `prove.py --terminal-gate --server --faithfulness --retrieval --repair 3` (GPT-5.5-xHigh): **`n²≡0,1 mod 4`** and **`√2 irrational` (x²=2y², infinite descent)** both went prove→formalize→compile→**Layer-4 audit PASS (0 rejects)**→faithfulness 4/4→`authoritative_elementary=True`. **2/3** of the ladder certified; `3∣a²+b²⇒3∣a∧3∣b` was proven but its `decide`-based formalization failed to compile → honestly `authoritative=False` (gap #1). See [`live_certification_runs.md`](live_certification_runs.md). |
+| **Vanilla vs harness on ArXivMath NT (final-answer)** | Live GPT-5.5-xHigh: vanilla 4/5 (80%); harness {7,15,17} 3/3 — no regression. The Codex Autoreason tournament (PUCT+BT+admissibility) ran end-to-end. See [`runs/2026-06-13_nt_vanilla_vs_harness.md`](../../benchmarks/datasets/arxivmath/runs/2026-06-13_nt_vanilla_vs_harness.md). |
 
-**Caveat:** the live Codex+Lean+Mathlib paths are **opt-in** (env-gated) and were **not re-executed** in the surveys; "LIVE-validated" rests on the persisted real-toolchain fixtures, the built REPL/Mathlib project, and prior validated runs documented in tests/docs — not a fresh run this session.
+**Caveat:** most live paths are still opt-in (env-gated). **This session DID re-execute** the certification pipeline and the ArXivMath comparison live with GPT-5.5-xHigh + Lean/Mathlib (rows above); the remaining "LIVE-validated" claims rest on persisted real-toolchain fixtures + prior validated runs.
 
 ---
 
@@ -226,7 +266,11 @@ make all       # check + test (CI target)
 make demo      # agent/demo.py — gate + flat driver, no LLM / no network
 ```
 
-Aggregate offline result across surveyed suites: **~210 tests passed, ~7 opt-in skipped** (gate/ledger/obligations/scanner/toolkit/lean_audit/terminal 68 + orchestrator/dag/dag_driver/population/faithfulness/trace 60 + numeric/retrieval/semantic/formalizer/codex set + lean_server/bridge — all deterministic, model & Lean stubbed).
+Aggregate offline result (this snapshot): **280 tests passed, 8 opt-in skipped** — all deterministic
+(model & Lean stubbed). New since the prior snapshot: `test_dag` semantic-canonicalization +
+soundness guards, `test_tournament`, `test_dag_driver` refiner/replan, `test_layer4_sync`,
+`test_neural_retrieval`, `test_answer_check`, `test_arxivmath`. The 8 skips are the env-gated live
+paths (`MATHAGENT_LEAN_TESTS` / `MATHAGENT_CODEX_TESTS` / `MATHAGENT_NEURAL_TESTS`).
 
 **Run the prover (requires the external `codex` CLI on PATH; `--server`/Mathlib audits need a built ~5 GB `.lake`):**
 
@@ -252,10 +296,11 @@ Key flags: `--model gpt-5.5` · `--effort xhigh` · `--direct` (single Ralph loo
 |---|---|
 | **LEAP** | AND-OR DAG with memoization — `agent/orchestrator/dag.py`, `dag_driver.py` |
 | **AlphaProof_Nexus** | Per-goal Ralph loop + population/Elo search — `agent/orchestrator/ralph.py`, `population.py` |
-| **Autoreason** | Incumbent / "do-nothing" revision tournament (design-only; k=2 stop) — *planned in DagDriver* |
-| **AlphaEvolve** | Population/Elo candidate-decomposition ranking — `agent/orchestrator/population.py` |
+| **Autoreason** | Incumbent / "do-nothing" revision tournament (k=2 stop, margin gate) — **built**: `agent/orchestrator/tournament.py`, wired into `DagDriver(refiner=…)` |
+| **AlphaEvolve** | Population/Elo candidate-decomposition ranking (PUCT + Bradley-Terry, driver-driven) — `agent/orchestrator/population.py` |
 | **AXLE** | Adversarial statement-faithfulness panel — `agent/orchestrator/faithfulness.py` |
-| **Loogle / LeanSearch** | Mathlib lemma retrieval for the repair loop — `agent/tools/retrieval.py` (+ BM25 `semantic_retrieval.py`) |
+| **Loogle / LeanSearch / LeanExplore** | Mathlib lemma retrieval — `agent/tools/retrieval.py` (Loogle) + BM25 (`semantic_retrieval.py`) + neural bi-encoder (`neural_retrieval.py`) |
+| **MathArena ArXivMath** | Non-contaminative final-answer benchmark adapter + SymPy grader — `agent/benchmarks/arxivmath.py`, `agent/tools/answer_check.py` |
 | **Pantograph / LeanDojo** | Lean compile/audit bridge + persistent REPL server — `agent/gates/lean_bridge.py`, `lean_server.py`, `lean/Audit.lean` |
 | **AlphaProof (substitute)** | Codex GPT-5.5-xHigh focused prover — `agent/tools/codex_prover.py` |
 
@@ -263,13 +308,45 @@ Key flags: `--model gpt-5.5` · `--effort xhigh` · `--direct` (single Ralph loo
 
 ## 7. Honest gaps & next steps
 
+### Resolved in this snapshot
+
+- ✅ **Retrieval neural backend (was gap #3)** — `neural_retrieval.py` adds a dense bi-encoder
+  (`bge-small-en-v1.5`, the LeanExplore recipe) + optional cross-encoder reranker, hybridized with
+  Loogle + BM25. Closes the abbreviation/paraphrase gap (`gcd` ↔ "greatest common divisor").
+  *Caveat:* unit-tested with a stub embedder; the semantic win is asserted only in the **opt-in** live
+  test (`MATHAGENT_NEURAL_TESTS=1`) — not yet run here.
+- ✅ **Autoreason tournament + PUCT + Bradley-Terry + `max_replan_depth` (was gap #5)** —
+  `tournament.py` (do-nothing first-class, k=2 stop, margin gate, **elementary-admissibility guard so a
+  non-elementary revision can't displace an elementary incumbent**); wired as `DagDriver(refiner=…)`;
+  the population path now uses Bradley-Terry strengths + PUCT selection; the decomposition loop consumes
+  the global replan budget.
+- ✅ **Semantic `goal_hash` (was gap #6)** — `canonical_form` folds notation/synonyms/spacing
+  (`n²−n` ≡ `n^2 - n`, `∀`≡`for all`, `∣`≡`divides`) **conservatively**: it never renames variables or
+  reorders operands (a false memo hit would be *unsound*), with soundness guards tested
+  (`x∣y` ≠ `y∣x`).
+- ✅ **CI + Layer-4 sync (was gap #7)** — `.github/workflows/ci.yml` runs the offline suite on every
+  push (py3.11/3.12) and the **live-Lean suite on manual `workflow_dispatch`** (cached `.lake`);
+  `test_layer4_sync.py` ties the `Audit.lean` JSON contract ↔ Python parser ↔ denylist YAML together
+  and pins that `gate.evaluate` does **not** invoke Layer 4 (the intentional separation).
+- ✅ **ArXivMath first live run (advances gap #2)** — non-contaminative adapter + SymPy grader, run
+  **live with GPT-5.5-xHigh** on the hand-classified NT subset of `arxivmath-0326`. **Vanilla 4/5
+  (80%, 1 timeout); harness {7,15,17} 3/3 = 100%; apples-to-apples 3/3 vs 3/3 — no regression.** The
+  Codex Autoreason tournament (PUCT + Bradley-Terry + admissibility gate) ran end-to-end on real
+  research problems. Record: [`benchmarks/datasets/arxivmath/runs/2026-06-13_nt_vanilla_vs_harness.md`](../../benchmarks/datasets/arxivmath/runs/2026-06-13_nt_vanilla_vs_harness.md).
+  *No lift shown — the base model is at ceiling on this tiny NT subset (the dataset, not the harness,
+  is the limiter).*
+
+### Remaining
+
 | # | Gap | Next step |
 |---|---|---|
-| 1 | **Autoformalization is the wall** — repair only recovered trivial targets (`n+0=n`, `n²−n`); no success demonstrated on hard NT. | Drive the formalize→repair loop on real benchmark problems; measure where formalization first fails. |
-| 2 | **Benchmark suite is effectively one problem** — 5 of 6 folders are placeholders, and the live one (`x2_plus_1_eq_y3`) is self-marked contaminated/example-adjacent. **No run records exist.** | Flesh out the 5 placeholder problems; add a clean uncontaminated target; produce real scored run records. |
-| 3 | **Retrieval is purely lexical** (BM25 + Loogle) — abbreviation/paraphrase gaps (e.g. "greatest common divisor" vs `gcd`). | Add neural / semantic embedding retrieval. |
-| 4 | **Statement-faithfulness same-model caveat** — judges and prover can be the same model; no cross-model independence. | Use an independent judge model; widen lens panel. |
-| 5 | **Incumbent / revision-control tournament not built** (Autoreason); PUCT + Bradley-Terry implemented but not wired into DagDriver selection; `max_replan_depth` tracked but unused. | Wire PUCT resampling and a first-class incumbent ("do nothing") tournament into the driver. |
-| 6 | **`goal_hash` is lexical** (NFC + whitespace), not semantic — trivially-rephrased identical lemmas miss the memo cache. | Add semantic goal canonicalization. |
-| 7 | **Live paths opt-in & not re-run**; `gate.py` deliberately does **not** invoke Layer 4 (chaining lives in `formalize_bridge`/`prove.py`); denylist/allowlist not asserted in sync with `Audit.lean` constant names. | Add a CI job that runs the live suite; add a sync test for denylist ↔ emitted constants. |
-| 8 | **Train-a-prover is explicitly v2.** | Keep training-free harness as the v1 baseline; revisit after benchmark runs exist. |
+| 1 | **Autoformalization is still the main wall** — but now with live data: 2/3 of a real NT ladder certified end-to-end (incl. infinite descent); the miss (`3∣a²+b²⇒3∣a∧3∣b`) was a brittle `decide`-over-`Fin`/`ZMod` formalization that failed `Decidable` synthesis, and the 3-iter repair didn't steer off `decide`. | Bias the formalizer/repair prompts toward `omega`/`Int.ModEq`/`ZMod` residue analysis over `decide`; add a "prefer `omega` on a `failed to synthesize Decidable` error" repair hint. Then scale the ladder. |
+| 2 | **No *lift* measured yet** — first live run done (vanilla 80% / harness 3/3 non-regression), but vanilla is at ceiling on this tiny NT subset so the harness had no headroom. | Sweep vanilla across the full 30 (or the harder aggregate items) to find **failures**, then run the harness only on those — the only place lift can show. |
+| 4 | **Statement-faithfulness same-model caveat** — judges/prover can be the same model; no cross-model independence. | Use an independent judge model; widen the lens panel. |
+| 8 | **V_leg AST-legality gate deferred** (LongCat HARD #2: statement-mutation / `unsafe`/`macro`/redefinition / smuggled `import`) — a deterministic AST legality check distinct from the dependency audit. **Deliberately deferred.** | Build the V_leg-style AST legality pass as a coarse first filter backstopping the Layer-4 dependency audit (PLAN §5 Layer 4 item 3). |
+| 9 | **Restricted-import Lean environment not built** — intentionally skipped (memo: coarse/brittle, backstopped by the audit). | Optional later filter; the dependency audit remains the authoritative gate. |
+| 10 | **Train-a-prover is explicitly v2.** | Keep the training-free harness as the v1 baseline; revisit after benchmark runs exist. |
+
+> Numbering note: #3/#5/#6/#7 are resolved above; #2 is narrowed; #8 is the newly-tracked deferred
+> V_leg gate; #9/#10 are carried forward. Gap #1 (autoformalization) + #2 (real run records) are the
+> two that actually block a first headline result — the search/retrieval/gate machinery is now in place.

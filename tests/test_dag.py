@@ -1,7 +1,7 @@
 """Tests for the AND-OR proof DAG: deep-hash memoization, acyclicity, assembly."""
 import pytest
 
-from agent.orchestrator.dag import ProofDAG, goal_hash, CycleError
+from agent.orchestrator.dag import ProofDAG, goal_hash, canonical_form, CycleError
 from agent.orchestrator.state import NodeState
 
 
@@ -13,6 +13,46 @@ def test_goal_hash_normalizes_whitespace():
 def test_goal_hash_is_case_sensitive():
     # x and X are different variables — must not collide.
     assert goal_hash("x^2") != goal_hash("X^2")
+
+
+# ---- semantic canonicalization: meaning-preserving surface differences MUST collapse ----
+
+@pytest.mark.parametrize("a,b", [
+    ("n² − n is even", "n^2 - n is even"),                 # superscript + unicode minus
+    ("∀ n, P n", "for all n, P n"),                        # quantifier word vs symbol
+    ("a ≤ b", "a <= b"),                                   # relation symbol
+    ("a ∣ b", "a divides b"),                              # divisibility word vs symbol
+    ("x ≠ y", "x != y"),
+    ("a → b", "a implies b"),
+    ("P if and only if Q", "P iff Q"),
+    ("Prove that x = y", "x = y"),                         # leading imperative stripped
+    ("$a + b$", "a + b"),                                  # math delimiters dropped
+    ("f ( x , y )", "f(x,y)"),                             # operator/paren spacing
+    ("x ∈ ℤ", "x in Int"),                                 # set membership + domain
+    ("x₁ + x₂", "x_1 + x_2"),                              # subscripts
+])
+def test_canonical_form_folds_surface_differences(a, b):
+    assert goal_hash(a) == goal_hash(b)
+
+
+# ---- soundness: DISTINCT goals must NEVER collide (a false hit reuses the wrong proof) ----
+
+@pytest.mark.parametrize("a,b", [
+    ("x | y", "y | x"),                                    # divisibility is not symmetric
+    ("a < b", "a > b"),
+    ("x = y", "x ≠ y"),
+    ("a - b", "b - a"),
+    ("p divides n", "p divides m"),                        # different free variable
+    ("x^2", "x^3"),
+    ("forall n, P n", "exists n, P n"),
+])
+def test_canonical_form_never_merges_distinct_goals(a, b):
+    assert goal_hash(a) != goal_hash(b)
+
+
+def test_canonical_form_is_idempotent():
+    once = canonical_form("∀ n, n² − n ≡ 0 (mod 2)")
+    assert canonical_form(once) == once
 
 
 def test_get_or_create_memoizes():

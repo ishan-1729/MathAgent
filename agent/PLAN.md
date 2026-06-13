@@ -151,7 +151,7 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Focused prover (Codex)** | GPT-5.5-xHigh via `codex exec` proves a node → step-ledger (AlphaProof's role). | **built** | AlphaProof_Nexus (AlphaProof tool) |
 | **Ralph loop** | Per-node episodes: prove → gate → carry "lessons learned" → repeat. | **built** | AlphaProof_Nexus |
 | **Decomposition reviewer** | Gate a blueprint on "does it simplify?" + "is it elementary?" before commit. | **built** | LEAP reviewer |
-| **Revision controller** | Incumbent tournament; "do nothing" first-class; failure-analysis *before* revision; k=2 stop. | P2 TODO | Autoreason |
+| **Revision controller** | Incumbent tournament; "do nothing" first-class; failure-analysis *before* revision; k=2 stop; PUCT + Bradley-Terry; elementary-admissibility guard. | **built** ([`orchestrator/tournament.py`](orchestrator/tournament.py); wired via `DagDriver(refiner=…)`; `max_replan_depth` now consumed) | Autoreason |
 | **Evaluation cascade** | Cheap structural + numeric checks gate expensive judge/Lean passes. | built (P1) | AlphaEvolve |
 | **Population / Elo over sketches** | Generate K candidate decompositions, rank by a pairwise-comparison Elo tournament (+ Bradley-Terry MLE, PUCT), try best-first. | **built** ([`population.py`](orchestrator/population.py)) | AlphaProof_Nexus/AlphaEvolve |
 | **Lean Layer-4 auditor** | Proof-term dependency + axiom audit (the authoritative gate). | **built + live-validated** ([`gates/lean_audit.py`](gates/lean_audit.py), [`lean_bridge.py`](gates/lean_bridge.py), [`lean/Audit.lean`](gates/lean/Audit.lean)) | AlphaProof_Nexus SafeVerify, AXLE |
@@ -160,7 +160,7 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Layer-4 terminal gate (DAG)** | After the DAG proves the root, formalize+audit+faithfulness as the authoritative gate. | **built** (`DagDriver.terminal_gate`, `make_terminal_gate`) | PLAN §5 Layer 4 |
 | **Persistent Lean server** | Keep Mathlib + `#audit` loaded; ~0.1s/audit after a one-time load. | **built + live** ([`gates/lean_server.py`](gates/lean_server.py), community REPL) | LeanDojo/Pantograph |
 | **Autoformalization repair loop** | Feed Lean compile errors / audit rejects back to the formalizer to iterate. | **built + live** (`formalize_and_audit(repair_iters=...)`) | LEAP/Aristotle compiler-feedback |
-| **Mathlib lemma retrieval** | Loogle (exact names from errors) + a local **BM25 semantic index** over the elementary Mathlib source, combined via `HybridRetriever`. | **built + live** ([`tools/retrieval.py`](tools/retrieval.py), [`tools/semantic_retrieval.py`](tools/semantic_retrieval.py)) | LeanSearch/Loogle, LEAP premise retrieval |
+| **Mathlib lemma retrieval** | Loogle (exact names from errors) + a local **BM25 index** + a **neural bi-encoder** (`bge-small-en-v1.5` + optional reranker), combined via `HybridRetriever`. | **built + live** ([`tools/retrieval.py`](tools/retrieval.py), [`tools/semantic_retrieval.py`](tools/semantic_retrieval.py), [`tools/neural_retrieval.py`](tools/neural_retrieval.py)) | LeanSearch/Loogle/LeanExplore, LEAP premise retrieval |
 | **Tools** ([`tools/`](tools/)) | Numeric/witness search, Codex prover, elementary auditor, retrieval, CAS, Lean bridge. | numeric + Codex + Lean built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))

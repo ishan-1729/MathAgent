@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.gates.toolkit import load_toolkit
 from agent.orchestrator import Budget, RunTrace, RalphLoop, DagDriver
-from agent.tools.codex_prover import CodexProver, CodexDecomposer, CodexReviewer, CodexConfig
+from agent.tools.codex_prover import (CodexProver, CodexDecomposer, CodexReviewer, CodexComparator,
+                                      CodexConfig, make_codex_refiner)
 
 
 def main() -> int:
@@ -45,7 +46,20 @@ def main() -> int:
     ap.add_argument("--repair", type=int, default=0, metavar="N",
                     help="autoformalization Lean-error repair iterations (feed compile errors back)")
     ap.add_argument("--retrieval", action="store_true",
-                    help="retrieve real Mathlib lemmas (Loogle) to guide repair")
+                    help="retrieve real Mathlib lemmas (Loogle + BM25) to guide repair")
+    ap.add_argument("--neural", action="store_true",
+                    help="add the neural bi-encoder retriever (needs mathagent[neural]); implies --retrieval")
+    ap.add_argument("--rerank", action="store_true",
+                    help="rerank neural candidates with a cross-encoder (needs mathagent[neural])")
+    ap.add_argument("--population", type=int, default=0, metavar="K",
+                    help="(dag) generate K candidate decompositions; rank by Codex Elo + Bradley-Terry; "
+                         "expand PUCT-best-first")
+    ap.add_argument("--judges", type=int, default=1, metavar="N",
+                    help="Codex judges in the population / refiner panels")
+    ap.add_argument("--refine", action="store_true",
+                    help="(dag) refine each directly-proven ledger with the Codex Autoreason tournament")
+    ap.add_argument("--max-replan", type=int, default=2, metavar="D",
+                    help="global re-plan budget (max_replan_depth)")
     args = ap.parse_args()
 
     if not CodexProver.available():
@@ -54,7 +68,7 @@ def main() -> int:
 
     toolkit = load_toolkit()
     cfg = CodexConfig(model=args.model, reasoning_effort=args.effort, timeout_s=args.timeout)
-    budget = Budget(max_llm_calls=args.budget)
+    budget = Budget(max_llm_calls=args.budget, max_replan_depth=args.max_replan)
     trace = RunTrace("codex-prove")
     prover = CodexProver(toolkit, cfg)
 
@@ -74,13 +88,22 @@ def main() -> int:
         from agent.tools.codex_prover import CodexFaithfulnessChecker
         faith = CodexFaithfulnessChecker(cfg)
     retriever = None
-    if args.retrieval:
+    if args.retrieval or args.neural:
         from agent.tools.retrieval import LoogleRetriever
         from agent.tools.semantic_retrieval import SemanticRetriever, HybridRetriever
-        rs = [LoogleRetriever()]                 # Loogle: exact names from compile errors
+        rs = [LoogleRetriever()]                  # Loogle: exact names from compile errors
+        if args.neural:                           # neural bi-encoder: semantic (closes abbrev gap)
+            from agent.tools.neural_retrieval import (NeuralRetriever, SentenceTransformerEmbedder,
+                                                      CrossEncoderReranker)
+            rer = CrossEncoderReranker() if args.rerank else None
+            neu = NeuralRetriever(SentenceTransformerEmbedder(), reranker=rer)
+            if neu.available():
+                rs.append(neu)
+            else:
+                print("# (--neural requested but sentence-transformers/Mathlib unavailable; skipping)")
         sem = SemanticRetriever()
         if sem.available():
-            rs.append(sem)                       # BM25: relevance from the claim's meaning words
+            rs.append(sem)                        # BM25: relevance from the claim's meaning words
         retriever = HybridRetriever(rs) if len(rs) > 1 else rs[0]
 
     if args.direct:
@@ -102,6 +125,10 @@ def main() -> int:
             terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
                                                faithfulness_checker=faith, server=server,
                                                retriever=retriever, repair_iters=args.repair)
+        # Codex-backed search/revision machinery (population Elo+BT+PUCT; Autoreason refiner).
+        comparator = CodexComparator(cfg) if args.population else None
+        refiner = (make_codex_refiner(cfg, n_judges=args.judges, budget=budget, trace=trace)
+                   if args.refine else None)
         driver = DagDriver(
             prover,
             decomposer=CodexDecomposer(toolkit, cfg),
@@ -109,6 +136,7 @@ def main() -> int:
             toolkit=toolkit, budget=budget, trace=trace,
             max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
             ralph_episodes=args.episodes, terminal_gate=terminal_gate,
+            comparator=comparator, population_k=args.population, refiner=refiner,
         )
         res = driver.run(args.goal)
         ok = res.proven

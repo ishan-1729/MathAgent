@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:        # manual trigger for the live Lean+Mathlib suite
+
+jobs:
+  # Always-on: skeleton check + the deterministic (model- and Lean-stubbed) test suite.
+  offline:
+    name: Offline (skeleton + deterministic suite)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Skeleton check
+        run: make check
+      - name: Deterministic test suite
+        env:
+          PYTHONIOENCODING: utf-8
+        run: make test
+
+  # Opt-in (manual): the live Lean + Mathlib audit suite. Not on PRs — a Mathlib build is heavy and the
+  # Codex (GPT-5.5) live tests need credentials that don't belong in CI, so MATHAGENT_CODEX_TESTS stays
+  # unset here and those tests skip. This job exercises the real Layer-4 audit / bridge / persistent
+  # server / semantic-retrieval build against a cached Mathlib.
+  live-lean:
+    name: Live Lean + Mathlib (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: pip install -e ".[test]"
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Cache Lean build (.lake)
+        uses: actions/cache@v4
+        with:
+          path: formal/lean/mathagent_formal/.lake
+          key: lake-${{ runner.os }}-${{ hashFiles('formal/lean/mathagent_formal/lean-toolchain', 'formal/lean/mathagent_formal/lakefile.toml') }}
+      - name: Resolve + fetch Mathlib cache + build
+        working-directory: formal/lean/mathagent_formal
+        run: |
+          lake exe cache get || true   # fetch prebuilt Mathlib oleans (best-effort)
+          lake build
+      - name: Run live Lean suite
+        env:
+          MATHAGENT_LEAN_TESTS: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m pytest -q \
+            tests/test_lean_mathlib_live.py \
+            tests/test_lean_bridge.py \
+            tests/test_lean_server.py \
+            tests/test_semantic_retrieval.py \
+            tests/test_formalize_live.py
