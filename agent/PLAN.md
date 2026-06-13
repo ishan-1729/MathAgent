@@ -155,6 +155,7 @@ memoized sub-lemmas and an incumbent tournament for revision control.
 | **Evaluation cascade** | Cheap structural + numeric checks gate expensive judge/Lean passes. | built (P1) | AlphaEvolve |
 | **Population / Elo over sketches** | Generate K candidate decompositions, rank by a pairwise-comparison Elo tournament (+ Bradley-Terry MLE, PUCT), try best-first. | **built** ([`population.py`](orchestrator/population.py)) | AlphaProof_Nexus/AlphaEvolve |
 | **Lean Layer-4 auditor** | Proof-term dependency + axiom audit (the authoritative gate). | **built + live-validated** ([`gates/lean_audit.py`](gates/lean_audit.py), [`lean_bridge.py`](gates/lean_bridge.py), [`lean/Audit.lean`](gates/lean/Audit.lean)) | AlphaProof_Nexus SafeVerify, AXLE |
+| **Ledger→Lean formalization bridge** | Formalize a gate-passed ledger to Lean, compile, run Layer 4 → `authoritative_elementary`. | **built + live (Mathlib)** ([`tools/formalizer.py`](tools/formalizer.py), [`orchestrator/formalize_bridge.py`](orchestrator/formalize_bridge.py)) | LEAP, Aristotle informal→formal |
 | **Tools** ([`tools/`](tools/)) | Numeric/witness search, Codex prover, elementary auditor, retrieval, CAS, Lean bridge. | numeric + Codex + Lean built | Axplorer, MathCode, LeanDojo/Pantograph |
 
 ### 4.2 The swarm roles ([`roles/`](roles/))
@@ -299,9 +300,18 @@ instance projections. So:
 
 ## 7. Lean track — advisory in v1, authoritative gate later (spiked early)
 
-Local Lean/Mathlib is **not installed**. Note: **Lean/elan/lake run natively on Windows**; the real constraint
-is that some *harness binaries and tracing tooling* (OpenGauss/MathCode) are Linux-only — mine their ideas,
-don't depend on them; use WSL2 only if a specific tool needs it.
+> **Status: ✅ Lean + Mathlib installed; Layer 4 + the ledger→Lean formalization bridge built and
+> live-validated.** Lean 4.30.0 (via elan) + a Mathlib `v4.30.0` lake project
+> ([`formal/lean/mathagent_formal/`](../formal/lean/mathagent_formal/)). The full loop runs end-to-end:
+> a gate-passed ledger → Codex formalization → compile (`lake env lean`) → Layer-4 dependency audit →
+> `authoritative_elementary` (confirmed `True` on `n+0=n`; `IsDedekindDomain` rejected live against
+> Mathlib). See [`research/docs/formalization_bridge.md`](../research/docs/formalization_bridge.md) and
+> [`lean_layer4_and_population.md`](../research/docs/lean_layer4_and_population.md). Remaining: raise
+> autoformalization success on hard NT statements, statement-faithfulness checks, and wiring Layer-4 as
+> the terminal gate of a DAG run.
+
+Note: **Lean/elan/lake run natively on Windows**; the real constraint is that some *harness binaries and
+tracing tooling* (OpenGauss/MathCode) are Linux-only — mine their ideas, don't depend on them.
 
 - **v1 (advisory) + early spike (Phase 1, parallel):** install Lean+Mathlib; build the **minimal Layer-4
   auditor** and demonstrate it **accepts a genuine elementary proof and rejects one citing a denylisted

@@ -35,37 +35,91 @@ class LeanBridgeError(RuntimeError):
     pass
 
 
-def find_lean() -> Optional[str]:
-    p = shutil.which("lean")
+def _find_tool(name: str) -> Optional[str]:
+    p = shutil.which(name)
     if p:
         return p
-    guess = Path.home() / ".elan" / "bin" / ("lean.exe" if os.name == "nt" else "lean")
+    exe = f"{name}.exe" if os.name == "nt" else name
+    guess = Path.home() / ".elan" / "bin" / exe
     return str(guess) if guess.exists() else None
+
+
+def find_lean() -> Optional[str]:
+    return _find_tool("lean")
+
+
+def find_lake() -> Optional[str]:
+    return _find_tool("lake")
 
 
 def available() -> bool:
     return find_lean() is not None
 
 
+def find_mathlib_project() -> Optional[str]:
+    """The repo's Mathlib lake project, if scaffolded (so `import Mathlib` proofs can be audited)."""
+    proj = Path(__file__).resolve().parents[2] / "formal" / "lean" / "mathagent_formal"
+    return str(proj) if (proj / "lakefile.toml").exists() else None
+
+
 def _extractor_src() -> str:
     return _AUDIT_LEAN.read_text(encoding="utf-8")
 
 
-def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300) -> str:
-    """Compile `proof_src` and return the raw dependency-report JSON for `theorem_name`."""
-    lean = find_lean()
-    if not lean:
-        raise LeanUnavailable("lean not found on PATH or ~/.elan/bin")
+_IMPORT_RE = re.compile(r"^\s*import\s+\S+.*$", re.MULTILINE)
 
-    source = f"{_extractor_src()}\n\n{proof_src}\n\n#audit {theorem_name}\n"
+
+def _split_imports(src: str) -> tuple[list[str], str]:
+    """Return (import lines, body-without-imports). Lean requires all imports at the file top."""
+    imports = [m.group(0).strip() for m in _IMPORT_RE.finditer(src)]
+    body = _IMPORT_RE.sub("", src)
+    return imports, body
+
+
+def _assemble_source(proof_src: str, theorem_name: str) -> str:
+    """Combine the extractor + proof into one file with all imports hoisted to the top (deduped)."""
+    ext_imports, ext_body = _split_imports(_extractor_src())
+    pf_imports, pf_body = _split_imports(proof_src)
+    seen: set[str] = set()
+    imports: list[str] = []
+    for imp in ext_imports + pf_imports:
+        if imp not in seen:
+            seen.add(imp)
+            imports.append(imp)
+    return ("\n".join(imports) + "\n\n" + ext_body.strip() + "\n\n"
+            + pf_body.strip() + f"\n\n#audit {theorem_name}\n")
+
+
+def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300,
+                  project_dir: Optional[str | Path] = None) -> str:
+    """Compile `proof_src` and return the raw dependency-report JSON for `theorem_name`.
+
+    With `project_dir` (a lake project, e.g. the Mathlib project) the proof is run via
+    `lake env lean`, so `import Mathlib` resolves; otherwise a bare `lean` runs core-only proofs.
+    """
+    source = _assemble_source(proof_src, theorem_name)
     workdir = tempfile.mkdtemp(prefix="lean_audit_")
     lean_file = Path(workdir) / "Target.lean"
     lean_file.write_text(source, encoding="utf-8")
+
+    if project_dir is not None:
+        lake = find_lake()
+        if not lake:
+            raise LeanUnavailable("lake not found on PATH or ~/.elan/bin")
+        argv = [lake, "env", "lean", str(lean_file)]
+        cwd = str(project_dir)
+    else:
+        lean = find_lean()
+        if not lean:
+            raise LeanUnavailable("lean not found on PATH or ~/.elan/bin")
+        argv = [lean, str(lean_file)]
+        cwd = workdir
+
     try:
         proc = subprocess.run(
-            [lean, str(lean_file)],
+            argv,
             capture_output=True, encoding="utf-8", errors="replace",
-            timeout=timeout_s, cwd=workdir,
+            timeout=timeout_s, cwd=cwd,
             env={**os.environ, "MATHAGENT_TOOLCHAIN": os.environ.get("MATHAGENT_TOOLCHAIN", "")},
         )
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -82,8 +136,10 @@ def run_extractor(proof_src: str, theorem_name: str, timeout_s: int = 300) -> st
 
 
 def audit_lean_source(proof_src: str, theorem_name: str,
-                      toolkit: Optional[Toolkit] = None, timeout_s: int = 300) -> LeanAuditResult:
+                      toolkit: Optional[Toolkit] = None, timeout_s: int = 300,
+                      project_dir: Optional[str | Path] = None) -> LeanAuditResult:
     """Compile + extract + audit a Lean proof. Raises LeanUnavailable/LeanBridgeError on setup issues;
-    a compiling-but-non-elementary proof returns a REJECT result (not an exception)."""
-    report_json = run_extractor(proof_src, theorem_name, timeout_s=timeout_s)
+    a compiling-but-non-elementary proof returns a REJECT result (not an exception). Pass `project_dir`
+    (a Mathlib lake project) to audit proofs that `import Mathlib`."""
+    report_json = run_extractor(proof_src, theorem_name, timeout_s=timeout_s, project_dir=project_dir)
     return audit_json(report_json, toolkit)

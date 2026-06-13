@@ -54,6 +54,8 @@ KEY_FILES = [
     "agent/gates/lean/Audit.lean",
     "agent/tools/numeric.py",
     "agent/tools/codex_prover.py",
+    "agent/tools/formalizer.py",
+    "agent/orchestrator/formalize_bridge.py",
     "agent/orchestrator/driver.py",
     "agent/orchestrator/dag.py",
     "agent/orchestrator/ralph.py",

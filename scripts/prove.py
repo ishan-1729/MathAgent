@@ -34,6 +34,8 @@ def main() -> int:
     ap.add_argument("--budget", type=int, default=60, help="max Codex calls for the whole run")
     ap.add_argument("--timeout", type=int, default=1200, help="per-Codex-call timeout (s)")
     ap.add_argument("--out", type=Path, help="write the winning ledger / trace JSONL here (prefix)")
+    ap.add_argument("--formalize", action="store_true",
+                    help="after a direct proof, formalize the ledger to Lean and run the Layer-4 audit")
     args = ap.parse_args()
 
     if not CodexProver.available():
@@ -75,6 +77,20 @@ def main() -> int:
         print(f"dag: {res.dag.stats()}")
         import json as _json
         print("\n--- proof tree ---\n" + _json.dumps(res.proof_tree(), indent=2))
+
+    # Optional: close the loop — formalize the proven ledger to Lean and run the Layer-4 audit.
+    winning_ledger = res.ledger if (args.direct and ok and res.ledger) else None
+    if args.formalize and winning_ledger:
+        from agent.tools.formalizer import CodexFormalizer
+        from agent.orchestrator.formalize_bridge import formalize_and_audit
+        print("\n# Formalizing the ledger to Lean and running the Layer-4 audit...")
+        fa = formalize_and_audit(winning_ledger, CodexFormalizer(toolkit, cfg), toolkit=toolkit)
+        print("formalize + audit:", fa.summary())
+        print("authoritative_elementary:", fa.elementary_verified)
+        if fa.lean_source:
+            print("\n--- formalized Lean ---\n" + fa.lean_source)
+    elif args.formalize:
+        print("\n(--formalize is supported in --direct mode on a proven ledger)")
 
     print(f"\ncalls spent: {budget.calls_spent}/{budget.max_llm_calls}")
     if args.out:
