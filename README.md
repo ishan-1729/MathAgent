@@ -1,27 +1,37 @@
 # MathAgent
 
-MathAgent is a research repository for agentic discovery of elementary Diophantine proofs and later Lean formalization. It is a collaboration between Ishan and Kieren, with room for multiple AI workflows to explore separate branches.
+MathAgent is a research repository for an **agentic system that solves mathematics problems**. v1 focuses on
+**number theory by elementary means only** (the IMO-usable toolkit), enforced as a hard project constraint.
+Successful arguments are later formalized in Lean. It is a collaboration between Ishan and Kieren, with room
+for multiple AI workflows to explore separate branches.
 
-The repo is organized around four core artifact types:
+The build plan for the agent is **[`agent/PLAN.md`](agent/PLAN.md)** — read it first.
 
-- `methods/`: reusable proof techniques, one method per file.
-- `library/`: small high-impact identities, lemmas, and transformations.
-- `problems/`: target theorem folders with statements, allowed inputs, attempts, Lean notes, and evaluation records.
-- `examples/`: solved demonstrations that teach how a method is used.
+## Repository map
 
-Supporting areas include `workflows/` for agent protocols, `evaluation/` for scoring, `formal/` for Lean-facing artifacts, and `papers/` for systems literature about theorem-proving agents, Lean tooling, search, refinement, and research automation.
+The repo is grouped into role-based top-level categories:
 
-Examples and problems are intentionally separated. Examples may contain solved demonstrations and method skeletons. Problems should usually avoid full standard proofs, so workflow evaluations are not contaminated by copied solutions.
+| Category | Contents | Purpose |
+| --- | --- | --- |
+| **`agent/`** | `orchestrator/`, `roles/`, `gates/`, `tools/`, `instructions/`, `workflows/` | The agentic system: control loop, swarm prompts, the **elementary-constraint gates**, tools, rules, and run configurations. |
+| **`knowledge/`** | `methods/`, `library/`, `examples/` | What the agent knows: reusable proof techniques, high-impact identities, and solved demonstrations. |
+| **`benchmarks/`** | `problems/`, `evaluation/` | What the agent is tested on: target theorems and the scoring rubric / metrics. |
+| **`formal/`** | `lean/` | Lean formalization area (advisory in v1). |
+| **`research/`** | `papers/`, `docs/` | Hand-curated systems literature and project design docs (incl. the [literature synthesis](research/docs/literature_design_implications.md)). |
+| **`scripts/`**, **`.agents/`** | skeleton check; agent skills | Infrastructure and skill discovery. |
 
-The `papers/` folder is for brainstorming coherent software/workflow configurations and benchmarking plans. It should influence workflow design and evaluation infrastructure, not silently expand the mathematical facts available to a problem run.
+Examples and problems are intentionally separated. Examples may contain solved demonstrations and method
+skeletons. Problem folders should usually avoid full standard proofs, so workflow evaluations are not
+contaminated by copied solutions. The `research/papers/` folder is architecture inspiration for workflow and
+gate design — it should not silently expand the mathematical facts available to a problem run.
 
-**First Tasks**
-1. Fill method files.
-2. Add high-impact Tagebuch identities.
-3. Create target problem statements.
-4. Run workflows on separate branches.
-5. Score attempts using evaluation metrics.
-6. Use `papers/` to design and compare workflow configurations.
+## First tasks
+
+1. Read `agent/PLAN.md` and the literature synthesis in `research/docs/`.
+2. Fill method files in `knowledge/methods/` and add high-impact Tagebuch identities.
+3. Create target problem statements in `benchmarks/problems/`.
+4. Build the elementary-constraint gate (`agent/gates/`) and the swarm role prompts (`agent/roles/`).
+5. Run workflows on separate branches and score attempts with `benchmarks/evaluation/`.
 
 Run the skeleton check with:
 

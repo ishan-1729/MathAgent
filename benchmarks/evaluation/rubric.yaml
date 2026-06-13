@@ -1,0 +1,23 @@
+# Scoring policy (v1). See agent/PLAN.md §8.2.
+#
+# elementary_compliance is NOT a weight: it is a BINARY ADMIT/REJECT GATE applied
+# BEFORE any weighted scoring. A proof that fails the elementary gate scores nothing,
+# regardless of correctness (a correct non-elementary proof has failed the task).
+#
+# Among ADMITTED (gate-passing) proofs, score with the weights below (must sum to 1.0,
+# fixed across workflows for a given problem). lean_compilability is scored only on the
+# Lean track, not in the default informal rubric.
+
+gate:
+  elementary_compliance: binary   # admit/reject; see agent/gates/ and PLAN.md §5
+
+# Weights for admitted proofs (informal track):
+weights:
+  correctness: 0.30
+  novelty: 0.25
+  step_complexity_product: 0.25   # simplicity: fewer, lower-complexity steps score higher
+  generalizability: 0.20
+
+# Lean-track-only rubric (applied when a proof is formalized; see PLAN.md §7):
+lean_track:
+  lean_compilability: 1.0

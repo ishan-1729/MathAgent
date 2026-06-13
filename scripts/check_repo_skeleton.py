@@ -5,19 +5,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Top-level categories after the role-based reorg:
+#   agent/      - the agentic system (orchestrator, roles, gates, tools, instructions, workflows)
+#   knowledge/  - the math knowledge base (methods, library, examples)
+#   benchmarks/ - targets + scoring (problems, evaluation)
+#   formal/     - Lean (advisory in v1)
+#   research/   - literature + design docs (papers, docs)
+#   scripts/    - infra ; .agents/ - skill discovery convention
 REQUIRED_TOP_LEVEL_DIRS = [
     ".agents",
-    "docs",
-    "evaluation",
-    "examples",
+    "agent",
+    "agent/orchestrator",
+    "agent/roles",
+    "agent/gates",
+    "agent/tools",
+    "agent/instructions",
+    "agent/workflows",
+    "benchmarks",
+    "benchmarks/problems",
+    "benchmarks/evaluation",
     "formal",
-    "instructions",
-    "library",
-    "methods",
-    "papers",
-    "problems",
+    "knowledge",
+    "knowledge/methods",
+    "knowledge/library",
+    "knowledge/examples",
+    "research",
+    "research/papers",
+    "research/docs",
     "scripts",
-    "workflows",
 ]
 
 KEY_FILES = [
@@ -26,11 +41,15 @@ KEY_FILES = [
     "CONTRIBUTING.md",
     "Makefile",
     "pyproject.toml",
-    "papers/INDEX.md",
-    "methods/TEMPLATE.md",
-    "library/identity_TEMPLATE.md",
-    "problems/TEMPLATE/problem.md",
-    "evaluation/run_record_TEMPLATE.md",
+    "agent/README.md",
+    "agent/PLAN.md",
+    "agent/gates/README.md",
+    "research/papers/INDEX.md",
+    "research/docs/literature_design_implications.md",
+    "knowledge/methods/TEMPLATE.md",
+    "knowledge/library/identity_TEMPLATE.md",
+    "benchmarks/problems/TEMPLATE/problem.md",
+    "benchmarks/evaluation/run_record_TEMPLATE.md",
     "formal/lean/MathAgent/Scratch.lean",
     ".agents/skills/elementary-proof-attempt/SKILL.md",
     ".agents/skills/method-file-authoring/SKILL.md",
@@ -92,10 +111,10 @@ def main() -> int:
         if not (ROOT / filename).is_file():
             failures.append(f"missing file: {filename}")
 
-    method_files = sorted((ROOT / "methods").glob("*.md"))
+    method_files = sorted((ROOT / "knowledge" / "methods").glob("*.md"))
     failures.extend(check_frontmatter(method_files, {"README.md", "TEMPLATE.md"}))
 
-    library_files = sorted((ROOT / "library").rglob("*.md"))
+    library_files = sorted((ROOT / "knowledge" / "library").rglob("*.md"))
     failures.extend(check_frontmatter(library_files, {"README.md", "identity_TEMPLATE.md"}))
 
     if failures:
