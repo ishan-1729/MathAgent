@@ -94,6 +94,44 @@ check (`collectAxioms ⊆ {propext, Classical.choice, Quot.sound}`) is how a `so
 deterministically only at Layer 4. Calling a Layers-0–3-passed proof "elementary" would relocate the
 "Lean-verified = elementary" category error one step over.
 
+**How the layers compose (fail-closed, max-severity).** Each deterministic check emits findings on a
+three-level severity lattice — **REJECT** (authoritative refutation) > **REVIEW** (soft signal, routed to
+Layer 2) > **INFO** (advisory) — and the verdict is the **maximum** severity present, so a single REJECT
+decides it (`gate.py::evaluate`). Crucially the gate is **fail-closed**: a malformed ledger *and* any
+uncaught internal exception are both converted into a REJECT, so a bug can only ever produce a safe
+rejection, never a silent pass (invariant 1).
+
+**Boundary rulings — the contested edge of "elementary."** Most justifications are simply allowed or not,
+but a handful sit on the genuine boundary, where a binary flag is wrong. `allowed_toolkit.yaml` carries a
+separate **four-valued** `boundary_rulings:` vocabulary (read via `Toolkit.ruling()`): **`allowed`** (e.g.
+Pell's fundamental solution — an elementary descent proof exists), **`allowed_with_citation`** (e.g.
+*Zsygmondy* — elementary but hard; cite it like LTE), **`allowed_per_problem_whitelist`** (e.g. *higher /
+cubic–quartic reciprocity* — admit only where a specific problem needs it), and **`disallowed`** (e.g. the
+*Gauss-sum / analytic* proof of quadratic reciprocity — even though a *different*, elementary proof of the
+same theorem is fine). This is the harness's explicit, auditable answer to "what counts as elementary at
+the edge," distinct from both the justification enum and the Layer-4 dependency denylist.
+
+**Layer 3, grounded safely.** The numeric re-checks must evaluate model-supplied expressions, which is
+dangerous (arbitrary `eval`, float drift, runaway search). So expressions are parsed with SymPy into an
+**allowlisted integer-only AST** — only `Add/Mul/Pow/Symbol`, integer leaves, non-negative bounded
+exponents (no floats, rationals, transcendentals, or undeclared symbols) — giving *exact* arithmetic with
+no code execution; and case-searches enumerate a **closed integer box** with hard caps (`MAX_BOX_POINTS`,
+`MAX_ABS_BOUND`) so a check cannot become a combinatorial/bignum DoS (`numeric.py`). Two further routers:
+the prose scanner forces **"elastic" justifications** (`bounding, factorization, squeeze, descent,
+vieta_jumping`) to mandatory review — they can hide a heavy step behind an innocent label — and a
+**coprimality-provenance** check requires a coprime-factorization split to cite a *real prior* `gcd` step
+rather than asserting coprimality from nowhere.
+
+**Layer 4, mechanically.** The audit stands on a custom Lean **`#audit` command** (`lean/Audit.lean`): it
+walks the kernel's fully-elaborated proof term and, with an **iterative worklist** (`closure` over
+`usedConsts`, so no stack blow-up), computes the **transitive constant-dependency closure** — every
+theorem / def / axiom the term actually uses, in both its type and its value — plus `collectAxioms`,
+emitting a one-line JSON report. Because it reads the *kernel term*, it sees through tactics, macros, and
+notation to exactly what the proof depends on; "it compiled" is irrelevant. A small **bridge**
+(`lean_bridge.py`) assembles the extractor + candidate into one file (imports hoisted to the top and
+de-duplicated, as Lean requires) and distinguishes a real `:error:` from a recoverable "uses `sorry`"
+warning, so the repair loop fires on the right signal.
+
 ---
 
 ## 4. End-to-end pipeline (with data shapes)
@@ -101,6 +139,9 @@ deterministically only at Layer 4. Calling a Layers-0–3-passed proof "elementa
 The unit of work is a **step-ledger**: a proof as a typed DAG of justified steps —
 `step := {id, claim, justification ∈ closed-vocabulary, depends_on:[id…], obligations?}` with exactly
 one `conclusion`. It is the contract every gate layer reads and the artifact the formalizer consumes.
+(The parse front-end extracts the ledger from whatever the model emitted — a dict, a JSON string, or a
+fenced ` ```json ` block — validates it against a Draft-7 JSON Schema, and NFC-normalizes prose so
+equivalent Unicode glyphs cannot dodge the denylist; anything malformed is a deterministic REJECT.)
 
 ```
 informal claim → [Prover (Codex)] → JSON step-ledger
@@ -127,21 +168,35 @@ runs?* **Nothing learned. It is a deterministic control-flow cascade plus operat
 (`DagDriver._prove`):
 
 1. **Ralph loop (direct attempt) — unconditional.** Every node first tries a direct proof via the Ralph
-   loop (multi-episode, lessons-learned). If it succeeds, the node returns immediately.
+   loop (multi-episode, lessons-learned; explained in §5.1). If it succeeds, the node returns immediately.
 2. **`_refine` tournament — `if self.refiner is not None`** (set by `--refine`). Runs on a directly-proven
    ledger; monotone (a challenger must beat the incumbent on a blind panel *and* stay elementary).
 3. **LEAP decomposition — only if the direct attempt *failed***. The cascade falls through to decompose →
    review → recurse. (Reached only on direct failure; gated also by `decomposer is not None`.)
 4. **Population/Elo + PUCT/BT — `if population_k and comparator`** (set by `--population`). Lives *inside*
    the decomposition step (ranks K candidate decompositions).
-5. **Re-plan — bounded by `max_replan_depth`** (each re-decomposition after the first consumes the global
-   replan budget).
+5. **Re-plan — bounded, doubly.** The first decomposition plan is *free*; each subsequent re-plan is
+   capped both **per node** (`max_decomp_attempts`) and **globally** (`Budget.max_replan_depth`), with
+   reviewer feedback threaded into each new plan — so a stubborn goal must eventually give up
+   (`EXHAUSTED`) rather than spin forever (invariant 6).
 6. **Deep-hash cache — always active**; reuses a proven node by its semantic hash (inert when there's
    nothing to reuse).
 
 So "the easy theorem didn't use the DAG/population" means only that the **direct attempt succeeded and
 the cascade short-circuited** — *and* that the optional layers were off by flag. The only "intelligence"
 in the gating is **try-cheap-first, escalate-on-failure**, which is LEAP's own design — not a classifier.
+
+### 5.1 The Ralph loop (the always-on direct attempt)
+
+"Ralph" (from AlphaProof_Nexus) turns one noisy LLM call into a **self-correcting loop**
+(`ralph.py::RalphLoop`). Each **episode**: the prover emits a step-ledger → the **deterministic gate
+re-checks it** (`evaluate`) → on rejection, the gate's specific findings are appended as capped
+**lessons-learned** notes that condition the next episode (the paper's *"write a lessons-learned comment
+and resume"*), optionally interleaving an adversarial judge panel (Layer 2). It repeats until the ledger
+is admitted or the shared `Budget` runs out (then `exhausted=True` — never a false success). In one line:
+it is **fixed-point iteration over proof attempts** — keep refining from accumulated feedback until the
+output stops being rejected. This is item 1 of the cascade, and the leaf behaviour at every DAG node's
+direct attempt.
 
 ---
 
@@ -196,33 +251,207 @@ stub are interchangeable; the whole harness is deterministically testable with s
 | **Benchmark** | `agent/benchmarks/arxivmath.py`, `tools/answer_check.py`, `scripts/run_benchmark.py` | non-contaminative loader + SymPy grader + run records | MathArena ArXivMath |
 | **Web UI** | `ui/server.py`, `ui/index.html` | SSE console driving `prove.py` with every lever | — |
 
+**Curated method library.** Beyond the generic justifications, a set of *named* methods (`vieta_jumping`,
+`pell`, `cauchy_bezout`, `euclid_splitting`, `squeeze`, `sum_to_product`, …) each carry a `method_ref`
+pointing at a hand-written write-up under `knowledge/methods/`; `Toolkit.method_ref_for()` links a ledger
+step that cites the method to its technique file. So a growing, human-authored method catalog plugs
+directly into the closed justification vocabulary the gate validates against.
+
+**Two drivers, one state machine.** `FlatDriver` runs a single target as a flat *prove → gate → repair →
+judge* pipeline (any truncated/unhandled-review case is forced to `EXHAUSTED`, never silently `PROVEN`);
+`DagDriver` adds the §9 AND-OR recursion on top. Every node carries a `NodeState` lifecycle
+(`OPEN → IN_PROGRESS → PROVEN / FAILED_* / EXHAUSTED`) that drives memoization and failure classification,
+and every run is an append-only **JSONL trace** (`trace.py`, injectable clock) rendered to a markdown
+record — so every run is a deterministic, comparable experiment (invariant 7).
+
 ---
 
-## 8. Search & revision machinery — PUCT, Bradley-Terry, the tournament
+## 8. Search & revision machinery — Population / Elo / Bradley-Terry / PUCT, explained
 
-Two distinct mechanisms at two layers (both *search/quality*, neither touches the gate):
+These are **search-efficiency** tools (`orchestrator/population.py`) — they never touch the elementary
+gate. They're worth understanding from scratch, so this section builds them up.
 
-- **Population/Elo + Bradley-Terry + PUCT — *candidate selection*.** When a goal admits several candidate
-  *decompositions*, generate K, run a pairwise Elo tournament (Codex `Comparator` judges), fit **Bradley-
-  Terry** latent strengths from the win matrix (stable batch estimate over noisy online Elo), then expand
-  **PUCT-best-first** (exploit strength + explore under-visited). Makes search *cheaper*.
-- **Autoreason incumbent tournament — *revision control*.** Given a *working* proof, each pass runs Codex
-  Critic (failure analysis only) → Author (revise) → Synthesizer (blind merge) → a Codex judge panel; a
-  challenger displaces the incumbent only if it beats it head-to-head by `margin` **and** passes the
-  elementary admissibility gate. "Do nothing" wins ties; stop after **k=2** consecutive incumbent wins.
-  Internally reuses Bradley-Terry (strengths) and PUCT (next-pass seed). Its job is the **synthesis-drift
-  / elementary-incumbent guard**: a "better-sounding but non-elementary" revision can't displace a correct
-  elementary proof. Makes search *safer* (monotone — never regresses).
+**The problem they solve.** When the driver decomposes a goal, it can ask Codex for **K candidate
+decompositions** ("sketches"). We don't know which is best, and *testing* one (recursing in to actually
+prove it) is **expensive**. What's **cheap** is asking a judge to **compare two** candidates ("which of
+these two looks more likely to lead to a correct, fully-elementary proof?"). So we have a classic
+two-part problem: **(a) rank K items from noisy pairwise comparisons, then (b) decide which one to spend
+the next expensive attempt on.** Three standard tools, one per sub-problem.
 
-Both are built and Codex-wired (`CodexComparator`, `make_codex_refiner`); neither is what blocks a first
+### 8.1 Elo — an online strength rating from pairwise results
+
+Borrowed from chess. Give every candidate a scalar **rating** `R` (start at 1500). Model the probability
+that A beats B as a **logistic** function of the rating gap:
+
+```
+E_A = P(A beats B) = 1 / (1 + 10^((R_B − R_A) / 400))
+```
+
+After a comparison with result `S_A ∈ {1 win, ½ tie, 0 loss}`, nudge both ratings toward the surprise:
+
+```
+R_A ← R_A + K · (S_A − E_A)        (and symmetrically R_B ← R_B + K · (S_B − E_B))
+```
+
+`K` is a step size. If A was expected to win (`E_A` near 1) and did, `S_A − E_A ≈ 0` → tiny update; an
+**upset** moves ratings a lot. This is literally **online stochastic gradient ascent** on the
+log-likelihood of a logistic model — cheap, incremental, one update per comparison (`EloPopulation.record`).
+Its weakness: the result is **path-dependent** (it depends on the *order* comparisons happened in).
+
+### 8.2 Bradley-Terry — the same model, fit properly (a batch MLE)
+
+Bradley-Terry is the statistical model that Elo is an online approximation *of*. Each item `i` has a
+latent positive **strength** `s_i`, and
+
+```
+P(i beats j) = s_i / (s_i + s_j)
+```
+
+(Writing `β_i = log s_i`, this is `P = σ(β_i − β_j)` — the *same* logistic shape as Elo, base-e instead of
+base-10.) Given the full **win matrix** `W` (`W[i,j]` = number of times `i` beat `j`), we can compute the
+**maximum-likelihood** strengths directly, instead of nudging them online. We use the standard
+**MM (minorization-maximization)** iteration — an EM-style scheme guaranteed to increase the likelihood
+each step (`fit_bradley_terry`):
+
+```
+s_i ← w_i / Σ_{j≠i}  n_ij / (s_i + s_j)          then renormalize
+        where  w_i = total wins of i,  n_ij = total games between i and j
+```
+
+Unlike Elo, this uses *all* the data at once, so it is **order-independent and more stable**. So in the
+harness: **Elo** updates ratings cheaply *during* the tournament; **Bradley-Terry** re-fits them *from the
+whole win matrix* afterward (`set_ratings_from_bradley_terry`) — the right thing to do once every
+comparison is in.
+
+### 8.3 PUCT — deciding what to expand next (explore vs exploit)
+
+Now we have strengths, but recursing into a candidate is **expensive**, so we shouldn't blindly always
+pick the top-rated one — a promising candidate we've barely looked at deserves a shot. This is the
+**multi-armed-bandit** explore/exploit trade-off. **PUCT** ("Predictor + Upper-Confidence-bound applied to
+Trees" — the selection rule AlphaZero uses inside MCTS) scores each candidate `a` as
+
+```
+score(a) = Q(a)              +   c · P(a) · √(ln(ΣN)) / (1 + N(a))
+           └ exploit ┘            └─────────── explore ───────────┘
+```
+
+- `Q(a)` — the **exploit** term: the candidate's strength, normalized to `[0,1]`.
+- `N(a)` — how many times we've already picked `a`; `ΣN` — total picks so far.
+- `P(a)` — a **prior** over candidates (here a `softmax` over the ratings).
+- `c` — how much to explore.
+
+The explore term is **large** for an under-visited candidate (`N(a)` small) with a decent prior, and
+**decays** as you keep picking it — "optimism under uncertainty," the same idea as the UCB1 bandit rule
+`mean + √(2 ln N / n)`. (AlphaZero's original uses `√(ΣN)`; our `select_puct` uses the UCB1-style
+`√(ln ΣN)` confidence term.) Pick the `argmax`, expand it, increment its visit count, repeat.
+
+### 8.4 How they compose — "population search"
+
+```
+K candidate decompositions
+  → pairwise Codex-judge comparisons (a tournament)  → a win matrix W + online Elo
+  → Bradley-Terry MLE on W                            → stable latent strengths (the ratings)
+  → PUCT                                              → which candidate to expand FIRST
+```
+
+That is **population search** (the AlphaProof_Nexus / AlphaEvolve idea): keep a *pool* of candidates
+alive, rate them from *cheap* comparisons, and spend *expensive* attempts best-first. It is
+**search-efficiency only** — none of it changes whether a proof is accepted; that is the gate's job.
+(`DagDriver._prove_via_population`.)
+
+### 8.5 The Autoreason tournament reuses the same two estimators
+
+The revision controller (`tournament.py`) is a *different* mechanism — **revision control**, not
+decomposition ranking — but it reuses the same two estimators. Given a *working* proof, each pass runs a
+Codex Critic (failure analysis only) → Author (revise) → Synthesizer (blind merge) → a Codex judge panel;
+**Bradley-Terry** turns the panel's pairwise votes into strengths and **PUCT** picks which surviving
+candidate seeds the next pass. A challenger displaces the incumbent only if it beats it head-to-head by a
+`margin` **and** passes the elementary admissibility gate; "do nothing" wins ties; stop after **k=2**
+consecutive incumbent wins. Its job is the **synthesis-drift / elementary-incumbent guard** — a
+"better-sounding but non-elementary" revision can never displace a correct elementary proof — so refinement
+is **monotone** (never regresses).
+
+Both mechanisms are Codex-wired (`CodexComparator`, `make_codex_refiner`); neither is what blocks a first
 result. They pay off once there is a search worth prioritizing and an incumbent worth defending.
 
 ---
 
-## 9. Memoization & the goal hash (a soundness-critical contract)
+## 9. The proof DAG — AND-OR structure, memoization & the goal hash
 
-The DAG memoizes by a **deep hash of the goal statement** (`dag.py::goal_hash`), so an identical
-sub-lemma on different branches resolves to one node, proven once. This key is **soundness-critical**: a
+§4–§5 keep saying "DAG" and "decompose→recurse"; this section explains what that machine actually *is*,
+from scratch. Like §8, everything here is **search structure**: it changes *how fast* a proof is found,
+never *whether it is accepted* (that is the gate, §3).
+
+### 9.1 The AND-OR proof DAG (LEAP's spine)
+
+Think of how a person plans a hard proof: *"I can prove the theorem **if** I can first prove these three
+lemmas."* That sentence, made into a data structure, is the whole idea (`dag.py::ProofDAG`).
+
+- An **OR-node is a goal.** It asserts "this statement is provable," and can be discharged in *either* of
+  two ways: by a **direct** proof (a self-contained step-ledger), **or** by *one* decomposition.
+  (OR = "any one route suffices.")
+- An **AND-node is a decomposition.** It is a *sketch* that proves the parent **assuming** a list of
+  sub-lemmas, so **all** of its child sub-lemma goals must be proven for it to count.
+  (AND = "every part is required.")
+- Each child is itself an OR-node, so the structure recurses — goals contain decompositions contain
+  goals. This is the classic **AND-OR graph** that AI search uses for problems that split into
+  independent sub-problems.
+
+Why a **DAG** (directed acyclic graph) rather than a tree? Because different branches often need the
+*same* lemma. Keyed by the goal hash (§9.4) that lemma is **one shared node**, not two copies — so the
+tree becomes a graph with reconvergent edges. "Acyclic" is enforced (§9.3): a proof may never, even
+transitively, depend on itself.
+
+**How the driver walks it (`dag_driver.py::_prove`) — depth-first with backtracking.** For each goal it
+(1) tries a **direct** proof first (cheap; the Ralph loop, §5.1); (2) on failure asks a **Decomposer**
+for a sketch + child goals; (3) **gates** the plan (below); (4) commits it as an AND-node and **recurses
+depth-first** into the children, **backtracking** — abandoning that decomposition and trying another —
+the instant any child fails. Depth-first keeps only one path in memory and surfaces a finished proof the
+moment a single branch closes top-to-bottom. This *is* §5's "try-cheap-first, escalate-on-failure"
+cascade, concretely.
+
+**Two soundness gates before a decomposition is trusted.** The AND-node guarantee — *all children proven
+⇒ parent proven* — is only real if the plan is honest, so each proposed decomposition must clear:
+
+- **Honest-decomposition validation** (`_lemma_claims`): the sketch is parsed as a step-ledger, and the
+  set of goal-hashes of its `lemma`-justified steps must **exactly equal** the set of declared child
+  goals. This blocks a sketch that secretly leans on an un-decomposed extra lemma (a hidden gap) or
+  declares children it never actually uses.
+- **The decomposition reviewer** (`Reviewer.review`, LEAP's pre-commit reviewer): an LLM judge checks
+  the plan is **useful** — non-circular, each child *strictly simpler*, and together *implying* the
+  parent — and stays inside the elementary toolkit; its notes feed back into the next re-plan. LEAP's
+  ablation shows that *without* this filter the agent loops forever on "valid but non-simplifying"
+  decompositions (a child that just restates the parent). It is **soft** (rank/prune) — it never
+  certifies elementarity; only Layer 4 does (§3).
+
+### 9.2 Memoization — prove each sub-lemma once (AlphaProof_Nexus's goal cache)
+
+**Memoization** is the dynamic-programming trick of *caching the result of an expensive computation so an
+identical sub-problem is solved once and reused.* Proof search is full of **overlapping sub-problems** —
+the same lemma resurfaces on many branches — so every goal becomes a node in a table keyed by its hash
+(`get_or_create`). The first time it is proven, the proof is stored; every later occurrence is a
+**cache hit** (counted in `cache_hits`) that reuses it instead of re-searching. When the finished proof
+is serialized (`assemble`/`proof_bundle`) a reused node is expanded once and later occurrences are
+marked **`shared`** ("proven above; reused"). Failure is cached too: a node marked `FAILED_GAP` is not
+re-attempted.
+
+This is the load-bearing efficiency idea, not a micro-optimization: it is what collapses an exponential
+re-derivation (LEAP's "Hilbert" tree baseline re-proves the same lemmas over and over) into a tractable
+graph search, and it lets an "anticipatory" lemma, proven once, feed many later steps.
+
+### 9.3 The acyclicity guard (LEAP's state-writer)
+
+A cache of "X is provable" is dangerous if a proof of X is allowed to assume X. So before committing a
+decomposition, `would_create_cycle` runs a DFS reachability check (`reaches`) over the already-committed
+edges plus the current ancestor set, and **rejects** any child that is the parent restated, an ancestor
+on the current path, or anything that transitively depends back on the parent. This keeps the DAG
+**acyclic**, making "A because B, B because A" circular proofs impossible — the precondition for the
+whole *all children proven ⇒ parent proven* guarantee.
+
+### 9.4 The goal-hash contract (soundness-critical)
+
+The key tying §9.1–§9.3 together is a **deep hash of the goal statement** (`dag.py::goal_hash`), so an
+identical sub-lemma on different branches resolves to one node. This key is **soundness-critical**: a
 *false hit* (two distinct goals hashing equal) would reuse a proof of the wrong lemma. So
 `canonical_form` folds **only meaning-preserving surface differences** (NFC + symbols: `→`/`->`, `≤`/`<=`,
 `²`/`^2`, `ℤ`/`Int`, `∣`/`|`; synonyms: `for all`/`∀`, `divides`/`∣`; spacing/markup) and **deliberately
@@ -238,10 +467,46 @@ The **repair loop** (`formalize_and_audit(repair_iters=N)`): formalize → compi
 (~0.1s) → on a compile error *or* an audit reject, feed diagnostics + retrieved real Mathlib lemmas back
 and re-formalize. A deep dive concluded Codex's `/goal` mode should **not** own this loop (a Python loop
 keeps control of retrieval/denylist/budget/audit; the persistent server's ~0.1s compile beats Codex
-re-running `lean` at ~60s/iter). Retrieval is a **hybrid**: Loogle (exact names from compile errors) +
-BM25 (lexical) + a **neural bi-encoder** (`bge-small-en-v1.5` over `name+signature+doc`, the LeanExplore
-recipe) that closes the abbreviation gap (`gcd` ↔ "greatest common divisor"); the neural backend is an
-optional dependency with graceful degradation.
+re-running `lean` at ~60s/iter).
+
+Retrieval is a **hybrid of three legs**, each strong where the others are weak:
+
+- **Loogle** (`retrieval.py`) — *exact names, by pattern.* It mines the compiler's "unknown identifier"
+  errors (the names the formalizer hallucinated) plus concept keywords from the claim into Loogle's HTTP
+  name/type search, surfacing the *real* Mathlib lemma that should replace a hallucinated one — the single
+  most common formalization fix.
+- **BM25** (`semantic_retrieval.py`) — *lexical keyword overlap.* The classic IR ranking function (rare
+  terms up-weighted by inverse document frequency, repeats saturating; `k1=1.5, b=0.75`) over an inverted
+  index of declaration names + signatures (name tokens boosted ×3), restricted to a curated elementary
+  slice of Mathlib (`Data/Nat`, `Data/Int`, `Data/ZMod`).
+- **Neural bi-encoder** (`neural_retrieval.py`) — *meaning, not words.* `bge-small-en-v1.5` embeds
+  `name+signature+doc` and the query *independently* and ranks by cosine similarity (the LeanExplore
+  recipe), closing the abbreviation gap (`gcd` ↔ "greatest common divisor"). An optional **cross-encoder**
+  (`ms-marco-MiniLM`) can re-score the top-N pool by feeding each (query, lemma) pair *jointly* through a
+  transformer — slower, but sharper than the bi-encoder because the two texts can attend to each other.
+
+The three are fused by **interleave-and-dedupe** (`HybridRetriever`): round-robin each source's best hits,
+drop duplicate declaration names, and **degrade gracefully** — if the neural dependencies are absent the
+pipeline silently falls back to Loogle + BM25. (Interleaving sidesteps having to calibrate three
+incomparable score scales.)
+
+### 10.1 The faithfulness wall — proving the *right* theorem
+
+A Lean proof can pass the kernel **and** the elementarity audit yet prove a subtly *different* statement —
+a weaker special case, or a vacuously-true one with impossible hypotheses. AlphaProof_Nexus "solved" wrong
+density variants this way, and Goedel reports >80% of failures are misformalization. So after compile+audit
+an **adversarial panel** (`faithfulness.py::adversarial_check`) checks the Lean *statement* against the
+English claim through four diverse **lenses**, each told to actively *find* a discrepancy and **default to
+"unfaithful" if unsure**:
+
+- **back-translation** — read the Lean back as English; does it match the claim?
+- **quantifiers / domain** — are `∀`/`∃`, variable types, and edge values (0, negatives) right?
+- **vacuity** — impossible hypotheses, or a trivially-true restatement?
+- **strength** — strictly weaker or stronger than claimed (a special case, or unrelated)?
+
+The statement is accepted only if at most `max_unfaithful` lenses object (default **0** — unanimity).
+Using *diverse* lenses rather than N identical judges is deliberate: each catches a failure mode the
+others miss. This is the final wall, so `authoritative_elementary` also means **faithful**.
 
 ---
 
@@ -251,8 +516,14 @@ v1's headline benchmark is **MathArena ArXivMath** — a *final-answer*, contami
 gold answers ship; problems are reverse-engineered from very recent arXiv papers). The integration is
 **non-contaminative by construction**: the loader splits each item into a *prompt* (statement only) and a
 *held-out oracle* (answer); a `Problem` has no `answer`/`source` field, so a solver cannot see them.
-Grading is **SymPy answer-equivalence**. Two solvers plug into the same harness: a *vanilla* single-shot
-Codex answerer and a *harness* answerer (Codex + the Autoreason tournament under an elementary gate).
+Grading is **SymPy answer-equivalence** (`answer_check.py`), not string match: it normalizes LaTeX-ish text
+(`\frac`, `\sqrt[n]`, `\cdot`, `\pi`, `^`, implicit multiplication) into a SymPy expression, then tries a
+**cascade** — exact normalized-string equality → order-agnostic set / positional tuple matching → numeric
+`evalf` within tolerance → symbolic `simplify(pred − gold) == 0` — accepting if *any* tier succeeds, so
+`1/2`, `0.5`, and `\frac{1}{2}` all count as equal. The runner also isolates faults **per item** (a solver
+timeout is recorded as an error and skipped, never aborting the whole run). Two solvers plug into the same
+harness: a *vanilla* single-shot Codex answerer and a *harness* answerer (Codex + the Autoreason tournament
+under an elementary gate).
 
 > **Genre note:** ArXivMath is final-answer; the harness's distinctive value is *elementary-proof
 > certification*, which a final-answer benchmark cannot measure. The **certification ladder**
