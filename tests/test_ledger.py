@@ -158,3 +158,34 @@ def test_missing_required_obligation_descent(toolkit):
     }
     led = parse_ledger(d)
     assert "missing_obligation" in _codes(validate_structure(led, toolkit), Severity.REJECT)
+
+
+# ---- goal<->claim binding: the conclusion must conclude the ledger's stated goal ----
+
+def test_goal_claim_mismatch_rejected(toolkit):
+    # The conclusion restates an intermediate lemma ("n is even") instead of the stated goal,
+    # so the proof concludes a DIFFERENT statement than the one claimed -> REJECT.
+    d = {
+        "problem": "p", "claim": "n^2 is even",
+        "steps": [
+            {"id": "s1", "claim": "n is even", "justification": "algebra", "depends_on": []},
+            {"id": "s2", "claim": "n is even", "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    }
+    led = parse_ledger(d)
+    assert "goal_claim_mismatch" in _codes(validate_structure(led, toolkit), Severity.REJECT)
+
+
+def test_conclusion_matching_goal_binds_despite_connective(toolkit):
+    # A conclusion that restates the goal with a leading "Hence" + trailing period still binds
+    # (notation/connective folding), so no mismatch fires.
+    d = {
+        "problem": "p", "claim": "n^2 is congruent to 0 or 1 mod 4",
+        "steps": [
+            {"id": "s1", "claim": "split on parity", "justification": "given", "depends_on": []},
+            {"id": "s2", "claim": "Hence n^2 is congruent to 0 or 1 mod 4.",
+             "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    }
+    led = parse_ledger(d)
+    assert "goal_claim_mismatch" not in _codes(validate_structure(led, toolkit), Severity.REJECT)

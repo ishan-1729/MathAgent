@@ -43,3 +43,28 @@ def test_scripted_checker():
     assert ScriptedFaithfulnessChecker(True).check("c", "l", "t").faithful
     bad = ScriptedFaithfulnessChecker(False, issues=["wrong quantifier"]).check("c", "l", "t")
     assert not bad.faithful and "wrong quantifier" in bad.issues
+
+
+# ---- judge-exception isolation: a crashing lens must default to UNFAITHFUL, not propagate ----
+
+def _judge_one_raises(claim, src, name, lens):
+    if lens == "quantifiers_domain":
+        raise RuntimeError("network timeout")
+    return SingleVerdict(lens=lens, faithful=True)
+
+
+def test_raising_judge_counts_as_unfaithful_and_does_not_propagate():
+    # No exception escapes; the crashing lens is recorded as an unfaithful vote (default-closed).
+    v = adversarial_check("claim", "lean", "thm", _judge_one_raises)
+    assert not v.faithful
+    assert v.n_unfaithful == 1
+    assert len(v.votes) == len(DEFAULT_LENSES)
+    crashed = next(vote for vote in v.votes if vote.lens == "quantifiers_domain")
+    assert not crashed.faithful
+    assert any("RuntimeError" in i for i in crashed.issues)
+    assert any("quantifiers_domain" in i for i in v.issues)
+
+
+def test_raising_judge_through_panel_checker():
+    chk = PanelFaithfulnessChecker(_judge_one_raises)
+    assert not chk.check("c", "l", "t").faithful  # crash must not propagate or pass

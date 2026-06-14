@@ -159,11 +159,25 @@ def test_repair_loop_exhausts(monkeypatch):
 
 
 def test_full_verify_authoritative(monkeypatch):
+    # Faithfulness FAILS CLOSED: authoritative requires a faithfulness panel that actually passed.
+    from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
     fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
-    res = fb.full_verify(VALID_LEDGER, fr, toolkit=TOOLKIT)
+    res = fb.full_verify(VALID_LEDGER, fr, toolkit=TOOLKIT,
+                         faithfulness_checker=ScriptedFaithfulnessChecker(True))
     assert res.gate.admitted_deterministically
     assert res.authoritative_elementary
+
+
+def test_full_verify_not_authoritative_without_faithfulness(monkeypatch):
+    # Regression: compiled + audited but NO faithfulness checker => NOT authoritative (fail closed).
+    # Asserted via formalize_and_audit so it is independent of the informal-gate outcome.
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    res = fb.formalize_and_audit(VALID_LEDGER, fr, toolkit=TOOLKIT)
+    assert res.elementary_verified      # the proof IS audited elementary...
+    assert not res.faithful             # ...but faithfulness never ran...
+    assert not res.authoritative        # ...so it is NOT authoritative
 
 
 def test_faithfulness_blocks_authoritative(monkeypatch):
@@ -188,6 +202,17 @@ def test_faithfulness_pass_is_authoritative(monkeypatch):
     assert res.authoritative
 
 
+def test_no_faithfulness_checker_blocks_authoritative(monkeypatch):
+    # Fail closed at the unit level: compiled + audit-passed but NO faithfulness checker => the
+    # statement was never verified, so the result must NOT be authoritative.
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    res = fb.formalize_and_audit(VALID_LEDGER, fr, toolkit=TOOLKIT)  # no faithfulness_checker
+    assert res.compiled and res.elementary_verified
+    assert res.faithfulness is None
+    assert not res.faithful and not res.authoritative
+
+
 def test_make_terminal_gate(monkeypatch):
     from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
@@ -195,6 +220,15 @@ def test_make_terminal_gate(monkeypatch):
                                  toolkit=TOOLKIT, faithfulness_checker=ScriptedFaithfulnessChecker(True))
     result = gate("root goal", "proof bundle text")
     assert result.authoritative
+
+
+def test_make_terminal_gate_without_faithfulness_not_authoritative(monkeypatch):
+    # A terminal gate built WITHOUT a faithfulness checker can never certify authoritative (fail closed).
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
+    gate = fb.make_terminal_gate(fz.ScriptedFormalizer("theorem ma_target : True := trivial"),
+                                 toolkit=TOOLKIT)
+    result = gate("root goal", "proof bundle text")
+    assert result.elementary_verified and not result.authoritative
 
 
 def test_full_verify_skips_lean_when_gate_rejects(monkeypatch):

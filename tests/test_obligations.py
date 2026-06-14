@@ -103,3 +103,61 @@ def test_split_coprimality_dangling(toolkit):
         {"id": "s3", "claim": "done", "justification": "conclusion", "depends_on": ["s2"]},
     ])
     assert "split_coprimality_dangling" in _codes(check_obligations(led, toolkit))
+
+
+def test_descent_malicious_expr_rejects_and_does_not_execute(toolkit, monkeypatch):
+    # A prover-controlled next_expr/measure_expr carrying a Python injection must become a
+    # deterministic REJECT (descent_expr_error) and must NOT execute during parsing.
+    import os
+
+    called = {"hit": False}
+    monkeypatch.setattr(os, "getpid", lambda: called.__setitem__("hit", True) or 1)
+    led = _ledger([
+        {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
+         "obligations": {"descent": {
+             "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+             "measure_expr": "x", "next_expr": '__import__("os").getpid()',
+             "variables": ["x"], "sample_bounds": {"x": [1, 5]}}}},
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    findings = check_obligations(led, toolkit)
+    assert "descent_expr_error" in _codes(findings)
+    assert called["hit"] is False
+
+
+def test_descent_constructor_globals_leak_blocked(toolkit, monkeypatch):
+    # The exact residual gate exploit: a model-controlled next_expr that reaches sympy's module
+    # __builtins__ via Symbol.__new__.__globals__. It must become a deterministic descent_expr_error
+    # REJECT and must NOT execute os.system during the descent spot-check.
+    import os
+
+    called = {"hit": False}
+    monkeypatch.setattr(os, "system", lambda *_a, **_k: called.__setitem__("hit", True) or 0)
+    payload = (
+        'Integer(Symbol.__new__.__globals__["__builtins__"]'
+        '["__import__"]("os").system("echo RCE_GATE_EXACT"))'
+    )
+    led = _ledger([
+        {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
+         "obligations": {"descent": {
+             "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+             "measure_expr": "1", "next_expr": payload,
+             "variables": ["x"], "sample_bounds": {"x": [0, 0]}}}},
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    findings = check_obligations(led, toolkit)
+    assert "descent_expr_error" in _codes(findings)
+    assert called["hit"] is False
+
+
+def test_descent_numeric_spotcheck_still_passes_after_hardening(toolkit):
+    # Legitimate descent spot-check behavior is unchanged by the parser hardening.
+    led = _ledger([
+        {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
+         "obligations": {"descent": {
+             "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+             "measure_expr": "x", "next_expr": "x - 1", "variables": ["x"],
+             "sample_bounds": {"x": [1, 20]}}}},
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert not _codes(check_obligations(led, toolkit))

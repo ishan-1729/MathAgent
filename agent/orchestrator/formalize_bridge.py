@@ -8,6 +8,10 @@ ADVERSARIAL statement-faithfulness check so a compiling/audited proof of the WRO
 faithfulness, reporting `authoritative_elementary` = informal-gate-admitted AND compiled AND
 dependency-audit-passed AND statement-faithful. This is the only place where "elementary" is *enforced*.
 
+Faithfulness FAILS CLOSED: `authoritative` is True only when a faithfulness panel actually ran and
+passed (see `FormalizeAuditResult.faithful`). A result with no faithfulness checker is audited but
+NOT authoritative — callers that want certification MUST pass a `faithfulness_checker`.
+
 `make_terminal_gate` packages this as a callable for use as the DAG driver's terminal gate.
 """
 from __future__ import annotations
@@ -17,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 from agent.gates import lean_bridge
-from agent.gates.gate import GateReport, evaluate
+from agent.gates.gate import GateReport, Verdict, evaluate
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.lean_audit import LeanAuditResult
 from agent.gates.toolkit import Toolkit, load_toolkit
@@ -56,12 +60,18 @@ class FormalizeAuditResult:
 
     @property
     def faithful(self) -> bool:
-        """True if faithfulness was not checked (None) or was checked and passed."""
-        return self.faithfulness is None or self.faithfulness.faithful
+        """FAIL CLOSED: True only if a faithfulness panel actually ran AND passed.
+
+        If faithfulness was never checked (`self.faithfulness is None`) this is False, so a
+        compiling/audited proof of the WRONG statement is never silently treated as authoritative.
+        """
+        return self.faithfulness is not None and self.faithfulness.faithful
 
     @property
     def authoritative(self) -> bool:
-        """The proof is authoritatively elementary: audited elementary AND the statement is faithful."""
+        """The proof is authoritatively elementary: audited elementary AND a faithfulness panel
+        ran and confirmed the statement faithfully captures the claim. Cannot be True unless a
+        faithfulness checker was supplied and passed (fail closed)."""
         return self.elementary_verified and self.faithful
 
     def summary(self) -> str:
@@ -157,7 +167,11 @@ class FullVerifyResult:
 
     @property
     def authoritative_elementary(self) -> bool:
-        return bool(self.gate.admitted_deterministically
+        # Fail closed on the informal gate: a NEEDS_REVIEW verdict (e.g. an elastic justification routed
+        # to Layer 2) must NOT be authoritative when nothing resolved that review. Only a fully-passing
+        # deterministic gate qualifies — `admitted_deterministically` also accepts NEEDS_REVIEW and is
+        # therefore too weak for the authoritative verdict.
+        return bool(self.gate.verdict is Verdict.PASSED_DETERMINISTIC
                     and self.lean is not None and self.lean.authoritative)
 
     def summary(self) -> str:

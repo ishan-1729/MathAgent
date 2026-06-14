@@ -11,7 +11,7 @@ import pytest
 
 from agent.gates import lean_bridge
 from agent.gates.toolkit import load_toolkit
-from agent.tools.codex_prover import CodexProver, CodexConfig
+from agent.tools.codex_prover import CodexProver, CodexConfig, CodexFaithfulnessChecker
 from agent.tools.formalizer import CodexFormalizer
 from agent.orchestrator.formalize_bridge import full_verify
 
@@ -30,7 +30,10 @@ def test_full_verify_trivial_target():
          "depends_on": ["s1"]},
         {"id": "s3", "claim": "For all integers n, n + 0 = n.", "justification": "conclusion",
          "depends_on": ["s2"]}]})
-    fm = CodexFormalizer(tk, CodexConfig(reasoning_effort="low", timeout_s=300))
-    res = full_verify(ledger, fm, toolkit=tk, timeout_s=540)
+    cfg = CodexConfig(reasoning_effort="low", timeout_s=300)
+    fm = CodexFormalizer(tk, cfg)
+    # Faithfulness FAILS CLOSED: a faithfulness panel must run+pass for the result to be authoritative.
+    res = full_verify(ledger, fm, toolkit=tk, timeout_s=540,
+                      faithfulness_checker=CodexFaithfulnessChecker(cfg))
     assert res.gate.admitted_deterministically
     assert res.authoritative_elementary, res.summary()

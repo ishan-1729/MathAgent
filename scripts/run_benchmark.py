@@ -59,9 +59,13 @@ class CodexAnswerSolver:
 class HarnessAnswerSolver:
     """**GPT-5.5-xHigh + the MathAgent harness.** Codex produces an elementary solution, then the Codex
     Autoreason incumbent tournament (critic → author → synthesizer → judge panel, with PUCT +
-    Bradley-Terry) refines it under an elementary-admissibility gate (a non-elementary "improvement"
-    cannot displace the incumbent); we then extract the final answer. Measures what the harness adds
-    over the bare model. Still sees only the statement (non-contaminative)."""
+    Bradley-Terry) refines it under a **prose denylist filter** (a candidate whose text trips a
+    non-elementary prose smell cannot displace the incumbent); we then extract the final answer.
+    NOTE: this is only a lowercase substring filter over `prose_terms` — NOT the authoritative
+    elementary gate (no typed ledger, no `gate.evaluate`, no Lean Layer-4 audit). It is a soft
+    admissibility heuristic for this final-answer benchmark; proof certification lives in `prove.py`.
+    Measures what the harness adds over the bare model. Still sees only the statement
+    (non-contaminative)."""
 
     def __init__(self, cfg, *, n_judges: int = 1, passes: int = 2):
         from agent.gates.toolkit import load_toolkit
@@ -71,6 +75,8 @@ class HarnessAnswerSolver:
         self.refiner = make_codex_refiner(cfg, n_judges=n_judges, max_passes=passes)
 
     def _elementary_ok(self, candidate: str) -> bool:
+        # Soft prose denylist filter only (substring scan) — see the class docstring; this is NOT the
+        # authoritative Layer-4 elementary gate.
         low = candidate.lower()
         return not any(term in low for term in self._deny)
 

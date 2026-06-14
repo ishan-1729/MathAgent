@@ -1,6 +1,6 @@
 # MathAgent — Build Status
 
-> **Snapshot:** `2026-06-14T04:21:35+05:30` · commit `29ad0da` · stamp `074739e7ecc32578`
+> **Snapshot:** `2026-06-14T18:58:00+05:30` · base commit `05cb1c3` · stamp `8f849a0d603b1807`
 > (`stamp = sha256(timestamp | full-commit-sha)[:16]` — identifies the exact state this doc describes;
 > regenerate on every edit so a stale doc is detectable.) See the canonical
 > **[`system_design.md`](system_design.md)** for the architecture this status tracks against.
@@ -226,7 +226,7 @@ non-contaminative **ArXivMath benchmark** adapter + harness.
 | Makefile | `Makefile` | check/test/demo/all/tree | built |
 | pyproject.toml | `pyproject.toml` | py≥3.11; pyyaml/sympy/jsonschema; pytest config | built |
 | conftest.py | `conftest.py` | sys.path bootstrap for `import agent` | built |
-| tests/ (29 files) | `tests/` | Full-stack suite (28 test modules + conftest) | built+unit-tested |
+| tests/ (33 files) | `tests/` | Full-stack suite (32 test modules + conftest) | built+unit-tested |
 | Live-gated tests | `tests/test_lean_mathlib_live.py` (+ bridge/server/formalize/codex) | Opt-in via env flags | **built+LIVE-validated** |
 | demo.py | `agent/demo.py` | `make demo` no-LLM/no-network end-to-end | built |
 | Lean env README | `formal/lean/README.md` | Lean 4.30.0 + Mathlib v4.30.0 build/audit env | data/docs |
@@ -265,10 +265,11 @@ make all       # check + test (CI target)
 make demo      # agent/demo.py — gate + flat driver, no LLM / no network
 ```
 
-Aggregate offline result (this snapshot): **280 tests passed, 8 opt-in skipped** — all deterministic
+Aggregate offline result (this snapshot): **380 tests passed, 8 opt-in skipped** — all deterministic
 (model & Lean stubbed). New since the prior snapshot: `test_dag` semantic-canonicalization +
 soundness guards, `test_tournament`, `test_dag_driver` refiner/replan, `test_layer4_sync`,
-`test_neural_retrieval`, `test_answer_check`, `test_arxivmath`. The 8 skips are the env-gated live
+`test_neural_retrieval`, `test_answer_check`, `test_arxivmath`, plus the **2026-06-14 security/soundness
+hardening** suites (see below). The 8 skips are the env-gated live
 paths (`MATHAGENT_LEAN_TESTS` / `MATHAGENT_CODEX_TESTS` / `MATHAGENT_NEURAL_TESTS`).
 
 **Run the prover (requires the external `codex` CLI on PATH; `--server`/Mathlib audits need a built ~5 GB `.lake`):**
@@ -286,6 +287,31 @@ Key flags: `--model gpt-5.5` · `--effort xhigh` · `--direct` (single Ralph loo
 | `MATHAGENT_CODEX_TESTS=1` (+ codex on PATH) | Live Codex prompt/role tests |
 | `MATHAGENT_LEAN_TESTS=1` (+ built Mathlib project) | Live Lean bridge / Mathlib audit / semantic build |
 | both | `test_formalize_live.py` full end-to-end (`n+0=n`) |
+
+### Security / soundness hardening (2026-06-14)
+
+A deep multi-agent audit (5 Opus code workers + 3 consistency workers + 2 adversarial Codex GPT-5.5-xHigh
+agents + skeptic verification; report in [`audits/2026-06-14_deep_audit.md`](audits/2026-06-14_deep_audit.md))
+found, and a follow-up fix campaign closed, a set of soundness/security defects. **Closed:**
+
+- **Faithfulness fails open → fail-closed.** `FormalizeAuditResult.faithful` now requires a panel that
+  *actually ran and passed*; `authoritative_elementary` requires it. The CLI defaults faithfulness **on**
+  for `--terminal-gate`/`--formalize` (`--no-faithfulness` = explicitly audited-only/non-authoritative).
+- **Lean Layer-4 audit integrity:** nonce-bound `#audit` sentinel + duplicate-sentinel rejection +
+  forbidden-command stripping + theorem-name cross-check (defeats self-reported / stale / injected audits);
+  prefix-anchored allow/deny precedence; persistent-server teardown + error isolation.
+- **RCE removed** from the numeric gate and the answer grader (no `sympify`/`eval`; locked `parse_expr`).
+- **`NEEDS_REVIEW` no longer admitted as authoritative** (requires `PASSED_DETERMINISTIC`); RalphLoop and
+  DAG decomposition fail closed on an unreviewed `NEEDS_REVIEW`.
+- **Goal binding** on the direct `--formalize` path (ledger claim *and* terminal conclusion bound to the
+  goal via `goal_hash`); depth-limit cache poisoning, decomposition rollback, greedy verdict regex, and
+  answer-grading mis-classification fixed. New suites: `test_faithfulness_gate`, `test_ralph_review`, plus
+  hardening tests across `test_lean_*`, `test_numeric`, `test_obligations`, `test_dag_driver`, `test_answer_check`.
+
+**Tracked follow-ups (non-blocking):** `boundary_rulings` is declared but not yet gate-wired; FlatDriver
+informal `claim==problem` and ledger `conclusion==claim` remain conditional (robust binding is in the
+orchestrator via `goal_hash`); a shared `canonical_form` between gates and orchestrator is the clean
+refactor; a regression test pinning the Lean shadow-elaborator class is advisable.
 
 ---
 

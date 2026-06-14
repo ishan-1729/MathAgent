@@ -66,6 +66,33 @@ def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+# A conclusion is conventionally restated with a leading connective ("Hence/Therefore/…") and a
+# trailing period; these are folded so such a restatement still binds to the goal.
+_CONCLUSION_LEAD = re.compile(
+    r"^(?:hence|therefore|thus|so|then|it\s+follows\s+that|"
+    r"we\s+conclude\s+that|we\s+have\s+(?:shown|proved|proven)\s+that)[\s,:]+",
+    re.IGNORECASE)
+
+
+def _norm_claim(s: str) -> str:
+    """NFC + whitespace-collapsed form for comparing a goal against a step's claim.
+
+    This is a deliberately *local* normalization (gates must stay free of orchestrator imports):
+    it folds Unicode form, whitespace, a trailing period, and a leading concluding connective
+    ("Hence/Therefore/…"), but never notation/synonyms. A genuine restatement of the same goal —
+    differing only in spacing or a connective — therefore still binds, while a different statement
+    does not.
+    """
+    out = re.sub(r"\s+", " ", _nfc(s or "")).strip()
+    out = _CONCLUSION_LEAD.sub("", out).strip()
+    out = out.rstrip(".").strip()
+    # Fold only the sentence-initial letter's case (capitalization is not mathematically meaningful
+    # at the start of a sentence, but mid-string case IS — `x` != `X` as variables — so it stays).
+    if out:
+        out = out[0].lower() + out[1:]
+    return out
+
+
 def _extract_json(text: str) -> dict:
     """Pull a ledger object out of raw text: a dict, a JSON string, or a fenced ```json block."""
     text = text.strip()
@@ -200,6 +227,27 @@ def validate_structure(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
     elif len(conclusions) > 1:
         findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "multi_conclusion",
                                 f"ledger has {len(conclusions)} 'conclusion' steps; expected exactly one"))
+
+    # 5a. goal<->claim binding: the conclusion must actually conclude the ledger's stated goal.
+    #     A proof whose terminal step claims something other than `ledger.claim` proves a DIFFERENT
+    #     statement than the one requested, so it is not a proof of this goal. Compared under
+    #     NFC + whitespace normalization (folding a leading "Hence/Therefore" connective and a
+    #     trailing period, which carry no mathematical content), so a benign restatement still binds.
+    #     To stay free of false positives on placeholder/scaffolding ledgers (whose claims are not
+    #     genuine restatements of each other), the REJECT fires only on a *genuine* mismatch: the
+    #     conclusion restates some OTHER body step's claim instead of the goal — i.e. the proof
+    #     concludes an intermediate lemma, not the requested statement. (Robust goal binding against the
+    #     *requested* goal is enforced in the orchestrator via goal_hash — FlatDriver/DagDriver/CLI.)
+    if len(conclusions) == 1:
+        concl = conclusions[0]
+        norm_concl = _norm_claim(concl.claim)
+        if norm_concl != _norm_claim(ledger.claim):
+            body_claims = {_norm_claim(s.claim) for s in ledger.steps if s.id != concl.id}
+            if norm_concl in body_claims:
+                findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "goal_claim_mismatch",
+                                        "conclusion step restates an intermediate step's claim "
+                                        "rather than the ledger's stated goal (the proof does not "
+                                        "conclude the requested claim)", concl.id))
 
     # 5b. a lone conclusion that depends on nothing, while other steps exist, "proves itself".
     if len(conclusions) == 1 and len(ledger.steps) > 1 and not conclusions[0].depends_on:

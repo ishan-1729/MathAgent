@@ -18,7 +18,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.gates.toolkit import load_toolkit
+from agent.gates.ledger import parse_ledger, LedgerError
 from agent.orchestrator import Budget, RunTrace, RalphLoop, DagDriver
+from agent.orchestrator.dag import goal_hash
 from agent.tools.codex_prover import (CodexProver, CodexDecomposer, CodexReviewer, CodexComparator,
                                       CodexConfig, make_codex_refiner)
 
@@ -40,7 +42,11 @@ def main() -> int:
     ap.add_argument("--terminal-gate", action="store_true",
                     help="(dag mode) run Layer 4 as the terminal authoritative gate on the proven root")
     ap.add_argument("--faithfulness", action="store_true",
-                    help="run the adversarial statement-faithfulness panel during Layer-4 verification")
+                    help="force the adversarial statement-faithfulness panel on (default ON for "
+                         "certification modes --terminal-gate / --formalize)")
+    ap.add_argument("--no-faithfulness", action="store_true",
+                    help="opt out of the faithfulness panel in certification modes (the result can "
+                         "then NOT be authoritative — audited only)")
     ap.add_argument("--server", action="store_true",
                     help="use the persistent Lean server (loads Mathlib once) for audits")
     ap.add_argument("--repair", type=int, default=0, metavar="N",
@@ -83,10 +89,17 @@ def main() -> int:
             server = LeanServer().start()
         else:
             print("# (--server requested but Lean REPL not built; using per-call lean)")
+    # Faithfulness FAILS CLOSED: a Layer-4 result can only be "authoritative" if a faithfulness panel
+    # actually ran and passed. So for the certification modes (--terminal-gate / --formalize) the panel
+    # is ON BY DEFAULT; --no-faithfulness opts out (the run is then audited-only, never authoritative).
+    certifying = args.terminal_gate or args.formalize
+    want_faith = args.faithfulness or (certifying and not args.no_faithfulness)
     faith = None
-    if args.faithfulness:
+    if want_faith:
         from agent.tools.codex_prover import CodexFaithfulnessChecker
         faith = CodexFaithfulnessChecker(cfg)
+    elif certifying:
+        print("# (--no-faithfulness: Layer-4 audit only; result will NOT be authoritative)")
     retriever = None
     if args.retrieval or args.neural:
         from agent.tools.retrieval import LoogleRetriever
@@ -106,10 +119,26 @@ def main() -> int:
             rs.append(sem)                        # BM25: relevance from the claim's meaning words
         retriever = HybridRetriever(rs) if len(rs) > 1 else rs[0]
 
+    cert_authoritative = None   # set in certifying modes once a Layer-4 certification actually runs
     if args.direct:
         res = RalphLoop(prover, toolkit=toolkit, budget=budget, trace=trace,
                         max_episodes=args.episodes).run(args.goal)
         ok = res.success
+        # Goal<->claim binding: a prover may return a clean, self-consistent ledger that proves a
+        # DIFFERENT statement than the one requested. Bind BOTH the top-level claim AND the terminal
+        # conclusion step to args.goal (mirroring DagDriver), so a ledger whose claim==goal but whose
+        # conclusion proves a fresh unrelated statement is not reported PROVEN for this goal.
+        if ok and res.ledger:
+            try:
+                led = parse_ledger(res.ledger)
+                gh = goal_hash(args.goal)
+                concl = next((s for s in led.steps if s.justification == "conclusion"), None)
+                proved = led.claim if (concl is None) else concl.claim
+                if goal_hash(led.claim) != gh or concl is None or goal_hash(concl.claim) != gh:
+                    ok = False
+                    print(f"# rejected: the ledger proves {proved!r}, not the requested goal")
+            except LedgerError:
+                pass
         print(f"result: {'PROVEN' if ok else 'NOT PROVEN'}  (episodes={res.episodes})")
         if res.report:
             print(f"gate: {res.report.summary()}")
@@ -147,6 +176,7 @@ def main() -> int:
         if res.terminal is not None:
             print("\nterminal Layer-4 gate:", res.terminal.summary())
             print("authoritative_elementary:", res.authoritative_elementary)
+            cert_authoritative = res.authoritative_elementary
 
     # Optional: close the loop — formalize the proven ledger to Lean and run the Layer-4 audit.
     winning_ledger = res.ledger if (args.direct and ok and res.ledger) else None
@@ -155,10 +185,12 @@ def main() -> int:
         from agent.orchestrator.formalize_bridge import formalize_and_audit
         print("\n# Formalizing the ledger to Lean and running the Layer-4 audit...")
         fa = formalize_and_audit(winning_ledger, CodexFormalizer(toolkit, cfg), toolkit=toolkit,
+                                 informal_claim=args.goal,
                                  faithfulness_checker=faith, server=server,
                                  retriever=retriever, repair_iters=args.repair)
         print("formalize + audit:", fa.summary())
         print("authoritative_elementary:", fa.authoritative)
+        cert_authoritative = fa.authoritative
         if fa.lean_source:
             print("\n--- formalized Lean ---\n" + fa.lean_source)
     elif args.formalize:
@@ -172,7 +204,15 @@ def main() -> int:
         trace.write_jsonl(str(args.out) + ".trace.jsonl")
     print("trace events: " + ", ".join(f"{k}={len(trace.by_kind(k))}"
           for k in ["ralph_episode", "decompose", "review", "prove_node", "cache_hit", "final"]))
-    return 0 if ok else 1
+    # In certifying modes the exit code reflects CERTIFICATION (authoritative_elementary), not just the
+    # informal PROVEN verdict, so automation keyed on the exit code is not misled.
+    success = ok
+    if certifying and cert_authoritative is not None:
+        success = ok and cert_authoritative
+        if ok and not cert_authoritative:
+            print("\n# NOTE: informally PROVEN but NOT authoritative_elementary; exiting non-zero "
+                  "(certifying mode). Use --no-faithfulness for an explicitly audited-only run.")
+    return 0 if success else 1
 
 
 if __name__ == "__main__":

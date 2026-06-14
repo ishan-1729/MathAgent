@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from agent.gates.gate import GateReport, evaluate
+from agent.gates.gate import GateReport, Verdict, evaluate
 from agent.gates.toolkit import Toolkit, load_toolkit
 from agent.orchestrator.driver import Prover, Judge
 from agent.orchestrator.state import Budget
@@ -70,6 +70,14 @@ class RalphLoop:
             if report.rejected:
                 lessons = [str(f) for f in report.rejects()][:_MAX_LESSONS]
                 continue
+
+            # Admitted by the deterministic gate. A soft NEEDS_REVIEW (e.g. an elastic
+            # justification like descent/vieta_jumping) with no judge to resolve it must NOT be
+            # returned as a proven direct proof -- the scanner exists precisely to force that
+            # review. Mirror FlatDriver's guard and fail closed.
+            if report.verdict is Verdict.NEEDS_REVIEW and not self.judges:
+                self.trace.emit("review_unhandled", reviews=[f.code for f in report.reviews()])
+                return RalphResult(False, text, report, episodes, lessons, exhausted=True)
 
             # Deterministically admitted -> optional Layer-2 adversarial review.
             judge_notes: list[str] = []

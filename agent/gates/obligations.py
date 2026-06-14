@@ -31,7 +31,8 @@ def _check_case_cover(step_id: str, ob: dict) -> list[Finding]:
         return []
     try:
         res = numeric.verify_residue_cover(cc["modulus"], cc["residues"])
-    except (numeric.NumericError, KeyError, TypeError) as e:
+    except Exception as e:  # noqa: BLE001 - any malformed-but-schema-valid obligation must become a
+        # deterministic REJECT, never an uncaught exception (KeyError, TypeError, NumericError, ...).
         return [Finding(LAYER_NUMERIC, Severity.REJECT, "case_cover_error", str(e), step_id)]
     if res.modulus < 2:
         return [Finding(LAYER_NUMERIC, Severity.REJECT, "case_cover_vacuous",
@@ -68,7 +69,8 @@ def _check_descent(step_id: str, ob: dict) -> list[Finding]:
         box = {v: tuple(sample_bounds[v]) for v in variables}
         try:
             ge_zero = numeric.find_points_where_nonneg(f"({ne}) - ({me})", variables, box)
-        except (numeric.NumericError, TypeError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - prover-controlled measure/next exprs must never crash
+            # the gate; any failure (NumericError, TypeError, ValueError, ...) is a deterministic REJECT.
             findings.append(Finding(LAYER_NUMERIC, Severity.REJECT, "descent_expr_error", str(e), step_id))
             return findings
         if ge_zero:

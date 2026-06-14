@@ -117,15 +117,17 @@ transitive <em>dependency closure</em>, not "it compiled."</div>
 <h3>Boundary rulings — the contested edge of "elementary"</h3>
 <p>Most justifications are simply allowed or not, but a handful sit on the genuine boundary, where a binary
 flag is wrong. <code>allowed_toolkit.yaml</code> carries a separate <strong>four-valued</strong>
-<code>boundary_rulings</code> vocabulary (read via <code>Toolkit.ruling()</code>): <strong>allowed</strong>
+<code>boundary_rulings</code> vocabulary (queryable via <code>Toolkit.ruling()</code>): <strong>allowed</strong>
 (e.g. Pell's fundamental solution — an elementary descent proof exists), <strong>allowed_with_citation</strong>
 (e.g. <em>Zsygmondy</em> — elementary but hard, cite it like LTE), <strong>allowed_per_problem_whitelist</strong>
 (e.g. higher / cubic–quartic reciprocity — admit only where a specific problem needs it), and
 <strong>disallowed</strong> (e.g. the <em>analytic / Gauss-sum</em> proof of quadratic reciprocity — even
 though a <em>different</em>, elementary proof of the same theorem is fine). It is the explicit, auditable
-answer to "what counts as elementary at the edge." The gate also <strong>fails closed</strong>: any malformed
-ledger or internal exception becomes a REJECT, and the verdict is the maximum severity present
-(REJECT &gt; REVIEW &gt; INFO), so a bug can only ever produce a safe rejection, never a silent pass.</p>
+answer to "what counts as elementary at the edge" — though it is <strong>declared, not yet gate-wired</strong>
+(<code>Toolkit.ruling()</code> exists, but no layer consults it yet; enforcement is a tracked follow-up).
+The gate also <strong>fails closed</strong>: any malformed ledger or internal exception becomes a REJECT,
+and the verdict is the maximum severity present (REJECT &gt; REVIEW &gt; INFO), so a bug can only ever
+produce a safe rejection, never a silent pass.</p>
 
 <h3>The faithfulness wall — proving the <em>right</em> theorem</h3>
 <p>A Lean proof can pass the kernel <strong>and</strong> the elementarity audit yet prove a subtly
@@ -137,7 +139,10 @@ So after compile+audit an <strong>adversarial panel</strong> (<code>faithfulness
 actively <em>find</em> a discrepancy and <strong>default to "unfaithful" if unsure</strong>. The statement is
 accepted only if at most <code>max_unfaithful</code> lenses object (default 0 — unanimity). Diverse lenses,
 not N identical judges, each catch a different failure mode — so <span class="pill ok">authoritative_elementary</span>
-also means <strong>faithful</strong>.</p>
+also means <strong>faithful</strong>. It <strong>fails closed</strong>: if no faithfulness panel ran, the
+result is <em>not</em> authoritative (the CLI defaults the panel on for certification; <code>--no-faithfulness</code>
+is explicitly audited-only). Authoritative also requires the informal gate to have <em>passed
+deterministically</em>, not merely <code>NEEDS_REVIEW</code>.</p>
 
 <h2><span class="num">4.</span>How mechanisms engage — there is no classifier</h2>
 <p>A natural question: what <em>decides</em> whether decomposition, population search, or the tournament

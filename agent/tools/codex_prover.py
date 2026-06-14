@@ -187,7 +187,102 @@ def children_from_sketch(sketch: str) -> list[str]:
     return children
 
 
-_VERDICT_RE = re.compile(r"\{.*\}", re.DOTALL)
+# Codex prose routinely contains stray braces/brackets BEFORE the final JSON (sets {1,2,3}, Lean
+# terms, [citations]). A greedy `\{.*\}` / `\[.*\]` (DOTALL) would span from the first delimiter to
+# the last and make json.loads fail, silently taking the fail-closed branch and losing the verdict.
+# Instead: prefer a fenced ```json block (as agent/gates/ledger.py:_extract_json does), then fall
+# back to scanning from the END for the last balanced object/array.
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*([\[{].*?[\]}])\s*```", re.DOTALL)
+
+# Matching close -> open delimiter, for the balanced backward scan.
+_CLOSERS = {"}": "{", "]": "["}
+
+
+def _last_balanced(text: str, open_ch: str, close_ch: str) -> Optional[str]:
+    """The LAST balanced `open_ch..close_ch` span in `text`, ignoring delimiters inside strings.
+
+    Scans from the end: anchor on the final `close_ch`, then walk backwards tracking depth until the
+    matching `open_ch`. Returns None if there is no balanced span. String literals (single/double
+    quoted) are skipped so braces/brackets inside JSON string values don't perturb the depth count.
+    """
+    end = text.rfind(close_ch)
+    while end != -1:
+        depth = 0
+        i = end
+        in_str = False
+        quote = ""
+        while i >= 0:
+            ch = text[i]
+            if in_str:
+                # We're walking backwards inside a string literal; the opening quote ends it. A
+                # backslash immediately before the quote would escape it, so count preceding
+                # backslashes and treat an odd run as an escaped (non-terminating) quote.
+                if ch == quote:
+                    bs = 0
+                    j = i - 1
+                    while j >= 0 and text[j] == "\\":
+                        bs += 1
+                        j -= 1
+                    if bs % 2 == 0:
+                        in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                quote = ch
+            elif ch == close_ch:
+                depth += 1
+            elif ch == open_ch:
+                depth -= 1
+                if depth == 0:
+                    return text[i:end + 1]
+            i -= 1
+        # No matching opener for this closer; try an earlier close delimiter.
+        end = text.rfind(close_ch, 0, end)
+    return None
+
+
+def _extract_json(raw: str):
+    """Parse the trailing JSON value out of Codex output. Prefer a fenced ```json block, else the
+    last balanced object/array. Returns the decoded value, or None if nothing valid is found."""
+    text = (raw or "").strip()
+    # 1. Fenced block (most reliable; mirrors ledger._extract_json).
+    for m in _FENCED_JSON_RE.finditer(text):
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+    # 2. Last balanced object/array. Take whichever appears later in the text so a trailing JSON
+    #    array isn't shadowed by an earlier object (and vice versa).
+    obj = _last_balanced(text, "{", "}")
+    arr = _last_balanced(text, "[", "]")
+    candidates = [c for c in (obj, arr) if c is not None]
+    candidates.sort(key=lambda c: text.rfind(c))      # later occurrence wins
+    for cand in reversed(candidates):
+        try:
+            return json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _extract_json_object(raw: str) -> Optional[dict]:
+    """The trailing JSON OBJECT from Codex output (fenced block preferred), or None."""
+    text = (raw or "").strip()
+    for m in _FENCED_JSON_RE.finditer(text):
+        try:
+            val = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(val, dict):
+            return val
+    span = _last_balanced(text, "{", "}")
+    if span is not None:
+        try:
+            val = json.loads(span)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(val, dict):
+            return val
+    return None
 
 
 class CodexReviewer:
@@ -210,15 +305,10 @@ class CodexReviewer:
             'Output ONLY a JSON object: {"useful": <bool>, "elementary": <bool>, "notes": [<strings>]}'
         )
         raw = _run_codex(prompt, self.cfg)
-        m = _VERDICT_RE.search(raw)
-        if not m:
+        obj = _extract_json_object(raw)
+        if obj is None:
             return ReviewVerdict(useful=False, elementary=False,
                                  notes=["reviewer output was not parseable JSON"])
-        try:
-            obj = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return ReviewVerdict(useful=False, elementary=False,
-                                 notes=["reviewer output was not valid JSON"])
         return ReviewVerdict(
             useful=bool(obj.get("useful", False)),
             elementary=bool(obj.get("elementary", False)),
@@ -243,13 +333,10 @@ class CodexComparator:
             'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}'
         )
         raw = _run_codex(prompt, self.cfg)
-        m = _VERDICT_RE.search(raw)
-        if not m:
+        obj = _extract_json_object(raw)
+        if obj is None:
             return 0
-        try:
-            w = str(json.loads(m.group(0)).get("winner", "tie")).strip().lower()
-        except json.JSONDecodeError:
-            return 0
+        w = str(obj.get("winner", "tie")).strip().lower()
         return 1 if w == "a" else (-1 if w == "b" else 0)
 
 
@@ -281,13 +368,9 @@ class _CodexFaithJudge:
             'Output ONLY a JSON object: {"faithful": <bool>, "issues": [<short strings>]}'
         )
         raw = _run_codex(prompt, self.cfg)
-        m = _VERDICT_RE.search(raw)
-        if not m:
+        obj = _extract_json_object(raw)
+        if obj is None:
             return SingleVerdict(lens=lens, faithful=False, issues=["unparseable judge output"])
-        try:
-            obj = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return SingleVerdict(lens=lens, faithful=False, issues=["invalid JSON from judge"])
         return SingleVerdict(lens=lens, faithful=bool(obj.get("faithful", False)),
                              issues=list(obj.get("issues", []) or []))
 
@@ -312,15 +395,25 @@ class CodexFaithfulnessChecker:
 # agent/orchestrator/tournament.py.
 # --------------------------------------------------------------------------------------------------
 
-_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
-
-
 def _json_array(raw: str) -> list[str]:
-    m = _JSON_ARRAY_RE.search(raw)
-    if not m:
+    """The trailing JSON ARRAY from Codex output (fenced block preferred), as a list of strings.
+
+    Returns [] on genuine parse failure or when the trailing JSON value is not an array — keeping the
+    critic's fail-closed semantics while no longer being fooled by stray brackets in prose (e.g.
+    `[citations]`, Lean list syntax) that precede the real array."""
+    text = (raw or "").strip()
+    for m in _FENCED_JSON_RE.finditer(text):
+        try:
+            val = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(val, list):
+            return [str(x) for x in val]
+    span = _last_balanced(text, "[", "]")
+    if span is None:
         return []
     try:
-        arr = json.loads(m.group(0))
+        arr = json.loads(span)
     except json.JSONDecodeError:
         return []
     return [str(x) for x in arr] if isinstance(arr, list) else []
@@ -402,13 +495,10 @@ class CodexSolutionComparator:
             'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}. Do not read or modify any files.'
         )
         raw = _run_codex(prompt, self.cfg)
-        m = _VERDICT_RE.search(raw)
-        if not m:
+        obj = _extract_json_object(raw)
+        if obj is None:
             return 0
-        try:
-            w = str(json.loads(m.group(0)).get("winner", "tie")).strip().lower()
-        except json.JSONDecodeError:
-            return 0
+        w = str(obj.get("winner", "tie")).strip().lower()
         return 1 if w == "a" else (-1 if w == "b" else 0)
 
 

@@ -103,13 +103,15 @@ rejection, never a silent pass (invariant 1).
 
 **Boundary rulings — the contested edge of "elementary."** Most justifications are simply allowed or not,
 but a handful sit on the genuine boundary, where a binary flag is wrong. `allowed_toolkit.yaml` carries a
-separate **four-valued** `boundary_rulings:` vocabulary (read via `Toolkit.ruling()`): **`allowed`** (e.g.
+separate **four-valued** `boundary_rulings:` vocabulary (queryable via `Toolkit.ruling()`): **`allowed`** (e.g.
 Pell's fundamental solution — an elementary descent proof exists), **`allowed_with_citation`** (e.g.
 *Zsygmondy* — elementary but hard; cite it like LTE), **`allowed_per_problem_whitelist`** (e.g. *higher /
 cubic–quartic reciprocity* — admit only where a specific problem needs it), and **`disallowed`** (e.g. the
 *Gauss-sum / analytic* proof of quadratic reciprocity — even though a *different*, elementary proof of the
 same theorem is fine). This is the harness's explicit, auditable answer to "what counts as elementary at
-the edge," distinct from both the justification enum and the Layer-4 dependency denylist.
+the edge," distinct from both the justification enum and the Layer-4 dependency denylist. **Status:** the
+table is *declared but not yet wired into gate enforcement* — `Toolkit.ruling()` exists, but no gate layer
+consults it yet; it documents intent at the contested edge, with enforcement a tracked follow-up.
 
 **Layer 3, grounded safely.** The numeric re-checks must evaluate model-supplied expressions, which is
 dangerous (arbitrary `eval`, float drift, runaway search). So expressions are parsed with SymPy into an
@@ -506,7 +508,12 @@ English claim through four diverse **lenses**, each told to actively *find* a di
 
 The statement is accepted only if at most `max_unfaithful` lenses object (default **0** — unanimity).
 Using *diverse* lenses rather than N identical judges is deliberate: each catches a failure mode the
-others miss. This is the final wall, so `authoritative_elementary` also means **faithful**.
+others miss. This is the final wall, so `authoritative_elementary` also means **faithful** — and it
+**fails closed**: if no faithfulness panel ran, the result is *not* authoritative (the previous
+`faithful = (checker is None or …)` fail-open was an audited soundness bug). The CLI's `--terminal-gate`
+/ `--formalize` certification modes default the panel **on**; `--no-faithfulness` makes a run explicitly
+audited-only and therefore non-authoritative. (Authoritative additionally requires the informal gate to
+have **passed deterministically**, not merely `NEEDS_REVIEW`.)
 
 ---
 

@@ -68,12 +68,17 @@ def build_argv(p: dict) -> list[str]:
         argv.append("--direct")
 
     # The headline "formalized proof?" checkbox: run the full formalize -> Layer-4 audit pipeline.
+    # Faithfulness FAILS CLOSED and is ON by default for certification (prove.py defaults it on for
+    # --formalize/--terminal-gate); unchecking it sends an explicit --no-faithfulness opt-out so the
+    # run is audited-only and the output will NOT claim authoritative_elementary.
     if _flag(p, "certify"):
         argv.append("--formalize" if direct else "--terminal-gate")
         if _flag(p, "server", default=True):
             argv.append("--server")
         if _flag(p, "faithfulness", default=True):
             argv.append("--faithfulness")
+        else:
+            argv.append("--no-faithfulness")
         argv += ["--repair", str(_int(p, "repair", 3, 0, 8))]
 
     # Search / revision levers.

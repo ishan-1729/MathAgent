@@ -66,16 +66,22 @@ def auditJson (declName : Name) : CoreM String := do
   return obj.compress
 
 open Lean.Elab.Command in
-/-- `#audit foo` logs the dependency report for `foo` as an info message (tagged with a sentinel).
-    Using `logInfo` (not `IO.println`) keeps the output in Lean's message channel, so it is captured
-    both by `lean <file>` (stdout diagnostics) and by the persistent REPL server (response messages). -/
-elab "#audit " id:ident : command => do
+/-- `#audit foo` (or `#audit foo "nonce"`) logs the dependency report for `foo` as an info message,
+    tagged with a sentinel. The optional `nonce` (a fresh per-run secret the Python bridge injects)
+    is echoed verbatim after the sentinel, so the bridge can tell a trusted report apart from one an
+    untrusted proof body forged: an attacker cannot guess the nonce, and any extra bare-sentinel line
+    is rejected. Using `logInfo` (not `IO.println`) keeps the output in Lean's message channel, so it
+    is captured both by `lean <file>` (stdout diagnostics) and by the REPL server (response messages). -/
+elab "#audit " id:ident nonce:(str)? : command => do
   let declName := id.getId
   let s ← liftCoreM do
     let env ← getEnv
     if !env.contains declName then
       throwError s!"#audit: unknown declaration {declName}"
     auditJson declName
-  logInfo ("MATHAGENT_AUDIT_JSON " ++ s)
+  let tag := match nonce with
+    | some n => "MATHAGENT_AUDIT_JSON " ++ n.getString ++ " "
+    | none   => "MATHAGENT_AUDIT_JSON "
+  logInfo (tag ++ s)
 
 end MathAgent

@@ -88,16 +88,29 @@ class LeanAuditResult:
         return f"lean-audit: {self.verdict.value} (rejects={len(self.rejects())})"
 
 
-def _name_matches(name: str, pattern: str) -> bool:
-    """A dotted-prefix match for namespace patterns, or a component match for bare identifiers.
+def _match_span(name: str, pattern: str) -> Optional[tuple[int, int]]:
+    """The dotted-component range ``[start, end)`` `pattern` matches in `name`, or None.
 
-    'Mathlib.NumberTheory.ClassNumber' matches itself and any 'Mathlib.NumberTheory.ClassNumber.*'.
-    'EllipticCurve' (bare) matches any name with 'EllipticCurve' as a dotted component, e.g.
-    'Mathlib.AlgebraicGeometry.EllipticCurve.j'.
+    A dotted namespace pattern is prefix-anchored: 'Mathlib.NumberTheory.ClassNumber' matches itself
+    and any 'Mathlib.NumberTheory.ClassNumber.*' at span (0, 3). A bare identifier matches any single
+    dotted component: 'EllipticCurve' matches 'Mathlib.AlgebraicGeometry.EllipticCurve.j' at the
+    component where it appears (so a denylisted component is caught regardless of namespace).
     """
+    comps = name.split(".")
     if "." in pattern:
-        return name == pattern or name.startswith(pattern + ".")
-    return pattern in name.split(".")
+        if name == pattern or name.startswith(pattern + "."):
+            return (0, len(pattern.split(".")))
+        return None
+    try:
+        i = comps.index(pattern)
+    except ValueError:
+        return None
+    return (i, i + 1)
+
+
+def _name_matches(name: str, pattern: str) -> bool:
+    """Whether `pattern` matches `name` (dotted-prefix for namespaces, component for bare ids)."""
+    return _match_span(name, pattern) is not None
 
 
 def _matches_any(name: str, patterns: list[str]) -> Optional[str]:
@@ -107,10 +120,51 @@ def _matches_any(name: str, patterns: list[str]) -> Optional[str]:
     return None
 
 
-def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None) -> LeanAuditResult:
-    """Audit a dependency report. Deterministic; REJECT findings are authoritative."""
+def _best_deny_span(name: str, patterns: list[str]) -> Optional[tuple[str, tuple[int, int]]]:
+    """The most-specific (widest, earliest) denylist match: ``(pattern, span)`` or None."""
+    best: Optional[tuple[str, tuple[int, int]]] = None
+    for p in patterns:
+        span = _match_span(name, p)
+        if span is None:
+            continue
+        if best is None or (span[1] - span[0], -span[0]) > (best[1][1] - best[1][0], -best[1][0]):
+            best = (p, span)
+    return best
+
+
+def _dominating_allow(name: str, deny_span: tuple[int, int],
+                      patterns: list[str]) -> Optional[str]:
+    """An allowlist pattern whose prefix-anchored match DOMINATES `deny_span`, or None.
+
+    An exemption only counts if it is anchored at the name's start AND spans at least as far as the
+    denylist hit. This prevents an unrelated bare infra component (e.g. 'Decidable' deep inside
+    'Mathlib.NumberTheory.ClassNumber.Decidable.foo') from exempting denylisted CONTENT. Fails CLOSED.
+    """
+    for p in patterns:
+        span = _match_span(name, p)
+        if span is None:
+            continue
+        if span[0] == 0 and span[0] <= deny_span[0] and span[1] >= deny_span[1]:
+            return p
+    return None
+
+
+def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
+                 theorem_name: Optional[str] = None) -> LeanAuditResult:
+    """Audit a dependency report. Deterministic; REJECT findings are authoritative.
+
+    If `theorem_name` is given, the report's stamped `theorem` MUST equal it (the extractor stamps
+    the audited declaration); a mismatch is a hard REJECT. This closes the stale-report and
+    forged-report-for-a-different-theorem soundness hazards (the extractor stamps it but it was never
+    compared before).
+    """
     toolkit = toolkit or load_toolkit()
     findings: list[Finding] = []
+
+    # 0. Theorem cross-check: the report must be ABOUT the theorem we asked to audit.
+    if theorem_name is not None and report.theorem != theorem_name:
+        findings.append(Finding(LAYER_LEAN, Severity.REJECT, "theorem_mismatch",
+                                f"audit report is for {report.theorem!r}, expected {theorem_name!r}"))
 
     # 1. Axiom integrity (catches sorry/admit/injected axioms).
     whitelist = set(toolkit.lean_axiom_whitelist)
@@ -120,27 +174,31 @@ def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None) ->
             findings.append(Finding(LAYER_LEAN, Severity.REJECT, sev_code,
                                     f"proof uses non-whitelisted axiom {ax!r}"))
 
-    # 2. Content denylist over the transitive constant closure (allowlists win).
+    # 2. Content denylist over the transitive constant closure. An exemption only wins if a
+    #    prefix-anchored allowlist match DOMINATES the denylist span (a stray infra component
+    #    elsewhere in the name does not exempt denylisted content). Fails CLOSED.
     deny = toolkit.lean_denylist_decls
     allow = toolkit.lean_infrastructure_allowlist + toolkit.lean_elementary_by_fiat
     for c in report.constants:
-        hit = _matches_any(c.name, deny)
+        hit = _best_deny_span(c.name, deny)
         if hit is None:
             continue
-        exempt = _matches_any(c.name, allow)
+        hit_pat, deny_span = hit
+        exempt = _dominating_allow(c.name, deny_span, allow)
         if exempt is not None:
             findings.append(Finding(LAYER_LEAN, Severity.INFO, "denylist_exempted",
-                                    f"{c.name} matches denylist {hit!r} but is allowlisted ({exempt!r})"))
+                                    f"{c.name} matches denylist {hit_pat!r} but is allowlisted ({exempt!r})"))
             continue
         findings.append(Finding(LAYER_LEAN, Severity.REJECT, "denylisted_dependency",
-                                f"non-elementary dependency {c.name!r} ({c.kind}) matches denylist {hit!r}"))
+                                f"non-elementary dependency {c.name!r} ({c.kind}) matches denylist {hit_pat!r}"))
 
     verdict = LeanVerdict.REJECT if any(f.severity is Severity.REJECT for f in findings) else LeanVerdict.PASS
     return LeanAuditResult(verdict=verdict, findings=findings, report=report)
 
 
-def audit_json(text: str, toolkit: Optional[Toolkit] = None) -> LeanAuditResult:
-    return audit_report(DependencyReport.from_json(text), toolkit)
+def audit_json(text: str, toolkit: Optional[Toolkit] = None,
+               theorem_name: Optional[str] = None) -> LeanAuditResult:
+    return audit_report(DependencyReport.from_json(text), toolkit, theorem_name=theorem_name)
 
 
 def audit_file(path: str | Path, toolkit: Optional[Toolkit] = None) -> LeanAuditResult:

@@ -24,17 +24,20 @@ from typing import Optional
 
 from agent.gates.lean_bridge import (
     LeanBridgeError, LeanUnavailable, find_lake, find_mathlib_project,
-    _split_imports, _extractor_src, extract_report_json,
+    _split_imports, _extractor_src, extract_report_json, _reject_if_forbidden,
+    _audit_command, make_nonce,
 )
 
 
-def report_from_response(resp: dict) -> Optional[str]:
-    """Extract the audit report JSON from a REPL response's messages, or None if absent."""
-    for msg in resp.get("messages", []):
-        rep = extract_report_json(str(msg.get("data", "")))
-        if rep is not None:
-            return rep
-    return None
+def report_from_response(resp: dict, nonce: Optional[str] = None) -> Optional[str]:
+    """Extract the trusted audit report JSON from a REPL response, or None if absent/forged.
+
+    All message bodies are concatenated and scanned together so the sentinel-forgery guard
+    (>1 bare sentinel, or a missing/mismatched nonce) sees the whole response at once — a forged
+    line in a different message than the real one cannot slip through. Fails CLOSED.
+    """
+    combined = "\n".join(str(m.get("data", "")) for m in resp.get("messages", []))
+    return extract_report_json(combined, nonce)
 
 
 def response_errors(resp: dict) -> str:
@@ -78,10 +81,14 @@ class LeanServer:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
-        threading.Thread(target=self._pump_stdout, daemon=True).start()
-        threading.Thread(target=self._pump_stderr, daemon=True).start()
-        resp = self._command(self._init_cmd(), self.init_timeout_s)  # loads Mathlib (slow, once)
-        self.base_env = int(resp.get("env", 0))
+        try:
+            threading.Thread(target=self._pump_stdout, daemon=True).start()
+            threading.Thread(target=self._pump_stderr, daemon=True).start()
+            resp = self._command(self._init_cmd(), self.init_timeout_s)  # loads Mathlib (slow, once)
+            self.base_env = int(resp.get("env", 0))
+        except Exception:
+            self.close()  # a half-started server must not leak the REPL process
+            raise
         return self
 
     def _init_cmd(self) -> str:
@@ -104,9 +111,23 @@ class LeanServer:
             self._stderr.append(line)
 
     def _send(self, obj: dict) -> None:
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write(json.dumps(obj) + "\n\n")
-        self.proc.stdin.flush()
+        if self.proc is None or self.proc.stdin is None:
+            raise LeanBridgeError("lean-server is not running")
+        try:
+            self.proc.stdin.write(json.dumps(obj) + "\n\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            # Dead/closed REPL stdin (broken pipe, closed file, killed proc): tear down and surface.
+            self.close()
+            raise LeanBridgeError(f"lean-server write failed (dead REPL?): {e}") from e
+
+    def _drain_queue(self) -> None:
+        """Discard any buffered/late stdout so a timed-out command cannot desync the next read."""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
 
     def _read_response(self, timeout_s: float) -> dict:
         buf = ""
@@ -114,12 +135,17 @@ class LeanServer:
         while True:
             remaining = end - time.monotonic()
             if remaining <= 0:
+                # Drain late output so the NEXT command does not read this command's stale reply.
+                self._drain_queue()
                 raise LeanBridgeError(f"lean-server response timed out after {timeout_s}s")
             try:
                 line = self._q.get(timeout=remaining)
             except queue.Empty:
+                self._drain_queue()
                 raise LeanBridgeError(f"lean-server response timed out after {timeout_s}s")
             if line is None:
+                # EOF: the REPL exited. Tear down so the server is not reused in a dead state.
+                self.close()
                 raise LeanBridgeError("lean-server process exited: " + "".join(self._stderr[-20:]))
             buf += line
             s = buf.strip()
@@ -141,26 +167,54 @@ class LeanServer:
     def audit(self, proof_src: str, theorem_name: str, timeout_s: int = 300) -> str:
         if self.proc is None:
             self.start()
+        _reject_if_forbidden(proof_src)  # no output/reduction commands in an audited proof
         _imports, body = _split_imports(proof_src)  # Mathlib already in the base env; drop re-imports
-        cmd = body.strip() + f"\n#audit {theorem_name}"
+        nonce = make_nonce()  # binds the trusted report to THIS run; a forged sentinel cannot match
+        cmd = body.strip() + "\n" + _audit_command(theorem_name, nonce)
         resp = self._command(cmd, timeout_s, env=self.base_env)
         # A proof with ERROR diagnostics is broken even if Lean error-recovered a declaration (and
         # thus still emitted a report): treat it as a compile failure so the repair loop engages.
         if any(m.get("severity") == "error" for m in resp.get("messages", [])):
             raise LeanBridgeError(f"lean-server: compile error: {response_errors(resp)}")
-        rep = report_from_response(resp)
-        if rep is not None:
-            return rep
-        raise LeanBridgeError(f"lean-server: no audit JSON: {response_errors(resp)}")
+        rep = report_from_response(resp, nonce)
+        if rep is None:
+            raise LeanBridgeError(f"lean-server: no audit JSON: {response_errors(resp)}")
+        # Theorem cross-check: the report must be ABOUT the theorem we asked to audit (defends
+        # against a stale/forged report for a different declaration even if the nonce leaked).
+        try:
+            stamped = json.loads(rep).get("theorem")
+        except json.JSONDecodeError as e:
+            raise LeanBridgeError(f"lean-server: malformed audit JSON: {e}") from e
+        if stamped != theorem_name:
+            raise LeanBridgeError(
+                f"lean-server: audit report is for {stamped!r}, expected {theorem_name!r}")
+        return rep
 
     def close(self) -> None:
-        if self.proc is not None:
-            for closer in (lambda: self.proc.stdin.close(), self.proc.terminate):
-                try:
-                    closer()
-                except Exception:
-                    pass
-            self.proc = None
+        proc, self.proc = self.proc, None
+        self.base_env = None
+        if proc is None:
+            return
+        # Close stdin first (signals EOF), then terminate, wait, and kill if it will not exit.
+        for closer in (lambda: proc.stdin.close(), proc.terminate):
+            try:
+                closer()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # Release the stdout/stderr pipes so the pump threads see EOF and no fds leak.
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> "LeanServer":
         return self.start()

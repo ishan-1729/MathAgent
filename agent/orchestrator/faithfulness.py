@@ -53,9 +53,21 @@ SingleJudge = Callable[[str, str, str, str], SingleVerdict]
 def adversarial_check(informal_claim: str, lean_source: str, theorem_name: str,
                       judge: SingleJudge, lenses: Optional[list[str]] = None,
                       max_unfaithful: int = 0) -> FaithfulnessVerdict:
-    """Run `judge` over each lens; faithful iff at most `max_unfaithful` lenses object."""
+    """Run `judge` over each lens; faithful iff at most `max_unfaithful` lenses object.
+
+    A live judge (e.g. a Codex-backed one) can raise on network/timeout/malformed output. Such a
+    crash must NOT abort the whole DAG run after a proof was found: a lens that fails to produce a
+    verdict conservatively counts as UNFAITHFUL (default-closed), so the statement is not silently
+    accepted on the strength of a missing vote.
+    """
     lenses = lenses or DEFAULT_LENSES
-    votes = [judge(informal_claim, lean_source, theorem_name, lens) for lens in lenses]
+    votes: list[SingleVerdict] = []
+    for lens in lenses:
+        try:
+            votes.append(judge(informal_claim, lean_source, theorem_name, lens))
+        except Exception as e:  # default-closed: a crashing lens counts as unfaithful
+            votes.append(SingleVerdict(lens=lens, faithful=False,
+                                       issues=[f"judge error: {type(e).__name__}: {e}"]))
     issues = [f"[{v.lens}] {i}" for v in votes if not v.faithful for i in (v.issues or ["unfaithful"])]
     faithful = sum(1 for v in votes if not v.faithful) <= max_unfaithful
     return FaithfulnessVerdict(faithful=faithful, votes=votes, issues=issues)

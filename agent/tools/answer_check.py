@@ -10,13 +10,24 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from sympy import simplify
+from sympy import Max, Min, simplify
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations, implicit_multiplication_application, convert_xor,
 )
 
 # Implicit multiplication ("2sqrt(2)", "2x") + caret-as-power, so LaTeX-ish answers parse.
 _TRANSFORMS = standard_transformations + (implicit_multiplication_application, convert_xor)
+
+# parse_expr() uses eval(), and by DEFAULT seeds its global namespace with `from sympy import *`
+# PLUS every Python builtin function (print, exec, open, __import__, ...). Answer strings are
+# UNTRUSTED model/benchmark output, so "print('x')" or "__import__('os').system(...)" would execute
+# during parsing. We instead pass a locked-down global namespace: the SymPy symbols only, with
+# `__builtins__` emptied so unknown names like `print` resolve to nothing (parse fails -> None)
+# rather than to a dangerous callable. No side effect occurs.
+_SAFE_GLOBALS: dict = {}
+exec("from sympy import *", _SAFE_GLOBALS)        # noqa: S102 - fixed trusted literal, not user input
+_SAFE_GLOBALS["max"], _SAFE_GLOBALS["min"] = Max, Min   # parse_expr's default max/min aliases
+_SAFE_GLOBALS["__builtins__"] = {}                # block print/exec/open/eval/__import__/etc.
 
 # LaTeX noise that carries no math meaning.
 _LATEX_NOISE = [r"\left", r"\right", r"\displaystyle", r"\,", r"\!", r"\;", r"\:",
@@ -25,6 +36,13 @@ _FRAC = re.compile(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
 _SQRT_N = re.compile(r"\\sqrt\s*\[([^\]]*)\]\s*\{([^{}]*)\}")
 _SQRT = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
 _LEAD = re.compile(r"^\s*(?:the\s+)?(?:final\s+)?answer\s*(?:is|:)?\s*", re.IGNORECASE)
+# A comma used as a thousands GROUPING separator: 1-3 digits, then one or more groups of exactly 3
+# digits (so "1,000" / "12,345,678" collapse, but "3,5" and a set like "1, 2, 3" are untouched).
+_THOUSANDS = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(?!\d)")
+
+
+def _strip_thousands(s: str) -> str:
+    return _THOUSANDS.sub(lambda m: m.group(1).replace(",", ""), s)
 
 
 def _clean(s: str) -> str:
@@ -47,14 +65,23 @@ def _latexish_to_sympy(s: str) -> str:
         s = _SQRT.sub(r"sqrt((\1))", s)
     s = s.replace(r"\cdot", "*").replace(r"\times", "*").replace(r"\div", "/")
     s = s.replace(r"\pi", "pi").replace(r"\infty", "oo").replace(r"\ ", " ")
-    s = re.sub(r"\\[a-zA-Z]+", "", s)      # drop any remaining LaTeX command words
+    # Any LaTeX command still present carries math meaning we did NOT translate (e.g. \pm, \mp,
+    # \sqrt with no braces). Silently deleting it mis-grades the answer: \pm 1 would become "1" and
+    # compare equal to 1, even though \pm 1 means {1, -1}. Refuse to parse instead (caught by
+    # _to_expr -> None), so the grader declines rather than fabricating an equivalence.
+    if re.search(r"\\[a-zA-Z]+", s):
+        raise ValueError(f"unsupported LaTeX command in answer: {s!r}")
     s = s.replace("{", "(").replace("}", ")")
     return s
 
 
 def _to_expr(s: str):
     try:
-        return parse_expr(_latexish_to_sympy(_clean(s)), transformations=_TRANSFORMS, evaluate=True)
+        cleaned = _strip_thousands(_clean(s))
+        # global_dict is the locked-down SymPy namespace (no Python builtins) so eval() in
+        # parse_expr cannot execute untrusted callables. Pass a copy: parse_expr may inject names.
+        return parse_expr(_latexish_to_sympy(cleaned), transformations=_TRANSFORMS,
+                          global_dict=dict(_SAFE_GLOBALS), evaluate=True)
     except Exception:
         return None
 
@@ -89,13 +116,17 @@ def _split_top(inner: str) -> list[str]:
 
 
 def _split_collection(s: str) -> Optional[tuple[str, list[str]]]:
+    """Classify `s` as a collection ONLY when its delimiters are EXPLICIT: `{...}` is a set and
+    `(...)`/`[...]` a tuple. A bare comma is NOT enough — `3,5` is the number 3.5 in many locales and
+    `1,000` is a thousands-grouped integer, so treating any comma'd string as a set silently
+    mis-grades them. Numeric/expression parsing (which strips thousands separators) runs first in
+    `answers_equivalent`, so by the time we get here a bare-comma string is genuinely ambiguous and
+    we decline to call it a collection."""
     s = _clean(s)
     if len(s) >= 2 and s[0] == "{" and s[-1] == "}":
         return ("set", _split_top(s[1:-1]))
-    if len(s) >= 2 and s[0] == "(" and s[-1] == ")" and "," in s:
+    if len(s) >= 2 and ((s[0] == "(" and s[-1] == ")") or (s[0] == "[" and s[-1] == "]")) and "," in s:
         return ("tuple", _split_top(s[1:-1]))
-    if "," in s and "=" not in s:
-        return ("set", _split_top(s))
     return None
 
 

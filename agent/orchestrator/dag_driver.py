@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, runtime_checkable
 
-from agent.gates.gate import evaluate
+from agent.gates.gate import Verdict, evaluate
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.toolkit import Toolkit, load_toolkit
 from agent.orchestrator.dag import ProofDAG, goal_hash, CycleError
@@ -80,6 +80,41 @@ def _lemma_claims(sketch: str) -> Optional[set[str]]:
     except LedgerError:
         return None
     return {goal_hash(s.claim) for s in led.steps if s.justification == "lemma"}
+
+
+def _proves_goal(ledger: str, goal: str) -> bool:
+    """Does `ledger` actually conclude `goal`? Soundness binding (goal<->claim).
+
+    BOTH the ledger's stated `claim` AND its terminal `conclusion` step must deep-hash-equal the
+    requested goal. Checking the top-level claim alone is insufficient: a ledger may set `claim`
+    to the goal while its conclusion step proves a DIFFERENT statement (e.g. claim "G" but a
+    conclusion claiming "H"), and the deterministic gate admits such a ledger because it cannot
+    distinguish a genuinely-wrong conclusion from a placeholder restatement without knowing the
+    requested goal. The terminal conclusion is the operative statement actually proved, so it is
+    the authoritative binding to the goal. Returns False if it won't parse, has no single
+    conclusion, or either the claim or the conclusion proves something else."""
+    try:
+        led = parse_ledger(ledger)
+    except LedgerError:
+        return False
+    if goal_hash(led.claim) != goal_hash(goal):
+        return False
+    conclusions = [s for s in led.steps if s.justification == "conclusion"]
+    if len(conclusions) != 1:
+        return False
+    return goal_hash(conclusions[0].claim) == goal_hash(goal)
+
+
+def _conclusion_claim(sketch: str) -> Optional[str]:
+    """The claim of the sketch's terminal `conclusion` step, or None if it won't parse / has none."""
+    try:
+        led = parse_ledger(sketch)
+    except LedgerError:
+        return None
+    for s in led.steps:
+        if s.justification == "conclusion":
+            return s.claim
+    return None
 
 
 class DagDriver:
@@ -150,7 +185,10 @@ class DagDriver:
         node = self.dag.get_or_create(goal)
         key = node.key
 
-        # Memoization: a proven goal is reused; a known-failed goal is not re-attempted.
+        # Memoization: a proven goal is reused; a *genuinely* failed goal is not re-attempted. Only
+        # the terminal failure states short-circuit here. EXHAUSTED is deliberately NOT memoized as a
+        # cached failure: a node that only failed because it hit the depth limit (or ran out of budget)
+        # on one branch may still be provable on a shallower branch, so it must stay re-attemptable.
         if node.proven:
             self.trace.emit("cache_hit", goal=goal[:80])
             return True
@@ -159,7 +197,11 @@ class DagDriver:
         if key in ancestors:               # cycle (defensive; commit guards this too)
             return False
         if depth > self.max_depth:
-            self.dag.mark_failed(goal)
+            # A depth-limit failure is limit-induced, not a real gap: record it as the non-terminal
+            # EXHAUSTED state (and leave the node re-attemptable) so the memo check above does NOT
+            # permanently block this same goal on a shallower branch (depth-limit cache poisoning).
+            if not node.proven:
+                node.state = NodeState.EXHAUSTED
             self.trace.emit("depth_limit", goal=goal[:80], depth=depth)
             return False
         if not self.budget.can_call():
@@ -174,6 +216,12 @@ class DagDriver:
         res = ralph.run(goal)
         node.attempts += res.episodes
         if res.success:
+            # Soundness: a directly-produced ledger must actually conclude THIS node's goal. A ledger
+            # that proves a different statement (claim deep-hash != goal) is not a proof of this node.
+            if not _proves_goal(res.ledger, goal):
+                self.trace.emit("goal_claim_mismatch", goal=goal[:80], proof_kind="direct")
+                self.dag.mark_failed(goal)
+                return False
             ledger = self._refine(goal, res.ledger)   # Autoreason tournament (no-regression refine)
             self.dag.mark_proven_direct(goal, ledger)
             self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
@@ -272,6 +320,24 @@ class DagDriver:
         sketch_report = evaluate(sketch, self.toolkit)
         if sketch_report.rejected:
             return False, [str(f) for f in sketch_report.rejects()]
+        # Fail closed: a NEEDS_REVIEW sketch (e.g. an elastic justification routed to Layer 2) with no
+        # reviewer to resolve it must NOT be admitted as a valid decomposition — mirror the direct
+        # node's review-unhandled guard.
+        if sketch_report.verdict is Verdict.NEEDS_REVIEW and self.reviewer is None:
+            return False, ["decomposition sketch needs Layer-2 review but no reviewer is configured"]
+
+        # Soundness: the sketch must conclude THIS goal. If its conclusion proves a different
+        # statement than the parent goal, the decomposition is not a valid plan for this node.
+        concl = _conclusion_claim(sketch)
+        if concl is None or goal_hash(concl) != goal_hash(goal):
+            return False, ["sketch conclusion does not prove the parent goal"]
+
+        # Snapshot the node so the commit can be rolled back if a child fails to prove. Committing
+        # before recursion lets the acyclicity guard see the in-flight edges, but a child failure must
+        # NOT leave stale 'decomposition' metadata behind (assemble()/proof_bundle would render it).
+        node = self.dag.get_or_create(goal)
+        prev_proof, prev_kind = node.proof, node.proof_kind
+        prev_children, prev_state = list(node.children), node.state
 
         try:
             self.dag.commit_decomposition(goal, sketch, children, child_ancestors)
@@ -282,6 +348,9 @@ class DagDriver:
         for child_goal in children:
             if not self._prove(child_goal, child_ancestors, depth + 1):
                 self.trace.emit("backtrack", goal=goal[:80])
+                # Roll back the (uncompleted) commit so no stale decomposition lingers on the node.
+                node.proof, node.proof_kind = prev_proof, prev_kind
+                node.children, node.state = prev_children, prev_state
                 return False, []
         self.dag.mark_proven_via_children(goal)
         self.trace.emit("prove_node", goal=goal[:80], proof_kind="decomposition")

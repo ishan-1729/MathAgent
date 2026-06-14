@@ -16,6 +16,7 @@ from agent.gates.gate import GateReport, Verdict, evaluate
 from agent.gates.ledger import Ledger
 from agent.gates.report import Severity
 from agent.gates.toolkit import Toolkit, load_toolkit
+from agent.orchestrator.dag import goal_hash
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.trace import RunTrace
 
@@ -127,6 +128,26 @@ class FlatDriver:
                     break
                 self.budget.spend_repair()
                 feedback = [str(f) for f in report.rejects()]
+                continue
+
+            # Goal<->claim binding (soundness): the gate admits a structurally valid ledger, but it
+            # must actually address the REQUESTED problem. A ledger written for a DIFFERENT problem
+            # (its `problem` deep-hash-differs from the requested one) is not a proof of this problem;
+            # route it through the repair loop just like a gate reject, and fail as a gap if no repair
+            # budget remains.
+            if report.ledger is not None and goal_hash(report.ledger.problem) != goal_hash(problem):
+                self.trace.emit("goal_claim_mismatch", attempt=attempts)
+                if not self.budget.can_repair():
+                    state = NodeState.FAILED_GAP
+                    break
+                if not self.budget.can_call():
+                    state = NodeState.EXHAUSTED
+                    self.trace.emit("budget", reason="llm_calls", **self.budget.snapshot())
+                    break
+                self.budget.spend_repair()
+                feedback = ["the proof addresses a different problem than requested: "
+                            f"asked to prove {problem!r}, but the ledger's problem is "
+                            f"{report.ledger.problem!r}"]
                 continue
 
             # Admitted by the deterministic gate. A soft NEEDS_REVIEW with no judge to resolve it

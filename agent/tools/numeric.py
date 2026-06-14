@@ -8,13 +8,18 @@ gate re-run the finite case-checks a ledger claims rather than trusting prose:
   - verify_solution_set      : confirm a claimed *complete* solution set (no missing, no spurious)
   - verify_residue_cover     : confirm a case split's residues cover a complete residue system
 
-Expressions are parsed with sympy and restricted to **integer** polynomial arithmetic (+ - * and
-non-negative integer powers, integer coefficients only) so evaluation is exact and safe (no arbitrary
-code, no transcendental functions, no float/rational leaks). Boxes are capped both in point-count and
-in integer magnitude to keep a "cheap" check cheap.
+Expressions are parsed by a restricted AST walk (Python's `ast`, never eval/exec/sympify) and limited
+to **integer** polynomial arithmetic (+ - * and non-negative integer powers, integer coefficients
+only) so evaluation is exact and safe (no arbitrary code, no transcendental functions, no
+float/rational leaks). Untrusted, model-controlled strings reach this parser, so it must never
+execute code embedded in the input: only +,-,*,** over integer literals and declared symbols are
+translated into sympy objects; calls, attribute access, and every other construct are rejected at the
+AST level before any value is built. Boxes are capped both in point-count and in integer magnitude to
+keep a "cheap" check cheap.
 """
 from __future__ import annotations
 
+import ast
 import itertools
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -59,6 +64,80 @@ class CoverCheck:
 _ALLOWED_NODES = (sympy.Add, sympy.Mul, sympy.Pow, sympy.Symbol)
 
 
+def _build_from_ast(node: ast.AST, syms: dict[str, sympy.Symbol]) -> sympy.Expr:
+    """Recursively translate a *validated* Python AST node into a sympy Expr.
+
+    SECURITY: this is the only place an untrusted expression is turned into a value. It does NOT use
+    eval/exec/sympify/parse_expr — every node type is matched explicitly and anything outside the
+    integer-polynomial grammar (calls, attribute access, subscripts, names that aren't declared
+    variables, non-integer literals, ...) raises NumericError *before* any sympy object capable of
+    leaking module globals is constructed. Crucially, validation and construction happen during this
+    structural walk, so no arbitrary Python is ever executed: a literal like 'os.system("...")'
+    surfaces as an ast.Call/ast.Attribute node and is rejected, never invoked.
+    """
+    if isinstance(node, ast.Expression):
+        return _build_from_ast(node.body, syms)
+
+    # Integer literal. (ast.Constant covers Python 3.8+; reject bools and non-int constants.)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, int):
+            raise NumericError(f"non-integer numeric leaf not allowed: {node.value!r}")
+        return sympy.Integer(node.value)
+
+    # Declared variable. Any other bare name is an undeclared symbol (or an attempt to reach a
+    # builtin/constructor by name) and is refused before it can be turned into a value.
+    if isinstance(node, ast.Name):
+        if node.id not in syms:
+            raise NumericError(f"expression uses undeclared symbol: {node.id!r}")
+        return syms[node.id]
+
+    # Unary +/- (e.g. "-x", "+3"); unary anything-else (e.g. ~, not) is rejected.
+    if isinstance(node, ast.UnaryOp):
+        operand = _build_from_ast(node.operand, syms)
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        raise NumericError(f"disallowed unary operator: {type(node.op).__name__}")
+
+    # Binary +, -, *, ** only. Division, modulo, bit-ops, matmul, etc. are rejected.
+    if isinstance(node, ast.BinOp):
+        left = _build_from_ast(node.left, syms)
+        right = _build_from_ast(node.right, syms)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+        raise NumericError(f"disallowed binary operator: {type(node.op).__name__}")
+
+    raise NumericError(f"disallowed syntax in expression: {type(node).__name__}")
+
+
+def _safe_parse(text: str, syms: dict[str, sympy.Symbol]) -> sympy.Expr:
+    """Parse a single sub-expression with NO eval/__builtins__/sympify reachable.
+
+    We compile the text to a Python AST in 'eval' mode (which only *parses* — it never executes),
+    then translate the tree node-by-node through `_build_from_ast`. Because translation rejects every
+    construct outside the +,-,*,** / integer / declared-symbol grammar before building it, arbitrary
+    code embedded as literal call/attribute syntax (e.g. 'Integer(Symbol.__new__.__globals__...)')
+    is refused at the AST level and never evaluated.
+    """
+    # ast.parse('eval') rejects leading/trailing whitespace (and the '=' split path hands us sides
+    # like ' y**3'); strip it so well-formed expressions with surrounding spaces still parse.
+    stripped = text.strip()
+    if not stripped:
+        raise NumericError("could not parse expression: empty sub-expression")
+    try:
+        tree = ast.parse(stripped, mode="eval")
+    except SyntaxError as e:
+        raise NumericError(f"could not parse expression {text!r}: {e}") from e
+    return _build_from_ast(tree, syms)
+
+
 def _parse(expression: str, variables: list[str]) -> tuple[sympy.Expr, list[sympy.Symbol]]:
     if not variables:
         raise NumericError("at least one variable is required")
@@ -66,10 +145,13 @@ def _parse(expression: str, variables: list[str]) -> tuple[sympy.Expr, list[symp
     try:
         if "=" in expression:
             lhs, rhs = expression.split("=", 1)
-            expr = sympy.sympify(lhs, locals=syms) - sympy.sympify(rhs, locals=syms)
+            expr = _safe_parse(lhs, syms) - _safe_parse(rhs, syms)
         else:
-            expr = sympy.sympify(expression, locals=syms)
-    except (sympy.SympifyError, SyntaxError, TypeError, AttributeError) as e:
+            expr = _safe_parse(expression, syms)
+    except Exception as e:  # noqa: BLE001 - _safe_parse already raises NumericError, but sympy
+        # arithmetic on the built nodes (e.g. the lhs-rhs subtraction) could surface other errors;
+        # the documented contract is that an unparseable/unsafe expression becomes a NumericError,
+        # never an uncaught exception.
         raise NumericError(f"could not parse expression {expression!r}: {e}") from e
 
     declared = set(syms.values())
