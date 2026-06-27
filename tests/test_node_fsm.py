@@ -17,7 +17,8 @@ from agent.orchestrator.state import NodeState
 
 ALL_STATES = list(NodeState)
 ALL_EVENTS = list(NodeEvent)
-TERMINAL = (NodeState.PROVEN, NodeState.FAILED_ELEMENTARY, NodeState.FAILED_GAP, NodeState.EXHAUSTED)
+TERMINAL = (NodeState.PROVEN, NodeState.LEAN_VERIFIED, NodeState.FAILED_ELEMENTARY,
+            NodeState.FAILED_GAP, NodeState.EXHAUSTED)
 
 
 # ---- ENUM-CARTESIAN TOTALITY: every (state x event) pair is handled, never raises, fully determined.
@@ -68,6 +69,51 @@ def test_terminal_absorbs_an_arbitrary_event_stream():
             state, action = node_transition(state, event)
             assert state is term
             assert action is Action.NONE
+
+
+# ---- P5 INVARIANT: LEAN_VERIFIED is a first-class TERMINAL-ABSORBING success state that DOMINATES
+#       soft PROVEN. The enum-cartesian proptests above ALREADY enumerate it (it is in NodeState, hence
+#       in ALL_STATES and in TERMINAL); these pin its specific properties.
+
+def test_lean_verified_is_enumerated_by_the_cartesian_proptest():
+    # The totality/determinism proptests range over ALL_STATES x ALL_EVENTS; prove LEAN_VERIFIED is a
+    # real enum member they cover (not an orphaned constant the proptest skips).
+    assert NodeState.LEAN_VERIFIED in ALL_STATES
+    assert NodeState.LEAN_VERIFIED in TERMINAL
+    # Every event on LEAN_VERIFIED is a determinate, non-raising transition (a slice of the cartesian).
+    for event in ALL_EVENTS:
+        next_state, action = node_transition(NodeState.LEAN_VERIFIED, event)
+        assert isinstance(next_state, NodeState) and isinstance(action, Action)
+
+
+@pytest.mark.parametrize("event", ALL_EVENTS)
+def test_lean_verified_is_terminal_absorbing(event):
+    # LEAN_VERIFIED absorbs EVERY event -> (LEAN_VERIFIED, NONE): no event resurrects, reopens, or
+    # DOWNGRADES a Lean-confirmed node (a late child result / memo re-entry cannot move it).
+    next_state, action = node_transition(NodeState.LEAN_VERIFIED, event)
+    assert next_state is NodeState.LEAN_VERIFIED, f"LEAN_VERIFIED moved to {next_state} on {event}"
+    assert action is Action.NONE
+
+
+def test_lean_verified_is_terminal_and_success():
+    # First-class state semantics: terminal (absorbing) AND a success (is_success), dominating PROVEN.
+    assert NodeState.LEAN_VERIFIED.is_terminal
+    assert NodeState.LEAN_VERIFIED.is_success
+    # PROVEN remains a success too; both are the TERMINAL_SUCCESS set.
+    assert NodeState.PROVEN.is_success
+    assert {s for s in NodeState if s.is_success} == {NodeState.PROVEN, NodeState.LEAN_VERIFIED}
+    # The failure/limit terminals are NOT success.
+    for s in (NodeState.FAILED_GAP, NodeState.FAILED_ELEMENTARY, NodeState.EXHAUSTED):
+        assert not s.is_success
+
+
+def test_lean_verified_absorbs_an_arbitrary_event_stream():
+    # Like the other terminals: feeding any sequence of events never moves LEAN_VERIFIED off itself.
+    state = NodeState.LEAN_VERIFIED
+    for event in ALL_EVENTS + list(reversed(ALL_EVENTS)):
+        state, action = node_transition(state, event)
+        assert state is NodeState.LEAN_VERIFIED
+        assert action is Action.NONE
 
 
 # ---- INVARIANT (the bug-fix): NEEDS_REVIEW-no-judge ALWAYS decomposes before EXHAUSTED.

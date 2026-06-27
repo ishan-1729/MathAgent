@@ -225,7 +225,12 @@ class OrNode:
 
     @property
     def proven(self) -> bool:
-        return self.state is NodeState.PROVEN
+        # SOUNDNESS: "proven" is TERMINAL-SUCCESS, which now spans BOTH soft PROVEN and hard
+        # LEAN_VERIFIED. Routing through is_success (not a bare ==PROVEN) is what makes a LEAN_VERIFIED
+        # node behave exactly like a PROVEN one EVERYWHERE this property is read — the cache-hit
+        # short-circuit, is_proven, assemble/proof_bundle/stats, and the AND-composition's
+        # all(child.proven) check. A LEAN_VERIFIED node must never be treated as un-proven.
+        return self.state.is_success
 
 
 class CycleError(Exception):
@@ -338,9 +343,15 @@ class ProofDAG:
         return False
 
     # --- commits ---
-    def mark_proven_direct(self, goal: str, ledger: str) -> OrNode:
+    def mark_proven_direct(self, goal: str, ledger: str, *, lean_verified: bool = False) -> OrNode:
+        """Commit a LEAF as proven by a direct ledger. `lean_verified` promotes the node to the
+        first-class HARD-success state LEAN_VERIFIED (a per-node Lean verifier compiled + audited this
+        leaf as elementary); the default False keeps the soft-success state PROVEN (the byte-identical
+        offline path — no verifier ever sets this True). The node.lean_verified annotation is set in
+        lockstep with the state so the two can never disagree."""
         node = self.get_or_create(goal)
-        node.state = NodeState.PROVEN
+        node.state = NodeState.LEAN_VERIFIED if lean_verified else NodeState.PROVEN
+        node.lean_verified = bool(lean_verified)
         node.proof = ledger
         node.proof_kind = "direct"
         node.children = []
@@ -362,20 +373,26 @@ class ProofDAG:
 
     def mark_proven_via_children(self, goal: str) -> OrNode:
         node = self.get_or_create(goal)
+        # all-children-success: `.proven` is is_success, so a LEAN_VERIFIED child counts exactly like a
+        # PROVEN one (a soft-PROVEN and a hard-LEAN_VERIFIED child are both "proven" for composition).
         if not all(self.nodes[ck].proven for ck in node.children):
             raise ValueError("cannot mark proven: not all children are proven")
-        node.state = NodeState.PROVEN
         node.proof_context = self.context   # certificate is valid only under the current context
         node.reason = None
         # P4 LEAP parent-composition rule: a parent is lean_verified ONLY when its COMPOSITION sketch
         # compiled in Lean (sketch_lean_verified, stamped by the driver before this call) AND EVERY
-        # child is itself lean_verified (every hypothesis discharged). This is the LEAP invariant: a
+        # child is itself LEAN_VERIFIED (every hypothesis discharged by a Lean-confirmed child — a
+        # single soft-PROVEN child leaves the parent soft PROVEN). This is the LEAP invariant: a
         # parent's per-node Lean authority requires both the composition AND all the discharged
         # children. When no sketch verifier ran (sketch_lean_verified stays False — the byte-identical
         # default path) this leaves lean_verified False (soft PROVEN), unchanged behavior.
-        node.lean_verified = bool(
+        lean = bool(
             node.sketch_lean_verified
-            and all(self.nodes[ck].lean_verified for ck in node.children))
+            and all(self.nodes[ck].state is NodeState.LEAN_VERIFIED for ck in node.children))
+        node.lean_verified = lean
+        # First-class state: a fully Lean-verified composition is LEAN_VERIFIED (dominates PROVEN); a
+        # soft composition (no/failed sketch verifier, or any non-LEAN_VERIFIED child) stays PROVEN.
+        node.state = NodeState.LEAN_VERIFIED if lean else NodeState.PROVEN
         return node
 
     def mark_failed(self, goal: str, *, elementary: bool = False,

@@ -1239,7 +1239,10 @@ def test_node_verifier_pass_marks_proven_and_lean_verified():
     res = _node_driver(v).run("G")
     assert res.proven
     g = res.dag.get(goal_hash("G"))
-    assert g.state is NodeState.PROVEN and g.proof_kind == "direct"
+    # P5: a Lean-confirmed leaf is the first-class HARD-success state LEAN_VERIFIED (dominates PROVEN).
+    assert g.state is NodeState.LEAN_VERIFIED and g.proof_kind == "direct"
+    assert g.state.is_success                             # LEAN_VERIFIED is a success state
+    assert g.proven                                       # and reads as proven everywhere
     assert g.lean_verified is True                        # Lean confirmed the leaf elementary
     assert v.calls and v.calls[0][0] == "G"               # the verifier was actually consulted
     ev = res.trace.by_kind("node_lean")
@@ -1494,8 +1497,13 @@ def test_compiling_sketch_commits_and_all_children_verified_sets_parent_lean_ver
     assert g.proof_kind == "decomposition"
     assert g.sketch_lean_verified is True                 # the composition compiled in Lean
     # every child discharged (leaf-verified) AND the composition compiled -> parent lean_verified.
+    # P5: each Lean-discharged child is the first-class LEAN_VERIFIED state, and the parent — sketch
+    # compiled AND every child LEAN_VERIFIED — is itself promoted to LEAN_VERIFIED (dominates PROVEN).
+    assert res.dag.get(goal_hash("A")).state is NodeState.LEAN_VERIFIED
+    assert res.dag.get(goal_hash("B")).state is NodeState.LEAN_VERIFIED
     assert res.dag.get(goal_hash("A")).lean_verified is True
     assert res.dag.get(goal_hash("B")).lean_verified is True
+    assert g.state is NodeState.LEAN_VERIFIED
     assert g.lean_verified is True
     ev = res.trace.by_kind("sketch_lean")
     assert ev and ev[0].data["outcome"] == "elementary_verified"
@@ -1521,6 +1529,10 @@ def test_compiling_sketch_but_child_not_verified_leaves_parent_lean_verified_fal
     assert res.dag.get(goal_hash("A")).lean_verified is False   # children not Lean-discharged
     assert res.dag.get(goal_hash("B")).lean_verified is False
     assert g.lean_verified is False                       # composition incomplete -> parent NOT verified
+    # P5: a single non-LEAN_VERIFIED (here soft-PROVEN) child leaves the parent in soft PROVEN, NOT
+    # the dominating LEAN_VERIFIED state, even though the composition sketch itself compiled.
+    assert g.state is NodeState.PROVEN
+    assert res.dag.get(goal_hash("A")).state is NodeState.PROVEN
 
 
 def test_rejected_sketch_then_compiling_retry_commits():
@@ -1549,3 +1561,309 @@ def test_rejected_sketch_then_compiling_retry_commits():
     g = res.dag.get(goal_hash("G"))
     assert g.proof_kind == "decomposition" and g.sketch_lean_verified is True
     assert sv.calls == 2                                  # rejected once, then committed
+
+
+# ==================================================================================================
+# THREAD 2 — ROBUSTNESS: a RAISING decomposer / reviewer must NOT crash DagDriver.run().
+#
+# A live decomposer/reviewer (Codex / Claude CLI) can raise on a subprocess timeout (ClaudeError /
+# CodexError), a non-zero exit, or malformed output. Such a raise is treated as "this decomposition
+# attempt failed" -> next attempt / backtrack, classified ReasonCode.unknown_tool_error, surfaced on
+# the trace. These tests exercise the REAL _decompose / _try_decomposition path and FAIL against the
+# pre-change code (which let the exception propagate out of run()).
+# ==================================================================================================
+
+class RaisingDecomposer:
+    """decompose() always raises (stand-in for a Codex/Claude timeout). Counts its calls."""
+    def __init__(self, exc: Exception | None = None):
+        self._exc = exc or RuntimeError("codex exec timed out after 1200s")
+        self.calls = 0
+
+    def decompose(self, goal: str, feedback=None):
+        self.calls += 1
+        raise self._exc
+
+
+class RaiseThenDecompose:
+    """Raises on the first decompose() call, then returns a valid plan (proves recovery / next-attempt)."""
+    def __init__(self, plan, exc: Exception | None = None):
+        self._plan = plan
+        self._exc = exc or RuntimeError("transient timeout")
+        self.calls = 0
+
+    def decompose(self, goal: str, feedback=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._exc
+        return self._plan
+
+
+class RaisingReviewer:
+    """review() always raises (stand-in for a reviewer subprocess timeout). Counts its calls."""
+    def __init__(self, exc: Exception | None = None):
+        self._exc = exc or RuntimeError("reviewer exec timed out")
+        self.calls = 0
+
+    def review(self, goal: str, sketch: str, child_goals):
+        self.calls += 1
+        raise self._exc
+
+
+def test_raising_decomposer_does_not_crash_run():
+    """The core defect: a decomposer that RAISES (after a failed direct attempt) must NOT propagate out
+    of run(); the node is classified unknown_tool_error and the run returns not-proven."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({})                               # direct attempt fails -> route to decompose
+    decomp = RaisingDecomposer()
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  max_decomp_attempts=2).run("G")
+    assert res.proven is False                            # NOT a crash
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.FAILED_GAP
+    assert g.reason == ReasonCode.unknown_tool_error.value
+    # The exception was surfaced on the trace (one per attempt), not silently swallowed.
+    errs = res.trace.by_kind("decomposer_error")
+    assert len(errs) == 2 and errs[0].data["reason"] == ReasonCode.unknown_tool_error.value
+    assert decomp.calls == 2                              # bounded by max_decomp_attempts (no infinite loop)
+
+
+def test_raising_decomposer_recovers_on_next_attempt():
+    """A first decompose() that raises followed by a valid plan still proves via children — a transient
+    decomposer crash is a failed attempt, not a terminal failure."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A")})         # G's direct fails; child A proves directly
+    decomp = RaiseThenDecompose((sketch("G", ["A"]), ["A"]))
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  max_decomp_attempts=2).run("G")
+    assert res.proven is True                             # recovered on the second attempt
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert len(res.trace.by_kind("decomposer_error")) == 1
+    assert decomp.calls == 2
+
+
+def test_raising_reviewer_does_not_crash_run():
+    """A reviewer that RAISES is treated as a failed decomposition attempt (unknown_tool_error), not a
+    crash. With one attempt, the node terminates FAILED_GAP carrying the tool-error reason."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    reviewer = RaisingReviewer()
+    res = _driver(prover, decomposer=decomp, reviewer=reviewer, max_decomp_attempts=1).run("G")
+    assert res.proven is False                            # NOT a crash
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.FAILED_GAP
+    assert g.reason == ReasonCode.unknown_tool_error.value
+    errs = res.trace.by_kind("reviewer_error")
+    assert len(errs) == 1 and errs[0].data["reason"] == ReasonCode.unknown_tool_error.value
+    assert reviewer.calls == 1
+
+
+def test_raising_reviewer_recovers_when_a_later_attempt_passes():
+    """A reviewer that raises on the first attempt but passes on the next still commits the decomposition
+    — the tool error backtracks to the next attempt rather than terminating the node."""
+    from agent.orchestrator.dag import goal_hash
+
+    class _RaiseThenPassReviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, goal, sketch_text, child_goals):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient reviewer timeout")
+            return OK_REVIEW
+
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"]), (sketch("G", ["A"]), ["A"])])
+    reviewer = _RaiseThenPassReviewer()
+    res = _driver(prover, decomposer=decomp, reviewer=reviewer, max_decomp_attempts=2).run("G")
+    assert res.proven is True
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert reviewer.calls == 2                            # raised once, then passed
+
+
+# ---- node-gate boundary: a formalizer/Lean TIMEOUT fails OPEN to soft PROVEN -----------------------
+
+def _verdict_timeout() -> FormalizeAuditResult:
+    """A Lean/formalizer TIMEOUT verdict: the formalizer produced a term but the audit timed out
+    (lean_bridge raises LeanBridgeError -> formalize_and_audit returns compiled=False with the timeout
+    error). This is the could-not-compile outcome (iii): fail OPEN to soft PROVEN, re-attemptable."""
+    return FormalizeAuditResult(formalized=True, compiled=False,
+                                lean_source="theorem t : True := by sorry",
+                                error="lean timed out after 600s")
+
+
+def test_node_gate_formalizer_timeout_fails_open_soft_proven():
+    """CONFIRM the node-gate boundary fails OPEN on a formalizer/Lean timeout: a leaf the informal gate
+    already passed stays softly PROVEN (lean_verified=False, re-attemptable) — a timeout never refutes
+    elementarity nor starves the leaf."""
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_timeout())
+    res = _node_driver(v).run("G")
+    assert res.proven                                     # timeout -> soft PROVEN (fail open)
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.lean_verified is False
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
+
+
+def test_make_node_gate_timeout_knob_is_configurable():
+    """The per-node formalizer timeout is a configurable make_node_gate knob (default 600s). With Lean
+    unavailable the gate returns lean_unavailable WITHOUT compiling, but it still ACCEPTS the timeout_s
+    knob (the configurability the robustness thread requires)."""
+    from agent.gates import lean_bridge
+
+    class _NoFormalizer:
+        def formalize(self, ledger_text, **kw):
+            raise AssertionError("formalize must not be called when Lean is unavailable")
+
+    if lean_bridge.available():
+        pytest.skip("Lean is installed; the unavailable path is not exercised")
+    gate = make_node_gate(_NoFormalizer(), toolkit=TOOLKIT, timeout_s=42)   # knob accepted
+    verdict = gate("G", valid_ledger("G"))
+    assert verdict.lean_unavailable is True
+
+
+# ==================================================================================================
+# P3 — PER-NODE VERIFY BUDGET SUB-CAP + SHARED WARM SERVER.
+#
+# Budget gains an OPTIONAL max_node_verify_calls sub-cap (default None = UNLIMITED -> byte-identical),
+# SEPARATE from max_llm_calls so per-node Lean cannot starve the prover/decomposer search. Before
+# invoking the leaf node_verifier / AND-node sketch_verifier, the driver checks can_verify_node(); if
+# the sub-cap is exhausted it SKIPS per-node Lean for that node and falls back to soft PROVEN (the
+# proof is not blocked, nothing crashes), recording a reason on the trace; on each verify it calls
+# spend_verify_node(). DagDriver also accepts/holds ONE warm lean_server to thread into both gates.
+#
+# These tests exercise the REAL run() path and FAIL against the pre-change code (which had no sub-cap:
+# the leaf verifier fired unconditionally regardless of any node-verify budget).
+# ==================================================================================================
+
+def test_node_verify_subcap_unlimited_default_is_byte_identical():
+    """Sub-cap UNSET (None, the default): the leaf verifier fires on EVERY node exactly as before, and
+    can_verify_node() never BLOCKS. Regression guard that the default path is unchanged (the count is
+    tracked for observability but the unset sub-cap never gates and never leaks into the snapshot)."""
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _driver(DictProver({"G": valid_ledger("G")}), node_verifier=v,
+                  budget=Budget()).run("G")               # no max_node_verify_calls
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.lean_verified is True                         # the verifier DID fire (unlimited)
+    assert len(v.calls) == 1
+    # Unlimited (None) never BLOCKS and never surfaces in the snapshot (byte-identical trace events).
+    assert "node_verify_spent" not in res.budget.snapshot()
+    # The normal Lean outcome (not the budget-exhausted fallback) was recorded.
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "elementary_verified"
+
+
+def test_leaf_verify_subcap_exhausted_falls_back_to_soft_proven():
+    """With max_node_verify_calls small, a leaf BEYOND the cap SKIPS per-node Lean and falls back to soft
+    PROVEN (lean_verified=False) instead of calling the verifier. Two leaves, cap=1: the FIRST is
+    Lean-verified (cap spent), the SECOND falls back. Verifies the count + the fallback via run()."""
+    from agent.orchestrator.dag import goal_hash
+    # G decomposes into A and B, each a directly-proven leaf -> two leaf verify opportunities.
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  node_verifier=v, budget=Budget(max_node_verify_calls=1)).run("G")
+    assert res.proven                                      # the proof is NOT blocked by the sub-cap
+    # The cap spent exactly once: only ONE leaf was actually Lean-verified.
+    assert res.budget.node_verify_spent == 1
+    assert len(v.calls) == 1                               # the verifier was consulted exactly ONCE
+    a = res.dag.get(goal_hash("A"))
+    b = res.dag.get(goal_hash("B"))
+    # Exactly one child Lean-verified (cap spent), the other soft PROVEN (cap exhausted fallback).
+    verified = [n for n in (a, b) if n.lean_verified]
+    soft = [n for n in (a, b) if not n.lean_verified]
+    assert len(verified) == 1 and len(soft) == 1
+    # P5: the Lean-verified leaf is the first-class LEAN_VERIFIED state; the cap-exhausted fallback is
+    # soft PROVEN. Both are success states, so the proof (and every child read) still counts as proven.
+    assert verified[0].state is NodeState.LEAN_VERIFIED
+    assert soft[0].state is NodeState.PROVEN
+    assert all(n.proven for n in (a, b))                     # both success states read as proven
+    # The exhausted-cap fallback was recorded on the trace for the skipped leaf.
+    outcomes = [e.data["outcome"] for e in res.trace.by_kind("node_lean")]
+    assert "node_verify_budget_exhausted" in outcomes
+
+
+def test_leaf_verify_subcap_zero_skips_all_lean_soft_proven():
+    """max_node_verify_calls=0: NO leaf is ever Lean-verified; every leaf falls back to soft PROVEN and
+    the verifier is never called. The proof still succeeds (per-node Lean never blocks the prover)."""
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _driver(DictProver({"G": valid_ledger("G")}), node_verifier=v,
+                  budget=Budget(max_node_verify_calls=0)).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.lean_verified is False
+    assert v.calls == []                                  # the cap blocked the verifier entirely
+    assert res.budget.node_verify_spent == 0
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "node_verify_budget_exhausted"
+
+
+def test_sketch_verify_subcap_exhausted_soft_commits_without_lean():
+    """A SET sub-cap also gates the AND-node sketch_verifier. With cap=0 the composition Lean check is
+    SKIPPED and the decomposition SOFT-commits (sketch_lean_verified=False) via the existing gates — the
+    proof is not blocked. Verifies the count + the fallback via run()."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    sv = ScriptedSketchVerifier(_verdict_pass())
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, budget=Budget(max_node_verify_calls=0),
+                  max_decomp_attempts=1).run("G")
+    assert res.proven                                     # soft-committed despite the skipped Lean check
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert g.sketch_lean_verified is False               # the composition check was skipped
+    assert sv.calls == []                                # the verifier was never consulted (cap=0)
+    assert res.budget.node_verify_spent == 0
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "node_verify_budget_exhausted"
+
+
+def test_node_verify_subcap_separate_from_llm_calls():
+    """The sub-cap pool is SEPARATE from max_llm_calls: a leaf verify spends node_verify_spent, NOT the
+    main calls_spent that funds the prover/decomposer search (so per-node Lean cannot starve search)."""
+    v = ScriptedLeafVerifier(_verdict_pass())
+    budget = Budget(max_llm_calls=50, max_node_verify_calls=5)
+    res = _driver(DictProver({"G": valid_ledger("G")}), node_verifier=v, budget=budget).run("G")
+    assert res.proven
+    assert res.budget.node_verify_spent == 1             # the leaf verify drew from the SUB-cap pool
+    # calls_spent is driven only by the prover/decomposer/reviewer search, never by per-node Lean.
+    assert res.budget.node_verify_spent != res.budget.calls_spent or res.budget.calls_spent == 1
+
+
+def test_driver_holds_shared_lean_server_handle():
+    """DagDriver accepts/holds ONE warm lean_server to thread into the per-node gates (so each node
+    compile reuses the SAME warm base env). The handle is held verbatim; None (the default) is held as
+    None and changes nothing."""
+    sentinel = object()
+    d = _driver(DictProver({"G": valid_ledger("G")}), lean_server=sentinel)
+    assert d.lean_server is sentinel
+    d_default = _driver(DictProver({"G": valid_ledger("G")}))
+    assert d_default.lean_server is None                  # default: no shared server, byte-identical
+
+
+# ---- (R-ROBUST) a raising terminal gate -> proven-but-non-authoritative, never a crash ---------
+
+def test_raising_terminal_gate_does_not_crash_run():
+    """The terminal Layer-4 gate is a live model/Lean call and can RAISE. A raise MUST NOT crash
+    DagDriver.run(): the root stays PROVEN (soft) while the terminal authoritative verdict is ABSENT
+    (terminal=None / not authoritative_elementary), exactly as if no terminal gate were configured.
+    The raise is surfaced on the trace, never silently swallowed."""
+    def boom(goal, proof_text):
+        raise RuntimeError("formalize subprocess timed out")
+
+    res = _driver(DictProver({"G": valid_ledger("G")}), terminal_gate=boom).run("G")  # MUST NOT raise
+    assert res.proven                          # informally proven (root proof is untouched by the gate)
+    assert res.terminal is None                # the authoritative verdict is ABSENT, not a crash
+    assert not res.authoritative_elementary    # proven-but-non-authoritative
+    err = res.trace.by_kind("terminal_gate_error")
+    assert err and err[0].data["error_type"] == "RuntimeError"
+    assert not res.trace.by_kind("terminal_gate")  # the success-path event is NOT emitted on a raise

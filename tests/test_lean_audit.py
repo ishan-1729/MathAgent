@@ -154,6 +154,163 @@ def test_real_denylist_with_stray_decidable_component_rejected():
     assert "denylisted_dependency" in _codes(res)
 
 
+# ---- THREAD 4: non-elementary algebraic shortcuts beyond Z[i]/Z[√d] (probed live, then
+#      pinned offline). Each constant below is a REAL member of the named family's dependency
+#      closure observed against Mathlib via a warm LeanServer; the audit must REJECT it. ----
+
+# (family label, a real constant pulled into that shortcut's proof-term closure)
+_THREAD4_DENY_FAMILIES = [
+    ("generic UFD",            "UniqueFactorizationMonoid"),
+    ("generic PID",            "IsPrincipalIdealRing"),
+    ("adjoin root",            "AdjoinRoot.root"),
+    ("Algebra.adjoin",         "Algebra.adjoin"),
+    ("cyclotomic poly",        "Polynomial.cyclotomic"),
+    ("primitive root",         "IsPrimitiveRoot"),
+    ("roots of unity (lower)", "rootsOfUnity"),
+    ("roots of unity (upper)", "RootsOfUnity"),
+    ("p-adic field ℚ_p",       "Padic.normedField"),
+    ("p-adic ring ℤ_p",        "PadicInt.instCommRing"),
+    ("multivariate poly",      "MvPolynomial.X"),
+]
+
+
+@pytest.mark.parametrize("label,const", _THREAD4_DENY_FAMILIES)
+def test_thread4_nonelementary_shortcut_rejected(label, const):
+    """A synthetic report whose closure contains a constant from each newly-denylisted
+    family is REJECTED by the SHIPPED denylist (offline; no Lean needed). Each fails against
+    the pre-change denylist (those families were a live GAP)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, f"{label}: {const!r} should be rejected"
+    assert "denylisted_dependency" in _codes(res), label
+
+
+def test_thread4_padic_completion_denied_but_valuation_allowed():
+    """The p-adic COMPLETIONS (ℚ_p/ℤ_p) are denied, but the elementary integer/rational
+    p-adic VALUATION functions (v_p = exponent in the factorization) must NOT be collateral-
+    rejected: bare `padicValNat`/`padicValInt`/`padicValRat` are not the `Padic`/`PadicInt`
+    components, so a report using only them still PASSES."""
+    denied = DependencyReport("thm", axioms=[], constants=[ConstDep("PadicInt.instCommRing")])
+    assert not audit_report(denied, TOOLKIT).passed
+
+    valuation_only = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("padicValNat"), ConstDep("padicValInt"), ConstDep("padicValRat"),
+        ConstDep("Nat.add")])
+    res = audit_report(valuation_only, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
+def test_thread4_additions_do_not_overreject_elementary():
+    """A synthetic ELEMENTARY closure (Nat/Int arithmetic, gcd/Coprime/Prime/factorization,
+    Legendre/Jacobi, single-variable Polynomial, ZMod field, well-founded recursion) STILL
+    PASSES under the shipped denylist after the THREAD-4 additions. Guards against the new
+    entries collateral-rejecting elementary number theory or the by-fiat allowlist.
+
+    `Polynomial.X` confirms denylisting `Polynomial.cyclotomic` (dotted) leaves bare
+    single-variable `Polynomial` alone; `Algebra.id` confirms `Algebra.adjoin` (dotted) does
+    not touch bare `Algebra` plumbing."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Nat.add"), ConstDep("Nat.mul"), ConstDep("Int.add"),
+        ConstDep("Nat.gcd"), ConstDep("Nat.Coprime"), ConstDep("Nat.Prime"),
+        ConstDep("Nat.factorization"), ConstDep("legendreSym"), ConstDep("jacobiSym"),
+        ConstDep("Int.ModEq"), ConstDep("padicValNat"),
+        ConstDep("Polynomial.X"),          # single-var poly is NOT denylisted
+        ConstDep("Algebra.id"),            # bare Algebra plumbing is NOT denylisted
+        ConstDep("WellFounded.fix"), ConstDep("Nat.rec", "recursor"),
+        ConstDep("Decidable"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
+# ---- R-DENY: six LIVE denylist gaps (pass-to-fractions / quotient-by-ideal / bare NumberField).
+#      Reproduced live against a warm LeanServer + Mathlib (each construction below COMPILED and was
+#      ADMITTED — audit.passed=True — under the pre-R-DENY denylist), then pinned offline. Each
+#      constant is a REAL member of the named construction's proof-term dependency closure observed
+#      against Mathlib; the audit must now REJECT it. Every case fails against the pre-R-DENY denylist
+#      (those families were a live GAP), so none is vacuous. ----
+
+# (family label, a real constant pulled into that shortcut's proof-term closure)
+_RDENY_FAMILIES = [
+    ("fractional ideal (class-group/Dedekind)", "FractionalIdeal"),
+    ("localization (pass-to-fractions)",        "Localization"),
+    ("OreLocalization (Localization impl)",     "Localization.mk"),     # 'Localization' component
+    ("field of fractions object",               "FractionRing"),
+    ("pass-to-fractions typeclass",             "IsFractionRing"),
+    ("bare NumberField typeclass",              "NumberField"),
+    ("bare NumberField (closure proof)",        "NumberField.to_charZero"),
+    ("ideal quotient ring",                     "Ideal.Quotient.mk"),
+    ("ideal quotient (ring instance proof)",    "Ideal.Quotient.ring._proof_10"),
+    ("ideal-quotient typeclass (the ⧸ op)",     "HasQuotient.Quotient"),
+    ("ideal span (generated ideal)",            "Ideal.span"),
+]
+
+
+@pytest.mark.parametrize("label,const", _RDENY_FAMILIES)
+def test_rdeny_nonelementary_construction_rejected(label, const):
+    """A synthetic report whose closure contains a constant from each newly-denylisted R-DENY
+    family is REJECTED by the SHIPPED denylist (offline; no Lean needed)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, f"{label}: {const!r} should be rejected"
+    assert "denylisted_dependency" in _codes(res), label
+
+
+def test_rdeny_quotient_family_split_each_token_needed():
+    """The three quotient gaps split across the tokens, so all of Ideal.Quotient / HasQuotient /
+    Ideal.span are needed (observed live):
+      - 'Q[X] ⧸ Ideal.span {X^2+1}'  hits HasQuotient + Ideal.span but NOT Ideal.Quotient;
+      - 'IsDomain (R ⧸ P)'           hits Ideal.Quotient + HasQuotient but NOT Ideal.span.
+    A denylist missing any one of the three would admit one of the two shapes."""
+    # Q[X]/(X^2+1): the un-named-quotient path that re-opens AdjoinRoot. No `Ideal.Quotient.*`.
+    qx = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep("HasQuotient.Quotient", "definition"),
+        ConstDep("Ideal.span", "definition")])
+    assert not audit_report(qx, TOOLKIT).passed
+    # quotient-by-prime-is-a-domain: no `Ideal.span` in the closure.
+    dom = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep("Ideal.Quotient.mk", "definition"),
+        ConstDep("HasQuotient.Quotient", "definition")])
+    assert not audit_report(dom, TOOLKIT).passed
+
+
+def test_rdeny_isfractionring_distinct_from_localization():
+    """A bare `IsFractionRing` pass-to-fractions typeclass does NOT always force `Localization`
+    into the closure (probed live: 'IsFractionRing Int Rat' closure has IsFractionRing but NOT
+    Localization), so IsFractionRing is a distinct token that must reject ON ITS OWN."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep("IsFractionRing", "inductive")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "denylisted_dependency" in _codes(res)
+
+
+def test_rdeny_additions_do_not_overreject_zmod_intcast_elementary():
+    """THE OVER-REJECTION GUARD. A synthetic ELEMENTARY closure mirroring the CERTIFIED
+    ZMod/intCast reach — the `3 ∣ a^2 + b^2 ⇒ 3∣a ∧ 3∣b` shape that uses
+    `ZMod.intCast_zmod_eq_zero_iff_dvd` + `decide` over a finite ZMod core — STILL PASSES under
+    the shipped denylist after the R-DENY additions.
+
+    Constants below are REAL members of that certified proof's live closure (the cast bridge +
+    Int/Nat arithmetic; after `decide` reduces the finite ZMod core the surviving closure is plain
+    NatCast/Int/Nat). This is the dominating constraint: the ZMod/intCast bridge must NOT
+    transitively touch Ideal.Quotient / HasQuotient / Ideal.span / Localization / FractionRing /
+    IsFractionRing / FractionalIdeal / NumberField — and it does not."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Nat.cast"), ConstDep("NatCast.natCast"), ConstDep("instNatCastInt"),
+        ConstDep("Int.add"), ConstDep("Int.mul"), ConstDep("Int.instDvd"),
+        ConstDep("Int.mul_comm"), ConstDep("Int.pow"), ConstDep("Nat.add"),
+        ConstDep("Nat.rec", "recursor"), ConstDep("Decidable"), ConstDep("DecidableEq"),
+        # the elementary toolkit's other certified shapes' anchors, for breadth:
+        ConstDep("Nat.gcd"), ConstDep("Nat.Coprime"), ConstDep("Nat.Prime"),
+        ConstDep("Nat.find"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
 # ---- theorem cross-check (L2 fix b) ----
 
 def test_theorem_name_mismatch_rejected():

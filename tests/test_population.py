@@ -70,6 +70,45 @@ def test_scripted_comparator_sequence():
     assert [cmp.compare(a, b) for _ in range(3)] == [1, -1, 0]
 
 
+# ---- (R-ROBUST) a raising comparator is a TIE; the tournament never crashes -------------------
+
+class RaisingComparator:
+    """A comparator that ALWAYS raises (mirrors a live Codex/Claude CLI subprocess failure)."""
+    def compare(self, a, b):
+        raise RuntimeError("comparator subprocess timed out")
+
+
+def test_raising_comparator_degrades_to_tie_not_crash():
+    # A raising comparator must NOT abort the tournament: each comparison degrades to a TIE so the
+    # Elo machinery records a draw and the loop completes all pairs (3 pairs over 3 candidates).
+    pop = EloPopulation()
+    for i in range(3):
+        pop.add(Candidate(f"c{i}", "x"))
+    trace = RunTrace("t")
+    made = pop.tournament(RaisingComparator(), rounds=1, trace=trace)
+    assert made == 3                                  # every pair compared (none aborted the run)
+    # Every comparison was a tie -> equal games, no wins recorded, ratings unchanged from default.
+    assert all(c.games == 2 and c.wins == 1.0 for c in pop.candidates)
+    assert all(c.rating == DEFAULT_RATING for c in pop.candidates)
+    assert len(trace.by_kind("comparator_error")) == 3  # each raise surfaced on the trace, not swallowed
+
+
+def test_population_path_completes_when_comparator_raises():
+    # End-to-end through the DagDriver population path: a RAISING comparator must let run() RETURN
+    # (the tournament degrades to ties) instead of crashing DagDriver.run(). The good candidate still
+    # proves because the deterministic hard pre-gate + best-first expansion do not depend on the
+    # comparator producing a real signal.
+    prover, queues, _cmp = _common()
+    driver = DagDriver(prover, decomposer=QueueDecomposer(queues),
+                       reviewer=ScriptedReviewer([OK_REVIEW]), toolkit=TOOLKIT, budget=Budget(),
+                       trace=RunTrace("t"), comparator=RaisingComparator(),
+                       population_k=2, max_decomp_attempts=2)
+    res = driver.run("G")  # MUST NOT raise
+    assert res.proven                                 # population path completed, did not crash
+    assert res.trace.by_kind("population")
+    assert res.trace.by_kind("comparator_error")      # the raised comparison was traced, not swallowed
+
+
 def test_bradley_terry_orders_transitive_wins():
     ids = ["A", "B", "C"]
     wm = {("A", "B"): 3, ("B", "C"): 3, ("A", "C"): 3}

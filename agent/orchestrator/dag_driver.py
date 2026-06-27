@@ -146,6 +146,7 @@ class DagDriver:
         evolve_fallback: Optional[Decomposer] = None,
         node_verifier: Optional[Callable[[str, str], object]] = None,
         sketch_verifier: Optional[Callable[[str, str, list[str]], object]] = None,
+        lean_server: Optional[object] = None,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -216,6 +217,14 @@ class DagDriver:
         # parent-composition rule. When None (the default) _try_decomposition runs the BYTE-IDENTICAL
         # pre-P4 path — nothing calls the verifier or touches sketch_lean_verified.
         self.sketch_verifier = sketch_verifier
+        # SHARED WARM Lean server (P3): ONE persistent LeanServer (Mathlib + #audit loaded once) held by
+        # the driver so EVERY per-node compile (the leaf node_verifier AND the AND-node sketch_verifier)
+        # reuses the SAME warm base environment instead of reloading Mathlib (~40-60s) per node. The gates
+        # are constructed externally with this server threaded in (make_node_gate/make_sketch_gate accept a
+        # `server=`), so the driver merely holds the single handle (e.g. to close it after a run). None (the
+        # default) changes NOTHING: with no per-node verifier configured there is no per-node compile, and
+        # the default offline path is byte-identical.
+        self.lean_server = lean_server
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
@@ -225,9 +234,23 @@ class DagDriver:
         if proven and self.terminal_gate is not None:
             proof_text = self.dag.proof_bundle(goal)
             self.trace.emit("terminal_gate_start", goal=goal[:80])
-            terminal = self.terminal_gate(goal, proof_text)
-            self.trace.emit("terminal_gate", goal=goal[:80],
-                            authoritative=bool(getattr(terminal, "authoritative", False)))
+            # ROBUSTNESS (R-ROBUST): the terminal gate is a live model/Lean call (formalize -> audit ->
+            # faithfulness) and can RAISE (subprocess timeout, non-zero exit, toolchain failure, malformed
+            # output). A raise here MUST NOT crash the whole run: catch it so the root stays PROVEN (soft)
+            # while the terminal AUTHORITATIVE verdict is simply ABSENT (terminal=None -> not
+            # authoritative_elementary), exactly as if no terminal gate had been configured. The proof is
+            # informally proven but not Layer-4-authoritative; the exception is surfaced on the trace,
+            # never silently swallowed. A single model/Lean call never raises out of run().
+            try:
+                terminal = self.terminal_gate(goal, proof_text)
+            except Exception as e:
+                terminal = None
+                self.trace.emit("terminal_gate_error", goal=goal[:80],
+                                error_type=type(e).__name__, detail=str(e)[:160],
+                                reason=ReasonCode.unknown_tool_error.value)
+            else:
+                self.trace.emit("terminal_gate", goal=goal[:80],
+                                authoritative=bool(getattr(terminal, "authoritative", False)))
 
         stats = self.dag.stats()
         self.trace.emit("final", goal=goal[:80], proven=proven,
@@ -390,7 +413,22 @@ class DagDriver:
                     return True
             else:
                 self.budget.spend_call()
-                sketch, children = self.decomposer.decompose(goal, feedback or None)
+                # ROBUSTNESS (Thread 2): a live decomposer (Codex/Claude CLI) can RAISE (subprocess
+                # timeout, non-zero exit, malformed output). Treat a raise as "this decomposition
+                # attempt failed" -> classify unknown_tool_error and fall through to the next attempt
+                # (re-plan) / terminal backtrack, exactly like a rejected blueprint. The exception is
+                # surfaced on the trace, never silently swallowed; the budget unit is already spent so
+                # the loop stays bounded and terminates.
+                try:
+                    sketch, children = self.decomposer.decompose(goal, feedback or None)
+                except Exception as e:
+                    self.trace.emit("decomposer_error", goal=goal[:80],
+                                    error_type=type(e).__name__, detail=str(e)[:160],
+                                    reason=ReasonCode.unknown_tool_error.value)
+                    last_reason = ReasonCode.unknown_tool_error.value
+                    feedback = ([f"decomposer call failed ({type(e).__name__}): "
+                                 f"{str(e)[:160]}"] + feedback)
+                    continue
                 self.trace.emit("decompose", goal=goal[:80], children=len(children))
                 ok, notes, reason = self._try_decomposition(goal, sketch, children,
                                                             child_ancestors, depth)
@@ -585,7 +623,23 @@ class DagDriver:
                 back. NOT a terminal failure.
 
         The verifier is independent; any unexpected exception in it is treated as fail-OPEN (soft
-        PROVEN) so a flaky verifier never poisons a goal that the informal gate already admitted."""
+        PROVEN) so a flaky verifier never poisons a goal that the informal gate already admitted.
+
+        PER-NODE VERIFY SUB-CAP (P3): before invoking the verifier, check the budget's OPTIONAL
+        max_node_verify_calls sub-cap. If it is EXHAUSTED, SKIP per-node Lean for this leaf and fall
+        back to soft PROVEN (lean_verified=False, re-attemptable) — do NOT block the proof or crash, so
+        per-node Lean can never starve the prover/decomposer search. When the sub-cap is unlimited
+        (None, the default) can_verify_node() is always True and this is byte-identical to before."""
+        if not self.budget.can_verify_node():
+            # Sub-cap exhausted: do NOT spend a per-node Lean compile here. Fall back to the soft-PROVEN
+            # path the informal gate already justified (lean_verified stays False -> re-attemptable on a
+            # later run with more node-verify budget). Bounded + non-blocking by construction.
+            self.dag.mark_proven_direct(goal, ledger)
+            self.trace.emit("node_lean", goal=goal[:80], outcome="node_verify_budget_exhausted",
+                            lean_verified=False, reason=ReasonCode.budget_starved.value)
+            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+            return True
+        self.budget.spend_verify_node()
         try:
             verdict = self.node_verifier(goal, ledger)
         except Exception as e:
@@ -613,10 +667,11 @@ class DagDriver:
                             lean_verified=False, reason="lean_unavailable")
             return False
 
-        # (i) PASS -> promote AND stamp lean_verified.
+        # (i) PASS -> promote to the first-class HARD-success state LEAN_VERIFIED (dominates PROVEN)
+        # AND stamp the lean_verified annotation (set in lockstep by mark_proven_direct).
         if elementary_verified:
-            node = self.dag.mark_proven_direct(goal, ledger)
-            node.lean_verified = True
+            node = self.dag.mark_proven_direct(goal, ledger, lean_verified=True)
+            assert node.state is NodeState.LEAN_VERIFIED
             self.trace.emit("node_lean", goal=goal[:80], outcome="elementary_verified",
                             lean_verified=True)
             self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
@@ -661,7 +716,23 @@ class DagDriver:
 
         FAIL-CLOSED on commit: an UNAVAILABLE toolchain or a crashing verifier rejects the candidate
         (we never commit a composition we could not Lean-check). This only fires when a sketch_verifier
-        is explicitly configured; the None default never reaches here (byte-identical path)."""
+        is explicitly configured; the None default never reaches here (byte-identical path).
+
+        PER-NODE VERIFY SUB-CAP (P3): before invoking the verifier, check the budget's OPTIONAL
+        max_node_verify_calls sub-cap. If it is EXHAUSTED, SKIP the per-node Lean composition check and
+        fall back to a SOFT COMMIT (committed=True, sketch_lean_verified=False) — the decomposition still
+        commits via the SAME reviewer/acyclicity/binding gates the default path uses, just without the
+        extra Lean composition authority, so per-node Lean can never starve the prover/decomposer
+        search. This does NOT loosen any deterministic gate; it only declines the OPT-IN Lean overlay.
+        When the sub-cap is unlimited (None, the default) can_verify_node() is always True."""
+        if not self.budget.can_verify_node():
+            # Sub-cap exhausted: skip the Lean composition compile. Soft-commit (no sketch_lean stamp)
+            # exactly as the byte-identical pre-P4 path would, so the proof is not blocked or crashed.
+            self.trace.emit("sketch_lean", goal=goal[:80], outcome="node_verify_budget_exhausted",
+                            sketch_lean_verified=False, children=len(children),
+                            reason=ReasonCode.budget_starved.value)
+            return True, False, []
+        self.budget.spend_verify_node()
         try:
             verdict = self.sketch_verifier(goal, sketch, children)
         except Exception as e:
@@ -708,7 +779,18 @@ class DagDriver:
             if not self.budget.can_call():
                 return (False, ["budget exhausted before review"], ReasonCode.budget_starved.value)
             self.budget.spend_call()
-            review = self.reviewer.review(goal, sketch, children)
+            # ROBUSTNESS (Thread 2): a live reviewer (Codex/Claude CLI) can RAISE (subprocess timeout,
+            # non-zero exit, malformed output). Treat a raise as "this decomposition attempt failed
+            # review" -> reject this candidate (caller tries the next attempt / backtracks), classified
+            # unknown_tool_error. The exception is surfaced on the trace, never silently swallowed.
+            try:
+                review = self.reviewer.review(goal, sketch, children)
+            except Exception as e:
+                self.trace.emit("reviewer_error", goal=goal[:80],
+                                error_type=type(e).__name__, detail=str(e)[:160],
+                                reason=ReasonCode.unknown_tool_error.value)
+                return (False, [f"reviewer call failed ({type(e).__name__}): {str(e)[:160]}"],
+                        ReasonCode.unknown_tool_error.value)
             self.trace.emit("review", goal=goal[:80], useful=review.useful,
                             elementary=review.elementary)
             if not review.ok:
@@ -1078,7 +1160,15 @@ class DagDriver:
             if not self.budget.can_call():
                 break
             self.budget.spend_call()
-            sketch, children = self.decomposer.decompose(goal, feedback or None)
+            # ROBUSTNESS (Thread 2): a raising decomposer must not crash candidate generation; skip the
+            # failed candidate (its budget unit is already spent) and surface it on the trace.
+            try:
+                sketch, children = self.decomposer.decompose(goal, feedback or None)
+            except Exception as e:
+                self.trace.emit("decomposer_error", goal=goal[:80],
+                                error_type=type(e).__name__, detail=str(e)[:160],
+                                reason=ReasonCode.unknown_tool_error.value)
+                continue
             self.trace.emit("decompose", goal=goal[:80], children=len(children))
             if children:
                 cands.append(Candidate(id=f"cand{i}", content=sketch, goal=goal, children=children))
@@ -1096,7 +1186,7 @@ class DagDriver:
                             candidates=len(cands), rejected=pop.rejected_by_filter)
             return False
         comparisons = pop.tournament(self.comparator, rounds=self.population_rounds,
-                                     budget_ok=self._compare_budget_ok)
+                                     budget_ok=self._compare_budget_ok, trace=self.trace)
         # Bradley-Terry latent strengths from the tournament win matrix (a stable batch estimate over
         # noisy online Elo), then PUCT-best-first expansion (exploit strength + explore under-visited).
         pop.set_ratings_from_bradley_terry()

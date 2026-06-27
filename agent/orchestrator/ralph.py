@@ -61,7 +61,22 @@ class RalphLoop:
                 return RalphResult(False, text, report, episodes, lessons, exhausted=True)
             self.budget.spend_call()
             episodes += 1
-            text = self.prover.prove(goal, feedback=lessons or None)
+            # ROBUSTNESS (Thread 2): a live prover call (Codex/Claude CLI) can RAISE — a subprocess
+            # timeout (ClaudeError/CodexError), a non-zero exit, empty output, etc. Such a raise must
+            # NOT crash the loop: treat it exactly like an unusable/rejected ledger. The call already
+            # cost a budget unit (spent above), so we record a lessons-learned note describing the
+            # failure and continue to the next episode. The loop stays bounded by max_episodes/budget,
+            # so it terminates cleanly and exhausts as not-proven if every episode raises. The
+            # exception is surfaced on the trace (never silently swallowed).
+            try:
+                text = self.prover.prove(goal, feedback=lessons or None)
+            except Exception as e:
+                lesson = f"prover call failed ({type(e).__name__}): {str(e)[:160]}"
+                self.trace.emit("ralph_prover_error", goal=goal[:80], episode=episodes,
+                                error_type=type(e).__name__, detail=str(e)[:160])
+                lessons = ([lesson] + lessons)[:_MAX_LESSONS]
+                report = None
+                continue
             report = evaluate(text, self.toolkit)
             self.trace.emit("ralph_episode", goal=goal[:80], episode=episodes,
                             verdict=report.verdict.value,
@@ -87,7 +102,18 @@ class RalphLoop:
                     incomplete = True
                     break
                 self.budget.spend_call()
-                v = judge.review(report.ledger)
+                # ROBUSTNESS (Thread 2): a live adversarial-judge call (Codex/Claude CLI) can RAISE
+                # exactly like the prover above (subprocess timeout, non-zero exit, malformed output).
+                # It must NOT crash RalphLoop.run()/DagDriver.run(). Fail CLOSED: treat an un-runnable
+                # judge as a non-passing 'gap' note so the ledger is NOT cleanly admitted, surface it
+                # on the trace, and continue to the next judge. The call already cost a budget unit.
+                try:
+                    v = judge.review(report.ledger)
+                except Exception as e:
+                    self.trace.emit("ralph_judge_error", goal=goal[:80], episode=episodes,
+                                    error_type=type(e).__name__, detail=str(e)[:160])
+                    judge_notes.append(f"judge call failed ({type(e).__name__}): {str(e)[:160]}")
+                    continue
                 self.trace.emit("ralph_judge", judge=v.judge, passed=v.passed)
                 if not v.passed:
                     tag = "non-elementary" if not v.elementary else "gap"

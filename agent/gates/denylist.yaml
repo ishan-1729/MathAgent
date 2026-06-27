@@ -67,6 +67,75 @@ lean_denylist_decls:
   - GaussianInt
   - Zsqrtd
   - Mathlib.NumberTheory.Zsqrtd
+  # Generic UFD/PID structure on a ring: the *same* shortcut as Z[i]/Z[√d] but reached without naming
+  # the quadratic ring — drop into "a ring that happens to be a UFD/PID" and use that coprime-factors-
+  # of-a-cube-are-cubes / Bézout structure. The elementary toolkit forces the argument over Z. Component
+  # decls (live in Mathlib.RingTheory.UniqueFactorizationDomain / PrincipalIdealDomain). Bare Nat/Int
+  # arithmetic (ring/omega/gcd/Prime/factorization) does NOT pull these in (probed live).
+  - UniqueFactorizationMonoid
+  - IsPrincipalIdealRing
+  # Adjoining an algebraic number / forming a quotient by an irreducible: AdjoinRoot K[x]/(f) and
+  # Algebra.adjoin build a NON-elementary extension ring to factor in. (Algebra.adjoin is dotted so it
+  # matches only that construct, NOT bare `Algebra` plumbing.)
+  - AdjoinRoot
+  - Algebra.adjoin
+  # Cyclotomic theory / roots of unity. NOTE: cyclotomic polynomials live in
+  # Mathlib.RingTheory.Polynomial.Cyclotomic — NOT under the already-denylisted
+  # Mathlib.NumberTheory.Cyclotomic — so `Polynomial.cyclotomic`/`IsPrimitiveRoot`/`rootsOfUnity` were a
+  # live GAP. `Polynomial.cyclotomic` is dotted so it does NOT touch bare single-variable `Polynomial`.
+  - Polynomial.cyclotomic
+  - IsPrimitiveRoot
+  - rootsOfUnity
+  - RootsOfUnity
+  # p-adic COMPLETIONS: the field ℚ_p (Padic) and ring ℤ_p (PadicInt) are the analytic/topological
+  # completion machinery (Padic = topological completion; not first-order over Z). Denylist the
+  # COMPLETIONS only — the integer/rational valuation functions padicValNat/padicValInt/padicValRat
+  # (v_p = exponent in the factorization) are elementary and are NOT matched by the bare components
+  # `Padic`/`PadicInt` (probed live: a padicValNat proof passes; ℤ_[p]/ℚ_[p] reject).
+  - Padic
+  - PadicInt
+  # Multivariate polynomial rings: a commutative-algebra / algebraic-geometry construct an elementary
+  # NT proof over Z/Nat never needs (single-variable `Polynomial` is left alone — only the Mv form).
+  - MvPolynomial
+  # R-DENY (live-audited 2026-06-28, warm LeanServer + Mathlib): six non-elementary constructions were
+  # still ADMITTED (audit.passed=True). Each is a "drop into a richer ring / pass to a quotient or
+  # field of fractions" shortcut the elementary toolkit (descent/bounding/ZMod congruence over Z/Nat)
+  # must not get for free. The prose scanner already flags the matching phrases (fractional ideal /
+  # number field / ...); these give Layer-4 the matching CONTENT decls so it does not wave them through.
+  #
+  #   FractionalIdeal  — class-group/Dedekind object: '(I : FractionalIdeal (nonZeroDivisors Z) Q)'.
+  #   Localization     — pass-to-fractions: 'Localization (nonZeroDivisors Z)' (built on OreLocalization).
+  #   FractionRing     — the field of fractions object 'FractionRing Z' (= Localization at nonZeroDivisors).
+  #   IsFractionRing   — the pass-to-fractions TYPECLASS ('IsFractionRing Z Q'). Distinct token: a bare
+  #                      IsFractionRing instance does NOT always force `Localization` into the closure
+  #                      (probed: 'IsFractionRing Int Rat' closure has IsFractionRing but NOT Localization).
+  #   NumberField      — bare '[NumberField K]' closure constant (the existing dotted
+  #                      Mathlib.NumberTheory.NumberField / NumberField.RingOfIntegers entries never
+  #                      matched the bare `NumberField` typeclass used as '[Field K][NumberField K]').
+  #
+  # OVER-REJECTION SAFETY (the dominating constraint): the elementary reach depends on ZMod casework via
+  # the integer<->ZMod bridge (ZMod.intCast_zmod_eq_zero_iff_dvd + decide). I LIVE-audited the actual
+  # certified-proof shapes with these tokens patched in and confirmed they STILL PASS — crucially, the
+  # ZMod/intCast bridge does NOT transitively touch ANY token below (the certified 3|a^2+b^2, ∀x:ZMod 5
+  # x^5=x, ZMod 7/intCast-mod-4 closures are all CLEAN of Ideal.Quotient/HasQuotient/Ideal.span/
+  # Localization/FractionRing/IsFractionRing/FractionalIdeal/NumberField). Receipt: research/docs/audits/.
+  - FractionalIdeal
+  - Localization
+  - FractionRing
+  - IsFractionRing
+  - NumberField
+  # Quotient-by-an-ideal family. Three live gaps share it: 'Ideal.Quotient.mk (Ideal.span {(5:Z)}) 12';
+  # 'Q[X] ⧸ Ideal.span {X^2+1}' (re-opens AdjoinRoot via the un-named quotient path); and
+  # 'IsDomain (R ⧸ P)' for a prime P (Ideal.Quotient.isDomain). The three gaps split across these tokens
+  # (1a hits all three; the Q[X] quotient hits HasQuotient+Ideal.span but NOT Ideal.Quotient; the
+  # quotient-is-a-domain hits Ideal.Quotient+HasQuotient but NOT Ideal.span), so all three are needed.
+  # SAFE TO ADD BROADLY: probed live, the certified ZMod/intCast proofs do NOT touch Ideal.Quotient,
+  # Ideal.span, or HasQuotient (Mathlib does NOT build ZMod or the cast bridge over an Ideal quotient in
+  # these closures) — so these do NOT over-reject the certified elementary battery. `Ideal.Quotient` and
+  # `Ideal.span` are dotted (scoped to those constructs); `HasQuotient` is the bare `⧸` typeclass.
+  - Ideal.Quotient
+  - HasQuotient
+  - Ideal.span
 
 lean_infrastructure_allowlist:
   - WellFounded.fix

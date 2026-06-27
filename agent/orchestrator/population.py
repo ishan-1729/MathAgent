@@ -157,18 +157,34 @@ class EloPopulation:
 
     def tournament(self, comparator: Comparator, rounds: int = 1,
                    max_comparisons: Optional[int] = None,
-                   budget_ok: Optional[Callable[[], bool]] = None) -> int:
+                   budget_ok: Optional[Callable[[], bool]] = None,
+                   trace: Optional[object] = None) -> int:
         """Round-robin pairwise comparisons (×rounds), updating Elo. Returns #comparisons made.
 
         `budget_ok` (if given) is checked before each comparison; comparison stops when it returns
         False, so the tournament respects a shared call budget.
+
+        ROBUSTNESS (R-ROBUST): the comparator is a live model call (Codex/Claude CLI) and can RAISE
+        (subprocess timeout, non-zero exit, malformed output). A single raised comparison MUST NOT
+        crash the whole tournament: a raising `comparator.compare()` is treated as a TIE (outcome 0)
+        for that pairwise comparison, so the Elo/Bradley-Terry ranking degrades gracefully (one less
+        informative pairing) instead of aborting the population search. The budget for the failed
+        comparison is already spent (via `budget_ok`), so the loop stays bounded and still terminates.
+        The exception is surfaced on the (optional) `trace`, never silently swallowed.
         """
         made = 0
         for _ in range(rounds):
             for a, b in self._pairs(max_comparisons):
                 if budget_ok is not None and not budget_ok():
                     return made
-                outcome = comparator.compare(a, b)
+                try:
+                    outcome = comparator.compare(a, b)
+                except Exception as e:
+                    # Degrade a raising comparison to a TIE so the tournament continues (never crashes).
+                    if trace is not None:
+                        trace.emit("comparator_error", a=a.id, b=b.id,
+                                   error_type=type(e).__name__, detail=str(e)[:160])
+                    outcome = 0
                 made += 1
                 if outcome > 0:
                     self.record(a, b, 1.0)

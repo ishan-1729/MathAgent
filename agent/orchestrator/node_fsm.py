@@ -18,10 +18,11 @@ Effects-as-data discipline (Forge's `Effect`): a transition returns an `Action` 
 and NEVER performs I/O or mutates the DAG. The driver is the only stateful shell.
 
 Invariants the table guarantees (checked as proptests):
-  - Terminal states (PROVEN / FAILED_GAP / FAILED_ELEMENTARY / EXHAUSTED) ABSORB every event: they
-    transition to themselves with the no-op action NONE. No event resurrects a closed node — this is
-    termination as a *property of the table* (a late child result or memo re-entry cannot reopen a
-    decided node).
+  - Terminal states (PROVEN / LEAN_VERIFIED / FAILED_GAP / FAILED_ELEMENTARY / EXHAUSTED) ABSORB
+    every event: they transition to themselves with the no-op action NONE. No event resurrects a
+    closed node — this is termination as a *property of the table* (a late child result or memo
+    re-entry cannot reopen a decided node). LEAN_VERIFIED is terminal-ABSORBING exactly like PROVEN
+    (and DOMINATES it: a Lean-confirmed success that no event can downgrade or reopen).
   - A NEEDS_REVIEW-no-judge node ALWAYS decomposes (DECOMPOSE) before it may EXHAUST; it never goes
     straight to a terminal failure when a producer (decomposer) could still be tried.
 """
@@ -79,9 +80,12 @@ class ReasonCode(enum.Enum):
 
 
 # Terminal states absorb every event (no resurrection). Mirrors NodeState.is_terminal but named here
-# so the table reads explicitly.
+# so the table reads explicitly. LEAN_VERIFIED is listed alongside PROVEN: it is a terminal-SUCCESS,
+# terminal-ABSORBING state that DOMINATES soft PROVEN (every (LEAN_VERIFIED x event) pair maps to
+# (LEAN_VERIFIED, Action.NONE) here — no wildcard, the table stays total over the enums).
 _TERMINAL = (
     NodeState.PROVEN,
+    NodeState.LEAN_VERIFIED,
     NodeState.FAILED_ELEMENTARY,
     NodeState.FAILED_GAP,
     NodeState.EXHAUSTED,
