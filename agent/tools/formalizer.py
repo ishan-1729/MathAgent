@@ -117,6 +117,15 @@ class CodexFormalizer:
         "Prefer core/Std and elementary Mathlib lemmas (`Nat`/`Int` arithmetic, `Nat.gcd`, `ZMod`, "
         "`Int.ModEq`, `omega`, `decide`, `interval_cases`, `Nat.Prime`). If you need Mathlib, put "
         "`import Mathlib` as the FIRST line. Keep the statement faithful to the informal claim.\n"
+        "TACTIC DISCIPLINE (critical — most failures come from misusing `decide`): a QUANTIFIED goal "
+        "over ℤ or ℕ ranges over an INFINITE domain and is NOT decidable, so `decide`/`Decidable` "
+        "synthesis on the whole goal FAILS. For a claim modulo m, REDUCE to the finite ring `ZMod m`: "
+        "prove the finite core (e.g. `∀ x : ZMod m, P x` or `∀ x y : ZMod m, …`) by `decide` (it IS "
+        "decidable there), then bridge ℤ↔`ZMod m` with `ZMod.intCast_zmod_eq_zero_iff_dvd`, "
+        "`Int.cast`, `push_cast`, and `exact_mod_cast`. Use `omega` for linear integer/nat arithmetic "
+        "and goals with `∣`/`%`/`<`, and `interval_cases` for bounded ranges. Reserve `decide` for "
+        "genuinely FINITE, decidable subgoals ONLY. For infinite descent / minimal-counterexample, use "
+        "strong induction or `Nat.find`/well-founded recursion on a NONNEGATIVE integer measure.\n"
         "No `sorry`, no `admit`, no new `axiom`s, no `unsafe`/`native_decide`.\n"
     )
 
