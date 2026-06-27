@@ -2,6 +2,57 @@
 
 Type: repo dossier
 
+## WIRED IN (MathAgent)
+
+> **OpenEvolve is now an optional, wired-in evolutionary backend in this repo.** Bridge module:
+> [`agent/tools/openevolve_bridge.py`](../../../agent/tools/openevolve_bridge.py) (unit-tested:
+> [`tests/test_openevolve_bridge.py`](../../../tests/test_openevolve_bridge.py)). Architecture write-up:
+> [`research/docs/system_design.md`](../../docs/system_design.md) §8.6; status row in
+> [`research/docs/build_status.md`](../../docs/build_status.md) §3.4.
+>
+> **Use case.** We evolve **proof-sketch *ledgers*** (JSON strings conforming to
+> `agent/gates/ledger.schema.json`), *not* arbitrary programs. OpenEvolve's MAP-Elites population search
+> mutates the ledger **text**; the fitness oracle is our **deterministic gate** (`agent.gates.gate.evaluate`,
+> Layers 1–3), mapping its verdict to `REJECTED→0.0 / NEEDS_REVIEW→0.5 / PASSED_DETERMINISTIC→1.0`. MAP-Elites
+> feature dimensions are `step_count` and `justification_diversity`. `OpenEvolveBackend` implements the
+> `Decomposer` Protocol, so it drops into `DagDriver(decomposer=…)` as a third candidate-generation path
+> alongside the Ralph loop and `CodexDecomposer`.
+>
+> **The mutation LLM — a real AlphaEvolve-style breadth/depth ensemble.** OpenEvolve drives its mutation
+> calls through a **two-model ensemble** routed via the headless `claude` CLI
+> (`agent/tools/claude_cli._run_claude`): **Sonnet = BREADTH** (fast, high sampling weight ≈0.8 — many
+> candidates per unit of compute) + **Opus = DEPTH** (stronger, low weight ≈0.2 — occasional high-quality
+> suggestions). This is a direct mapping of AlphaEvolve's own ensemble, which ran **Gemini 2.0 Flash
+> (breadth) + Gemini 2.0 Pro (depth)** for exactly this reason. AlphaEvolve's "Models used" rationale: the
+> ensemble *"balance[s] computational throughput with the quality of generated solutions"* — Flash, *"with
+> its lower latency, enables a higher rate of candidate generation, increasing the number of ideas explored
+> per unit of time,"* while Pro *"provides occasional, higher-quality suggestions that can significantly
+> advance the evolutionary search."* Our Sonnet/Opus split serves the same breadth/depth roles. OpenEvolve
+> realizes the ensemble as a weighted `config.llm.models` list and samples one model per generation by
+> normalized weight. A dependency-free `StubEvolveLLM` keeps the loop offline-testable.
+>
+> **Bug fixed — evolution used to be a silent no-op.** OpenEvolve's `ProcessParallelController` *pickles*
+> the whole `Config` (including each model's `init_client` factory) to ship it to worker processes. The
+> earlier bridge supplied that factory as a closure/lambda, which is **unpicklable** — it was silently
+> dropped, so every "evolution" iteration only re-scored the seed ledger (no actual mutation ever ran).
+> This is now fixed: the factories are **picklable module-level classes** (`_ClaudeLLMFactory` /
+> `_FixedLLMFactory`) that carry only picklable state and construct the LLM instance inside the worker, so
+> the AlphaEvolve-style ensemble genuinely drives the search.
+>
+> **How we use it SAFELY (no-exec).** The evaluator **READS the candidate ledger file as text** and passes
+> it to `parse_ledger` + `gate.evaluate`; it **never `exec`/`eval`/`import`s** the evolved content, so no
+> arbitrary-code-execution surface is added (a poison ledger that would raise on import just parses as invalid
+> JSON → REJECTED → 0.0). The gate **fails closed** (any exception → REJECTED → 0.0). The only subprocess is
+> the audited headless `claude -p` call (all tools disabled, throwaway cwd, timeout) that drives the
+> breadth/depth ensemble — it only *generates text*; the evolved ledger is never shelled out, exec'd, or
+> imported. OpenEvolve is an **optional dependency**
+> (`pip install mathagent[evolve]`); `available()` probes via `importlib.util.find_spec` without importing it,
+> and the whole bridge runs offline against the stubs when it is absent.
+>
+> **Scope (no over-claim).** This is search/generation efficiency: it evolves ledgers scored by the *soft*
+> gate and therefore only **ranks and filters**. It does **NOT** certify a proof elementary — that is solely
+> the job of **Layer 4** (the Lean proof-term dependency + axiom audit). OpenEvolve never touches Layer 4.
+
 ## What it is
 
 `algorithmicsuperintelligence/openevolve` is a public open-source evolutionary coding agent positioned explicitly as an open-source implementation of the AlphaEvolve idea. It is not the AlphaEvolve white paper itself and it is not a Lean-specific system. Its target use case is broader: given an initial program, an evaluator, and a metric-bearing feedback loop, it repeatedly proposes code changes, runs evaluation, and keeps strong or diverse candidates in circulation. In practice it is a framework for LLM-guided program search rather than a single benchmark-specific demo. ([OpenEvolve repo](https://github.com/algorithmicsuperintelligence/openevolve), [README](https://github.com/algorithmicsuperintelligence/openevolve/blob/main/README.md))

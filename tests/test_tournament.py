@@ -86,3 +86,59 @@ def test_rejects_empty_judge_panel():
     with pytest.raises(ValueError):
         RevisionController(ScriptedCritic([[]]), ScriptedAuthor(["x"]),
                            ScriptedSynthesizer(["y"]), [])
+
+
+# ---- (P3 / #6) AutoReason ONE-WAY POLISH: refined output never re-enters the evolve archive ----
+
+def test_autoreason_refined_output_is_barred_from_evolve_archive():
+    """The AutoReason (exploit) champion, once it displaces the incumbent, must NEVER seed evolve.
+
+    AutoReason explores nothing — it polishes the single champion. Re-injecting that polished output
+    into the diversity-maximising explore archive can propagate a 'better-sounding' synthesis. We assert
+    the one-directional separation: a refined artifact registered with the explore/exploit barrier is
+    rejected as an evolve seed (fail loud)."""
+    pytest.importorskip("openevolve", reason="pip install mathagent[evolve]")
+    from agent.tools.openevolve_bridge import explore_exploit_barrier, evolve_sketches, StubEvolveLLM
+    from agent.gates.toolkit import load_toolkit
+
+    # The RevisionController's displaced champion (the refined output the driver would store).
+    scores = {"A": 1.0, "B": 5.0, "AB": 3.0}
+    res = _controller(scores, author=["B"], synth=["AB"], k_stop=2, max_passes=6).refine("goal", "A")
+    assert res.changed and res.content == "B"   # a real displacement -> "B" is the refined champion
+
+    # Simulate the driver registering the refined champion (exploit side).
+    explore_exploit_barrier().mark_refined(res.content)
+
+    # The refined champion must NOT be ingestible as an evolve (explore) seed.
+    with pytest.raises(AssertionError, match="explore/exploit separation"):
+        evolve_sketches("goal", load_toolkit(), llm=StubEvolveLLM([res.content]),
+                        iterations=1, seed_sketches=[res.content])
+
+
+def test_driver_refine_registers_champion_with_barrier():
+    """The DagDriver's _refine registers a CHANGED refined champion with the explore/exploit barrier,
+    so a later evolve run cannot re-seed from it (the one-way explore->exploit guarantee, wired)."""
+    pytest.importorskip("openevolve", reason="pip install mathagent[evolve]")
+    import json
+    from agent.orchestrator.dag_driver import DagDriver
+    from agent.orchestrator.driver import ScriptedProver
+    from agent.tools.openevolve_bridge import explore_exploit_barrier
+    from agent.gates.toolkit import load_toolkit
+
+    tk = load_toolkit()
+    incumbent = json.dumps({"problem": "p", "claim": "G", "steps": [
+        {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+        {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]}]})
+    refined = json.dumps({"problem": "p2", "claim": "G", "steps": [
+        {"id": "s1", "claim": "alt setup", "justification": "given", "depends_on": []},
+        {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]}]})
+
+    class _Refiner:
+        def refine(self, goal, ledger, is_admissible=None):
+            from agent.orchestrator.tournament import RefineResult
+            return RefineResult(content=refined, changed=True, passes=1, displacements=1)
+
+    driver = DagDriver(ScriptedProver([incumbent]), toolkit=tk, refiner=_Refiner())
+    out = driver._refine("G", incumbent)
+    assert out == refined
+    assert explore_exploit_barrier().is_refined(refined)   # registered -> barred from the archive

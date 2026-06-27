@@ -124,6 +124,8 @@
         </div>
         <div class="field"><label>population K</label><input type="number" id="population" value="0" min="0" max="8"></div>
         <div class="field"><label>judges</label><input type="number" id="judges" value="1" min="1" max="5"></div>
+        <div class="field"><label>evolve iters</label><input type="number" id="evolve" value="0" min="0" max="200"></div>
+        <div class="hint">evolve &gt; 0 → OpenEvolve proof-sketch search (needs mathagent[evolve]; no-op if absent)</div>
       </div>
 
       <div class="group">
@@ -165,7 +167,7 @@ function syncCert(){ $("certsub").style.opacity = $("certify").checked ? "1" : "
 $("certify").addEventListener("change", syncCert); syncCert();
 
 const CHECKS = ["certify","server","faithfulness","refine","retrieval","neural","rerank"];
-const NUMS   = ["repair","population","judges","max_depth","max_decomp","episodes","budget","max_replan","timeout"];
+const NUMS   = ["repair","population","judges","evolve","max_depth","max_decomp","episodes","budget","max_replan","timeout"];
 
 function params(){
   const p = new URLSearchParams();

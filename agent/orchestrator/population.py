@@ -80,13 +80,40 @@ def _expected(ra: float, rb: float) -> float:
 
 
 class EloPopulation:
-    def __init__(self, k: float = DEFAULT_K, seed: int = 0):
+    def __init__(self, k: float = DEFAULT_K, seed: int = 0,
+                 hard_filter: Optional[Callable[[Candidate], bool]] = None):
         self.candidates: list[Candidate] = []
         self.k = k
         self._rng = random.Random(seed)
         self._win_matrix: dict[tuple[str, str], int] = {}
+        # HARD PRE-GATE (P3 / openevolve_stacking_brief §9 #5): a deterministic filter (goal-binding +
+        # obligation-discharge) every candidate must pass BEFORE it is admitted to the ranking. A
+        # candidate failing the hard filter is NEVER added, so the Elo/BT/PUCT machinery — which is
+        # UNCHANGED — never sees, ranks, or selects a gameable candidate. None => admit everything
+        # (back-compat). Rejected candidates are counted for observability.
+        self.hard_filter = hard_filter
+        self.rejected_by_filter = 0
 
-    def add(self, c: Candidate) -> Candidate:
+    def admits(self, c: Candidate) -> bool:
+        """True iff candidate ``c`` passes the hard pre-gate (always True when no filter is set)."""
+        if self.hard_filter is None:
+            return True
+        try:
+            return bool(self.hard_filter(c))
+        except Exception:
+            # Fail closed: a hard filter that errors on a candidate REJECTS it (never admits a
+            # candidate the deterministic gate could not vouch for).
+            return False
+
+    def add(self, c: Candidate) -> Optional[Candidate]:
+        """Admit ``c`` to the population IFF it passes the hard pre-gate; else drop it (returns None).
+
+        The hard filter runs FIRST, before any rating/visit/comparison touches the candidate, so a
+        gate-gaming (off-goal / obligation-undischarged) candidate can never enter the tournament or be
+        selected. With no filter this is the original unconditional append."""
+        if not self.admits(c):
+            self.rejected_by_filter += 1
+            return None
         self.candidates.append(c)
         return c
 

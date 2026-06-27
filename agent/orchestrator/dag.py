@@ -6,10 +6,14 @@ A theorem is the root OR-node. An OR-node (a goal) can be proven either:
     (steps with justification `lemma`), whose claims become child OR-nodes (an AND-node:
     all children must be proven).
 
-Nodes are keyed by a **deep hash** of the (normalized) goal statement, so an identical sub-lemma
-arising on different branches resolves to the *same* node and is proven once and reused
-(memoization). A committed decomposition may not introduce a child that is an ancestor of the goal
-(acyclicity guard, LEAP's state-writer), so the "proof" can never be circular.
+Nodes are keyed by a **deep hash** of the (normalized) goal statement (`semantic_goal_hash`), so an
+identical sub-lemma arising on different branches resolves to the *same* node and is proven once and
+reused (memoization). The memo is **split-keyed** (T100 P1 item 4): the *effective* cache key is the
+PAIR `(semantic_goal_hash, proof_context_hash)`, where `proof_context_hash` fingerprints the
+elementary toolkit / gate / denylist / axiom-whitelist. A goal stays shared across branches under one
+context, but a toolkit/gate/lemma change INVALIDATES a stale PROVEN certificate (it is not reused).
+A committed decomposition may not introduce a child that is an ancestor of the goal (acyclicity
+guard, LEAP's state-writer), so the "proof" can never be circular.
 """
 from __future__ import annotations
 
@@ -17,9 +21,12 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from agent.orchestrator.state import NodeState
+
+if TYPE_CHECKING:  # avoid a runtime import cycle (toolkit is only needed for typing here)
+    from agent.gates.toolkit import Toolkit
 
 
 # --------------------------------------------------------------------------------------------------
@@ -108,10 +115,72 @@ def canonical_form(statement: str) -> str:
     return s.strip()
 
 
-def goal_hash(statement: str) -> str:
-    """Deep hash of a goal statement, keyed by its conservative canonical form. Case-preserving
-    (`x` != `X`); folds notation/synonyms/spacing but never renames variables or reorders operands."""
+def semantic_goal_hash(statement: str) -> str:
+    """Deep hash of a goal STATEMENT, keyed by its conservative canonical form. Case-preserving
+    (`x` != `X`); folds notation/synonyms/spacing but never renames variables or reorders operands.
+
+    This is the *statement identity* (T100 split-keyed memo): an identical sub-lemma arising on
+    different branches resolves to the SAME node and is proven once (cross-branch sharing / fan-in).
+    It deliberately does NOT depend on the toolkit/gate config — that invalidation axis is carried
+    separately by `proof_context_hash` so a goal stays shared while a ruleset change invalidates only
+    the stale PROVEN certificate."""
     return hashlib.sha256(canonical_form(statement).encode("utf-8")).hexdigest()[:16]
+
+
+# Backwards-compatible public alias (callers across the repo import `goal_hash`). The semantic hash
+# IS the goal identity; the name `goal_hash` is retained so the gate/CLI/driver imports keep working.
+goal_hash = semantic_goal_hash
+
+
+def _ctx_tokens(toolkit: "Toolkit") -> list[str]:
+    """The proof-context inputs that, if changed, must INVALIDATE a stale PROVEN certificate:
+    the allowed-justification vocabulary (+ each justification's obligation), the boundary rulings,
+    the prose denylist/allow-context terms, the Lean denylist/allowlist/by-fiat declarations, and the
+    axiom whitelist. Order-insensitive (sorted) so a reordering of YAML keys is not a context change,
+    but any addition/removal/retag is. Length-prefixed below to avoid delimiter-collision aliasing."""
+    tokens: list[str] = []
+    # Allowed justification vocabulary + the obligation each requires + any method_ref.
+    for key in sorted(toolkit.justifications):
+        j = toolkit.justifications[key]
+        tokens.append(f"just:{key}|{j.obligation}|{j.method_ref or ''}")
+    # Contested boundary rulings (a tool moving allowed<->disallowed is a context change).
+    for tool in sorted(toolkit.boundary_rulings):
+        ruling = (toolkit.boundary_rulings.get(tool) or {}).get("ruling", "")
+        tokens.append(f"rule:{tool}|{ruling}")
+    # Prose denylist + allow-context terms (the Layer-1b router vocabulary).
+    for t in sorted(toolkit.prose_terms):
+        tokens.append(f"deny:{t}")
+    for t in sorted(toolkit.allow_context_terms):
+        tokens.append(f"allow:{t}")
+    # Lean Layer-4 audit vocabulary.
+    for t in sorted(toolkit.lean_denylist_decls):
+        tokens.append(f"lean_deny:{t}")
+    for t in sorted(toolkit.lean_infrastructure_allowlist):
+        tokens.append(f"lean_infra:{t}")
+    for t in sorted(toolkit.lean_elementary_by_fiat):
+        tokens.append(f"lean_fiat:{t}")
+    for t in sorted(toolkit.lean_axiom_whitelist):
+        tokens.append(f"axiom:{t}")
+    return tokens
+
+
+def proof_context_hash(toolkit: "Toolkit") -> str:
+    """A stable hash over the elementary-proof CONTEXT (T100 split-keyed memo): the toolkit /
+    elementary-axiom vocabulary, the allowed-justification vocabulary, the denylist/allow-context and
+    Lean allowlist/denylist, and the axiom whitelist. Two runs with the same context share PROVEN
+    certificates; any toolkit/gate/lemma/denylist change yields a DIFFERENT hash so a stale PROVEN
+    minted under the old context is NOT reused (a cache MISS).
+
+    Length-prefixed token encoding (steal from Forge's `_canon`): each token is emitted as
+    `<len>:<token>` so a goal/string boundary can never be forged by embedding a delimiter."""
+    h = hashlib.sha256()
+    for tok in _ctx_tokens(toolkit):
+        b = tok.encode("utf-8")
+        h.update(str(len(b)).encode("ascii"))
+        h.update(b":")
+        h.update(b)
+        h.update(b"|")
+    return h.hexdigest()[:16]
 
 
 @dataclass
@@ -131,6 +200,13 @@ class OrNode:
     proof_kind: Optional[str] = None     # "direct" | "decomposition"
     children: list[str] = field(default_factory=list)  # child keys of the winning decomposition
     attempts: int = 0
+    # The proof_context_hash this node's PROVEN certificate was accepted under (the receipt of WHICH
+    # context admitted it). None until proven. A PROVEN whose context != the DAG's current context is
+    # a STALE certificate and must not be reused (see ProofDAG._context_valid).
+    proof_context: Optional[str] = None
+    # Precise blocker classification for a failed/exhausted node (ReasonCode.value) so no give-up is
+    # unclassified (T100 P1 item 3). None while OPEN/IN_PROGRESS/PROVEN.
+    reason: Optional[str] = None
 
     @property
     def proven(self) -> bool:
@@ -142,9 +218,48 @@ class CycleError(Exception):
 
 
 class ProofDAG:
-    def __init__(self) -> None:
+    """An AND-OR proof DAG with a SPLIT-KEYED memo (T100 P1 item 4).
+
+    Nodes are keyed by `semantic_goal_hash` (statement identity → cross-branch sharing / fan-in). The
+    DAG additionally carries a `context` = `proof_context_hash(toolkit)`. A PROVEN certificate records
+    the context it was accepted under (`OrNode.proof_context`). The *effective* cache key is therefore
+    the PAIR `(semantic_goal_hash, proof_context_hash)`: a PROVEN node minted under a DIFFERENT context
+    (a toolkit/gate/denylist/lemma change) is a STALE certificate and is NOT reused — it is reset to
+    OPEN so the goal is re-attempted under the new context (a cache MISS). Identical context ⇒ hit.
+
+    `context` may be None (legacy / context-agnostic callers): then no invalidation occurs and the
+    memo behaves exactly as before (goal-identity sharing only), so existing call sites are unchanged.
+    """
+
+    def __init__(self, context: Optional[str] = None) -> None:
         self.nodes: dict[str, OrNode] = {}
         self.cache_hits = 0
+        self.context = context              # proof_context_hash for this run (None = context-agnostic)
+        self.stale_invalidations = 0        # # of stale PROVEN certificates evicted on context mismatch
+
+    def _context_valid(self, node: OrNode) -> bool:
+        """Is this node's PROVEN certificate valid under the DAG's current context? A None DAG-context
+        means context-agnostic (always valid); otherwise the node's recorded `proof_context` must
+        match. A node minted with proof_context=None pre-dates context keying and is treated as valid
+        only when the DAG is also context-agnostic."""
+        if self.context is None:
+            return True
+        return node.proof_context == self.context
+
+    def _evict_if_stale(self, node: OrNode) -> bool:
+        """If `node` is PROVEN under a different context, reset it to OPEN (a cache MISS) and report
+        True. The stale artifact/children are cleared so a re-attempt under the new context starts
+        clean and `assemble`/`proof_bundle` never render a certificate the new context did not admit."""
+        if node.proven and not self._context_valid(node):
+            node.state = NodeState.OPEN
+            node.proof = None
+            node.proof_kind = None
+            node.children = []
+            node.proof_context = None
+            node.reason = None
+            self.stale_invalidations += 1
+            return True
+        return False
 
     # --- node access (memoized) ---
     def get_or_create(self, goal: str) -> OrNode:
@@ -154,7 +269,12 @@ class ProofDAG:
             node = OrNode(goal=goal, key=key)
             self.nodes[key] = node
         elif node.proven:
-            self.cache_hits += 1
+            # Split-keyed memo: only count a SHARE when the certificate is valid under this context;
+            # a stale PROVEN (context changed) is evicted to OPEN and re-attempted (a MISS).
+            if self._evict_if_stale(node):
+                pass  # stale -> miss; node is now OPEN
+            else:
+                self.cache_hits += 1
         return node
 
     def get(self, key: str) -> Optional[OrNode]:
@@ -162,7 +282,10 @@ class ProofDAG:
 
     def is_proven(self, goal: str) -> bool:
         node = self.nodes.get(goal_hash(goal))
-        return bool(node and node.proven)
+        if node is None or not node.proven:
+            return False
+        # A stale PROVEN (minted under a different context) is NOT proven for THIS context.
+        return self._context_valid(node)
 
     # --- acyclicity ---
     def reaches(self, start_key: str, target_key: str) -> bool:
@@ -202,6 +325,8 @@ class ProofDAG:
         node.proof = ledger
         node.proof_kind = "direct"
         node.children = []
+        node.proof_context = self.context   # stamp the context this certificate was accepted under
+        node.reason = None
         return node
 
     def commit_decomposition(self, goal: str, sketch: str, child_goals: list[str],
@@ -221,18 +346,51 @@ class ProofDAG:
         if not all(self.nodes[ck].proven for ck in node.children):
             raise ValueError("cannot mark proven: not all children are proven")
         node.state = NodeState.PROVEN
+        node.proof_context = self.context   # certificate is valid only under the current context
+        node.reason = None
         return node
 
-    def mark_failed(self, goal: str) -> OrNode:
+    def mark_failed(self, goal: str, *, elementary: bool = False,
+                    reason: Optional[str] = None) -> OrNode:
+        """Terminally fail a node. `elementary=True` records a real-but-non-elementary proof
+        (FAILED_ELEMENTARY); otherwise a logical gap (FAILED_GAP). `reason` is a ReasonCode.value
+        string so no give-up is unclassified (T100 P1 item 3)."""
         node = self.get_or_create(goal)
         if not node.proven:
-            node.state = NodeState.FAILED_GAP
+            node.state = NodeState.FAILED_ELEMENTARY if elementary else NodeState.FAILED_GAP
+            if reason is not None:
+                node.reason = reason
+        return node
+
+    def mark_exhausted(self, goal: str, *, reason: Optional[str] = None) -> OrNode:
+        """Mark a node EXHAUSTED (limit-induced, retryable elsewhere — NOT a terminal gap). Carries a
+        ReasonCode.value so every give-up is classified."""
+        node = self.get_or_create(goal)
+        if not node.proven:
+            node.state = NodeState.EXHAUSTED
+            if reason is not None:
+                node.reason = reason
         return node
 
     # --- output ---
+    def _reported_state(self, node: OrNode) -> NodeState:
+        """The state to REPORT for a node through the read accessors, respecting context validity. A
+        PROVEN certificate minted under an OLD proof_context is STALE: it must NOT be rendered as PROVEN
+        (the new context never admitted it). We report a stale-PROVEN as OPEN (a cache MISS that would be
+        re-attempted) — the same read-through guard get_or_create/_evict_if_stale apply on access — so
+        assemble()/proof_bundle()/stats() never advertise a certificate the current context does not
+        admit. Non-PROVEN states are reported as-is."""
+        if node.proven and not self._context_valid(node):
+            return NodeState.OPEN
+        return node.state
+
     def assemble(self, goal: str) -> dict:
         """A serializable proof tree rooted at goal. A node reused across branches (memoized) is
-        expanded once; later occurrences are marked `shared` (the DAG is acyclic by construction)."""
+        expanded once; later occurrences are marked `shared` (the DAG is acyclic by construction).
+
+        Context read-through: a context-STALE PROVEN (minted under an old proof_context) is reported as
+        OPEN, not PROVEN — the same validity guard get_or_create applies — so a stale certificate is
+        never rendered through this accessor."""
         key = goal_hash(goal)
         expanded: set[str] = set()
 
@@ -240,7 +398,8 @@ class ProofDAG:
             node = self.nodes.get(k)
             if node is None:
                 return {"goal": "<unknown>", "state": "missing"}
-            entry = {"goal": node.goal, "state": node.state.value, "kind": node.proof_kind}
+            entry = {"goal": node.goal, "state": self._reported_state(node).value,
+                     "kind": node.proof_kind}
             if k in expanded:
                 entry["shared"] = True   # memoized reuse; do not expand again
                 return entry
@@ -252,14 +411,18 @@ class ProofDAG:
         return build(key)
 
     def proof_bundle(self, goal: str) -> str:
-        """Serialize the proven proof rooted at goal into one informal text (for formalization)."""
+        """Serialize the proven proof rooted at goal into one informal text (for formalization).
+
+        Context read-through: a context-STALE PROVEN (minted under an old proof_context) is NOT proven
+        for the current context, so it is skipped — the bundle never serializes a certificate the
+        current context does not admit."""
         key = goal_hash(goal)
         seen: set[str] = set()
         lines: list[str] = []
 
         def visit(k: str, depth: int) -> None:
             node = self.nodes.get(k)
-            if node is None or not node.proven:
+            if node is None or not node.proven or not self._context_valid(node):
                 return
             pad = "  " * depth
             lines.append(f"{pad}GOAL: {node.goal}")
@@ -279,5 +442,9 @@ class ProofDAG:
         return "\n".join(lines)
 
     def stats(self) -> dict:
-        proven = sum(1 for n in self.nodes.values() if n.proven)
+        # Context read-through: only count a PROVEN that is VALID under the current context. A stale
+        # PROVEN (minted under an old proof_context) is not reported as proven — the same validity guard
+        # get_or_create/is_proven apply — so stats never over-reports a certificate the current context
+        # does not admit.
+        proven = sum(1 for n in self.nodes.values() if n.proven and self._context_valid(n))
         return {"nodes": len(self.nodes), "proven": proven, "cache_hits": self.cache_hits}

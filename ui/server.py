@@ -88,6 +88,11 @@ def build_argv(p: dict) -> list[str]:
     if pop:
         argv += ["--population", str(pop)]
     argv += ["--judges", str(_int(p, "judges", 1, 1, 5))]
+    # OpenEvolve proof-sketch search: K iterations (0 = off). Graceful no-op in prove.py if the
+    # optional openevolve package is not installed.
+    evolve = _int(p, "evolve", 0, 0, 200)
+    if evolve:
+        argv += ["--evolve", str(evolve)]
 
     # Retrieval levers.
     if _flag(p, "retrieval"):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from enum import Enum
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,6 +24,48 @@ from agent.orchestrator import Budget, RunTrace, RalphLoop, DagDriver
 from agent.orchestrator.dag import goal_hash
 from agent.tools.codex_prover import (CodexProver, CodexDecomposer, CodexReviewer, CodexComparator,
                                       CodexConfig, make_codex_refiner)
+
+
+# --------------------------------------------------------------------------------------------------
+# SEARCH-FITNESS vs REPORTING-STATUS separation (P3 / openevolve_stacking_brief §9):
+# the graded search fitness (the evolutionary combined_score, Elo ratings, etc.) is INTERNAL and must
+# NEVER leak into the user-facing certification language. The user-facing status is a CATEGORICAL enum
+# whose ladder runs strictly: rejected < candidate_incomplete < soft_proven < formalized_not_elementary
+# < authoritative_elementary. A search SCORE (a float) is never a status — only these categories are.
+# --------------------------------------------------------------------------------------------------
+class ReportStatus(Enum):
+    REJECTED = "rejected"                                  # no admissible proof found
+    CANDIDATE_INCOMPLETE = "candidate_incomplete"          # a candidate exists but is not soft-proven
+    SOFT_PROVEN = "soft_proven"                            # PROVEN (soft gate) — NOT a certificate
+    FORMALIZED_NOT_ELEMENTARY = "formalized_not_elementary"  # formalized + audited but NOT elementary
+    AUTHORITATIVE_ELEMENTARY = "authoritative_elementary"   # the ONLY real certificate
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+
+def report_status(*, proven: bool, has_candidate: bool = False,
+                  formalized: bool = False,
+                  authoritative_elementary: bool = False) -> ReportStatus:
+    """Map an outcome to the CATEGORICAL user-facing status (never a search score).
+
+    Precedence (highest first): an ``authoritative_elementary`` certificate dominates everything; a
+    ``formalized`` result that is NOT authoritative is ``formalized_not_elementary`` (audited but not
+    certified elementary — never reported as a certificate); a ``proven`` (soft-gate) result is
+    ``soft_proven``; a result with only a non-proven candidate is ``candidate_incomplete``; otherwise
+    ``rejected``. The graded search fitness is INTENTIONALLY not an input here — a high search score
+    never promotes the status."""
+    if authoritative_elementary:
+        return ReportStatus.AUTHORITATIVE_ELEMENTARY
+    if formalized:
+        # Formalized + audited but the audit did not certify elementary.
+        return ReportStatus.FORMALIZED_NOT_ELEMENTARY
+    if proven:
+        return ReportStatus.SOFT_PROVEN
+    if has_candidate:
+        return ReportStatus.CANDIDATE_INCOMPLETE
+    return ReportStatus.REJECTED
 
 
 def main() -> int:
@@ -66,6 +109,15 @@ def main() -> int:
                     help="(dag) refine each directly-proven ledger with the Codex Autoreason tournament")
     ap.add_argument("--max-replan", type=int, default=2, metavar="D",
                     help="global re-plan budget (max_replan_depth)")
+    ap.add_argument("--evolve", type=int, default=0, metavar="K",
+                    help="run the OpenEvolve proof-sketch search for K iterations to seed a best "
+                         "candidate ledger before proving (needs mathagent[evolve]); graceful no-op "
+                         "if openevolve is not installed")
+    ap.add_argument("--evolve-fallback", type=int, default=0, metavar="K",
+                    help="(dag) wire the OpenEvolve backend as a FALLBACK decomposer that fires ONLY "
+                         "on stuck nodes (K evolve iterations per fire); commits an evolved blueprint "
+                         "only if it is goal-bound + obligation-discharged (needs mathagent[evolve]); "
+                         "graceful no-op if openevolve is not installed")
     args = ap.parse_args()
 
     if not CodexProver.available():
@@ -80,6 +132,51 @@ def main() -> int:
 
     print(f"# Proving (model={args.model}, effort={args.effort}, mode={'direct' if args.direct else 'dag'}):")
     print(f"  {args.goal}\n")
+
+    # Optional: OpenEvolve proof-sketch search. When --evolve K is set we run the MAP-Elites
+    # population search (gate = fitness oracle) for K iterations to produce a best candidate ledger.
+    # If openevolve is not installed this is a graceful no-op with a clear message. The evolved
+    # candidate is reported; if it gates clean AND its claim+conclusion bind to the goal it is fed in
+    # as the winning ledger (short-circuiting the prover for that goal).
+    evolved_ledger = None
+    if args.evolve:
+        from agent.tools.openevolve_bridge import OpenEvolveBackend, evolve_sketches
+        if not OpenEvolveBackend.available():
+            print("# (--evolve requested but openevolve not installed; "
+                  "pip install mathagent[evolve] — skipping evolutionary search)\n")
+        else:
+            print(f"# evolving proof-sketch ledgers ({args.evolve} iterations, "
+                  "Sonnet-breadth + Opus-depth ensemble)...")
+            best_text, best_fitness, _metrics = evolve_sketches(
+                args.goal, toolkit, iterations=args.evolve)
+            print(f"# evolve: best gate fitness = {best_fitness:.2f}")
+            # Only accept the evolved ledger as authoritative for THIS goal if it gates clean (1.0)
+            # AND both its top-level claim and terminal conclusion bind to the requested goal.
+            if best_fitness >= 1.0:
+                try:
+                    led = parse_ledger(best_text)
+                    gh = goal_hash(args.goal)
+                    concl = next((s for s in led.steps if s.justification == "conclusion"), None)
+                    if goal_hash(led.claim) == gh and concl is not None and goal_hash(concl.claim) == gh:
+                        evolved_ledger = best_text
+                        print("# evolve: candidate gates clean and proves the goal\n")
+                    else:
+                        print("# evolve: candidate gates clean but does not bind to the goal; "
+                              "using it only as a seed for the prover\n")
+                except LedgerError:
+                    print("# evolve: best candidate did not re-parse; ignoring\n")
+            else:
+                print("# evolve: no clean candidate; falling through to the prover\n")
+
+    # A clean evolved ledger that proves the goal short-circuits the prover entirely.
+    if evolved_ledger is not None:
+        print("result: PROVEN  (via evolutionary proof-sketch search)")
+        if args.out:
+            Path(str(args.out) + ".ledger.json").write_text(evolved_ledger, encoding="utf-8")
+        else:
+            print("\n--- ledger ---\n" + evolved_ledger)
+        print(f"\ncalls spent: {budget.calls_spent}/{budget.max_llm_calls}")
+        return 0
 
     server = None
     if args.server:
@@ -158,6 +255,19 @@ def main() -> int:
         comparator = CodexComparator(cfg) if args.population else None
         refiner = (make_codex_refiner(cfg, n_judges=args.judges, budget=budget, trace=trace)
                    if args.refine else None)
+        # OpenEvolve fallback decomposer (fires ONLY on stuck nodes; commits only goal-bound,
+        # obligation-discharged blueprints). Graceful no-op if openevolve is unavailable.
+        evolve_fallback = None
+        if args.evolve_fallback:
+            from agent.tools.openevolve_bridge import OpenEvolveBackend
+            from agent.tools.claude_cli import ClaudeConfig
+            if OpenEvolveBackend.available():
+                evolve_fallback = OpenEvolveBackend(
+                    toolkit, ClaudeConfig(timeout_s=args.timeout),
+                    generations=args.evolve_fallback, retriever=retriever)
+            else:
+                print("# (--evolve-fallback requested but openevolve not installed; "
+                      "pip install mathagent[evolve] — fallback disabled)")
         driver = DagDriver(
             prover,
             decomposer=CodexDecomposer(toolkit, cfg),
@@ -166,6 +276,7 @@ def main() -> int:
             max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
             ralph_episodes=args.episodes, terminal_gate=terminal_gate,
             comparator=comparator, population_k=args.population, refiner=refiner,
+            evolve_fallback=evolve_fallback,
         )
         res = driver.run(args.goal)
         ok = res.proven
@@ -200,6 +311,14 @@ def main() -> int:
         server.close()
 
     print(f"\ncalls spent: {budget.calls_spent}/{budget.max_llm_calls}")
+    # CATEGORICAL user-facing status (P3): the graded search fitness stays INTERNAL; the user sees only
+    # a category from the certification ladder, so a search score never leaks into certification language.
+    status = report_status(
+        proven=ok,
+        formalized=bool(certifying and cert_authoritative is not None),
+        authoritative_elementary=bool(cert_authoritative),
+    )
+    print(f"status: {status.label}")
     if args.out:
         trace.write_jsonl(str(args.out) + ".trace.jsonl")
     print("trace events: " + ", ".join(f"{k}={len(trace.by_kind(k))}"

@@ -39,13 +39,32 @@ Within family (a) the system has a definite shape:
 
 - **Spine = LEAP.** Informal blueprint → AND-OR proof DAG → compiler-feedback revision → memoized
   lemma reuse, with a pre-commit decomposition reviewer.
-- **Grafted from AlphaProof_Nexus.** The Ralph loop, the deep-hash goal cache, population/Elo, and —
-  most important — **SafeVerify → our Layer-4 axiom/dependency audit**.
+- **Grafted from AlphaProof_Nexus.** The Ralph loop, the deep-hash goal cache, the **population/Elo
+  candidate search** (Elo + Bradley-Terry + PUCT over K candidate decompositions, §8), and — most
+  important — **SafeVerify → our Layer-4 axiom/dependency audit**.
 - **Substituted.** AlphaProof_Nexus uses an RL-trained prover (AlphaProof) as the per-subgoal tool —
   the one piece nobody can reproduce. **We swap in Codex GPT-5.5-xHigh.**
 - **Grafted from Autoreason.** The incumbent revision tournament (do-nothing first-class, blind judge
   panel, k=2 stop, margin gate) as the revision controller / synthesis-drift guard.
-- **Grafted from AlphaEvolve.** Population/Elo ranking + the cheap-first evaluation cascade.
+- **Grafted from AlphaEvolve — *two specific, narrow lessons*, not the population machinery.** (The
+  Elo/Bradley-Terry/PUCT population above is AlphaProof_Nexus-style; do **not** attribute it to
+  AlphaEvolve.) From AlphaEvolve we take: (1) the **cheap-first evaluation cascade** (run cheap
+  structural/numeric checks before expensive judge/Lean passes); and (2) the **"no hard projection"
+  lesson** — AlphaEvolve enforces a numeric property with soft penalty *plus a hard rounding
+  projection*, and elementarity has **no** such projection operator, so the hard part must be rebuilt
+  as a verification gate (Layer 4), never a projection (§3, PLAN §5).
+- **Wired-in evolutionary backend = OpenEvolve.** The open-source AlphaEvolve implementation
+  (`algorithmicsuperintelligence/openevolve`) is grafted as an **optional** third candidate-generation
+  path: a MAP-Elites population search over proof-sketch **ledgers**, scored by our deterministic gate
+  as the fitness oracle (`tools/openevolve_bridge.py`, §8.6). It evolves *ledger text only* and never
+  executes the evolved artifact; it ranks/filters, it does **not** certify — only Layer 4 does. Its
+  mutations are driven by a real **AlphaEvolve-style LLM ensemble** — fast-breadth **Sonnet**
+  (high sampling weight, many candidates) + stronger-depth **Opus** (low weight, occasional
+  high-quality suggestions), via the headless `claude` CLI — mirroring AlphaEvolve's own
+  Flash/Pro breadth/depth split (now Sonnet/Opus). AlphaEvolve's stated rationale: the ensemble
+  "balance[s] computational throughput with the quality of generated solutions" — the fast model
+  "enables a higher rate of candidate generation … per unit of time," the stronger model "provides
+  occasional, higher-quality suggestions."
 - **Borrowed infra.** Loogle/LeanSearch + a neural bi-encoder (the LeanExplore recipe) for retrieval;
   AXLE/Pantograph/LeanDojo ideas for the Lean bridge + persistent REPL (built in-house); AXLE/Goedel
   faithfulness → the adversarial faithfulness panel.
@@ -245,7 +264,8 @@ stub are interchangeable; the whole harness is deterministically testable with s
 | **Drivers** | `orchestrator/driver.py` (flat), `dag_driver.py` (AND-OR) | plan→prove→gate→repair; direct→decompose→review→recurse | LEAP |
 | **Proof DAG** | `orchestrator/dag.py` | AND-OR DAG, **semantic** deep-hash memo, acyclicity | LEAP, Nexus deep-hash |
 | **Ralph loop** | `orchestrator/ralph.py` | per-goal episodes + lessons-learned | AlphaProof_Nexus |
-| **Population** | `orchestrator/population.py` | Elo tournament, `fit_bradley_terry`, `select_puct` | Nexus / AlphaEvolve |
+| **Population** | `orchestrator/population.py` | Elo tournament, `fit_bradley_terry`, `select_puct` | AlphaProof_Nexus |
+| **Evolutionary backend** *(optional)* | `tools/openevolve_bridge.py` | evolve proof-sketch **ledgers** (MAP-Elites), gate-scored fitness, no-exec; `Decomposer` for `DagDriver` | OpenEvolve (AlphaEvolve OSS) |
 | **Revision tournament** | `orchestrator/tournament.py` | Autoreason incumbent tournament (do-nothing wins ties, PUCT+BT, admissibility guard) | Autoreason |
 | **Faithfulness** | `orchestrator/faithfulness.py` | adversarial multi-lens, default-unfaithful | AXLE / Goedel |
 | **Terminal gate** | `orchestrator/formalize_bridge.py` | formalize→compile→audit→faithfulness → `authoritative` | PLAN §5 Layer 4 |
@@ -356,8 +376,8 @@ K candidate decompositions
   → PUCT                                              → which candidate to expand FIRST
 ```
 
-That is **population search** (the AlphaProof_Nexus / AlphaEvolve idea): keep a *pool* of candidates
-alive, rate them from *cheap* comparisons, and spend *expensive* attempts best-first. It is
+That is **population search** (the AlphaProof_Nexus idea — *not* AlphaEvolve; see §2): keep a *pool* of
+candidates alive, rate them from *cheap* comparisons, and spend *expensive* attempts best-first. It is
 **search-efficiency only** — none of it changes whether a proof is accepted; that is the gate's job.
 (`DagDriver._prove_via_population`.)
 
@@ -375,6 +395,59 @@ is **monotone** (never regresses).
 
 Both mechanisms are Codex-wired (`CodexComparator`, `make_codex_refiner`); neither is what blocks a first
 result. They pay off once there is a search worth prioritizing and an incumbent worth defending.
+
+### 8.6 OpenEvolve — the evolutionary candidate backend (optional, gate-scored, no-exec)
+
+§8.1–8.4 *rank* a fixed pool of K candidate decompositions. **OpenEvolve** adds an orthogonal third path:
+instead of ranking a fixed pool, it **evolves the pool itself** — a population search that *mutates*
+proof-sketch ledgers and keeps strong/diverse ones. It is the open-source AlphaEvolve implementation
+(`algorithmicsuperintelligence/openevolve`), grafted in via `tools/openevolve_bridge.py`.
+
+How it maps onto our problem:
+
+- **Genotype = a proof-sketch ledger** — a JSON string conforming to `gates/ledger.schema.json`. The
+  evolved artifact is **always text**, never code.
+- **Fitness oracle = the deterministic gate.** `score_ledger` runs `gates.gate.evaluate` and maps its
+  verdict to a scalar: `REJECTED → 0.0`, `NEEDS_REVIEW → 0.5`, `PASSED_DETERMINISTIC → 1.0`. The gate
+  **fails closed** (a malformed ledger or any internal exception → REJECTED → 0.0), so there is no
+  fail-open path.
+- **Quality-diversity = MAP-Elites.** Two feature dimensions — `step_count` and
+  `justification_diversity` (distinct justifications used) — keep the population from collapsing onto one
+  shape, the same quality-diversity idea AlphaEvolve/OpenEvolve are built around.
+- **Mutations = a real AlphaEvolve-style LLM ensemble.** OpenEvolve's mutation calls are driven by a
+  **two-model breadth/depth ensemble** through the headless `claude` CLI
+  (`tools/claude_cli._run_claude`, wrapped in `asyncio.to_thread`): **Sonnet = BREADTH** (fast, high
+  sampling weight ≈0.8 — many candidates) + **Opus = DEPTH** (stronger, low weight ≈0.2 — occasional
+  high-quality suggestions). This is the **same breadth/depth split AlphaEvolve uses** (it ran a
+  Gemini-2.0 *Flash* + *Pro* ensemble; we run *Sonnet* + *Opus*). AlphaEvolve's own "Models used"
+  rationale: the mix "balance[s] computational throughput with the quality of generated solutions" —
+  the fast model "enables a higher rate of candidate generation, increasing the number of ideas
+  explored per unit of time," while the stronger model "provides occasional, higher-quality
+  suggestions that can significantly advance the evolutionary search." OpenEvolve realizes the ensemble
+  as a weighted `config.llm.models` list, sampling one model per generation by normalized weight. A
+  dependency-free `StubEvolveLLM` makes the whole loop deterministically testable offline. (Earlier
+  docs described a single Codex-backed mutator; the bridge now wires the genuine two-model ensemble.
+  A subtle bug where evolution was a silent no-op — OpenEvolve pickles the whole `Config` to its
+  worker processes, and the prior closure/lambda model factory was unpicklable and got dropped, so
+  every iteration only re-scored the seed — is **fixed** by picklable module-level factories
+  (`_ClaudeLLMFactory`/`_FixedLLMFactory`).)
+- **Wiring.** `OpenEvolveBackend` implements the `Decomposer` Protocol, so it slots straight into
+  `DagDriver(decomposer=…)` as a drop-in alternative to `CodexDecomposer`: `decompose` runs
+  `evolve_sketches` and extracts child goals from the best ledger's `lemma` steps via
+  `children_from_sketch`.
+
+**SAFETY (load-bearing, and unit-tested).** The evaluator **READS** the candidate ledger as text and
+gates it — it never `exec`/`eval`/`import`s the evolved content, so evolution adds **no
+arbitrary-code-execution surface** (a "poison" ledger whose text would raise on import simply parses as
+invalid JSON → REJECTED → 0.0). The only subprocess is the audited headless `claude -p` call (all tools
+disabled, throwaway cwd, timeout) — it only *generates text*; the evolved ledger is never shelled out.
+
+**Scope (no over-claim).** This is **search/generation efficiency**, exactly like §8.1–8.5: it evolves
+ledgers *scored by the soft, deterministic gate* (Layers 1–3) and so only **ranks and filters**. It does
+**not** certify a proof elementary — that remains the sole job of **Layer 4** (the Lean dependency +
+axiom audit, §3). OpenEvolve is an **optional** dependency (`pip install mathagent[evolve]`); `available()`
+probes for it without importing, and the entire bridge — including the gate evaluator — runs offline
+against the stubs when the package is absent.
 
 ---
 

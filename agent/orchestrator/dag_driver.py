@@ -21,10 +21,16 @@ from typing import Callable, Optional, Protocol, runtime_checkable
 from agent.gates.gate import Verdict, evaluate
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.toolkit import Toolkit, load_toolkit
-from agent.orchestrator.dag import ProofDAG, goal_hash, CycleError
+from agent.orchestrator.dag import ProofDAG, goal_hash, proof_context_hash, CycleError
+from agent.orchestrator.dilworth import dilworth_width, upward_rank, CyclicPosetError
 from agent.orchestrator.driver import Prover, Judge
+from agent.orchestrator.elementary_verifier import (
+    refute_elementary, VacuousVerificationError,
+)
+from agent.orchestrator.h0_consistency import check_children_consistency
+from agent.orchestrator.node_fsm import Action, NodeEvent, ReasonCode, node_transition
 from agent.orchestrator.population import Comparator, EloPopulation, Candidate
-from agent.orchestrator.ralph import RalphLoop
+from agent.orchestrator.ralph import RalphLoop, RalphResult
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.tournament import RevisionController
 from agent.orchestrator.trace import RunTrace
@@ -135,6 +141,9 @@ class DagDriver:
         population_rounds: int = 1,
         refiner: Optional[RevisionController] = None,
         terminal_gate: Optional[Callable[[str, str], object]] = None,
+        fanout_cap: int = 16,
+        h0_consistency: bool = True,
+        evolve_fallback: Optional[Decomposer] = None,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -160,7 +169,30 @@ class DagDriver:
         # `.authoritative` attribute. Runs once after the root is proven (formalize -> Lean audit ->
         # faithfulness). See agent/orchestrator/formalize_bridge.make_terminal_gate.
         self.terminal_gate = terminal_gate
-        self.dag = ProofDAG()
+        # Split-keyed memo (T100 P1 item 4): the DAG is keyed on (semantic_goal_hash,
+        # proof_context_hash). A PROVEN minted under this toolkit/gate/denylist context is shared
+        # across branches; a context change invalidates a stale PROVEN. The context hash is computed
+        # ONCE from the loaded toolkit and stamped onto every certificate the DAG mints.
+        self.context_hash = proof_context_hash(self.toolkit)
+        self.dag = ProofDAG(context=self.context_hash)
+        # P2 (forge_relevance_study §7): the SAFE parallel fan-out CAP for proving committed AND
+        # children. The number of children proved in one wave is bounded by the Dilworth antichain
+        # WIDTH of the open, all-deps-met children (a deep chain -> width 1, never over-spawn) AND a
+        # budget-derived limit AND this operator ceiling. Scheduling-only: width-bounded rank-ordered
+        # waves yield the SAME proven/failed result as the old serial loop (order-independent).
+        self.fanout_cap = max(1, int(fanout_cap))
+        # H0 child-consistency gate (forge_relevance_study §4.3.4): before an AND-node is promoted by
+        # composing its children, the children's assumption/binding/lemma signatures must agree on
+        # overlaps (a 0-cocycle check). A sibling proven under a hypothesis that CONTRADICTS another's
+        # is unsound to compose even though each child passed locally.
+        self.h0_consistency = h0_consistency
+        # OpenEvolve FALLBACK decomposer (P3 / brief §9 #1, openevolve_stacking_brief §9 P2): fires ONLY
+        # on STUCK nodes (after the normal direct + decomposer attempts have all failed). A flag-gated,
+        # OPTIONAL Decomposer (typically OpenEvolveBackend). Its evolved blueprint is committed ONLY if
+        # it is goal-bound and its obligations are discharged — reusing the SAME Phase-1 binding +
+        # acyclicity/strict-simpler-child + H0 checks as a normal decomposition (no weaker gate). None =>
+        # disabled (graceful no-op); also a no-op if the backend reports itself unavailable.
+        self.evolve_fallback = evolve_fallback
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
@@ -181,6 +213,29 @@ class DagDriver:
         return DagResult(goal=goal, proven=proven, dag=self.dag, trace=self.trace,
                          budget=self.budget, terminal=terminal)
 
+    # ---- direct-attempt outcome -> FSM event classification -----------------------------------
+    def _direct_event(self, res: RalphResult, goal: str) -> NodeEvent:
+        """Map a Ralph direct-attempt result to the NodeEvent the FSM table decides on.
+
+        Order matters: a goal<->claim mismatch on a 'successful' ledger is a soundness failure that
+        overrides success; a NEEDS_REVIEW-no-judge exhaustion is a *producible* state (decompose),
+        distinct from a genuine budget starvation (exhaust)."""
+        if res.success:
+            if not _proves_goal(res.ledger, goal):
+                return NodeEvent.GoalClaimMismatch
+            return NodeEvent.DirectProven
+        if res.exhausted:
+            # Distinguish "needs a producer" from genuine starvation. The Ralph loop sets exhausted on
+            # a NEEDS_REVIEW-with-no-judge (review_unhandled): that is NOT starvation — it needs a
+            # decomposition/producer. Reserve DirectExhaustedBudget for true budget starvation.
+            if (res.report is not None and res.report.verdict is Verdict.NEEDS_REVIEW
+                    and not self.judges):
+                return NodeEvent.DirectNeedsReviewNoJudge
+            return NodeEvent.DirectExhaustedBudget
+        # Plain failure (gate rejects / judge gaps that did not exhaust budget): a real gap to try to
+        # producer around via decomposition.
+        return NodeEvent.DirectRejected
+
     def _prove(self, goal: str, ancestors: set[str], depth: int) -> bool:
         node = self.dag.get_or_create(goal)
         key = node.key
@@ -197,14 +252,18 @@ class DagDriver:
         if key in ancestors:               # cycle (defensive; commit guards this too)
             return False
         if depth > self.max_depth:
-            # A depth-limit failure is limit-induced, not a real gap: record it as the non-terminal
-            # EXHAUSTED state (and leave the node re-attemptable) so the memo check above does NOT
-            # permanently block this same goal on a shallower branch (depth-limit cache poisoning).
+            # Decide via the FSM: a depth-limit hit on an IN_PROGRESS node -> EXHAUSTED (limit-induced,
+            # retryable on a shallower branch), carrying the depth_limit reason code. Leaving it
+            # re-attemptable means the memo check above does NOT poison a shallower retry of this goal.
+            _state, action = node_transition(NodeState.IN_PROGRESS, NodeEvent.DepthLimit)
+            assert action is Action.EXHAUST_STARVED
             if not node.proven:
-                node.state = NodeState.EXHAUSTED
-            self.trace.emit("depth_limit", goal=goal[:80], depth=depth)
+                self.dag.mark_exhausted(goal, reason=ReasonCode.depth_limit.value)
+            self.trace.emit("depth_limit", goal=goal[:80], depth=depth,
+                            reason=ReasonCode.depth_limit.value)
             return False
         if not self.budget.can_call():
+            self.dag.mark_exhausted(goal, reason=ReasonCode.budget_starved.value)
             self.trace.emit("budget", reason="llm_calls", **self.budget.snapshot())
             return False
 
@@ -215,40 +274,88 @@ class DagDriver:
                           trace=self.trace, max_episodes=self.ralph_episodes, judges=self.judges)
         res = ralph.run(goal)
         node.attempts += res.episodes
-        if res.success:
-            # Soundness: a directly-produced ledger must actually conclude THIS node's goal. A ledger
-            # that proves a different statement (claim deep-hash != goal) is not a proof of this node.
-            if not _proves_goal(res.ledger, goal):
-                self.trace.emit("goal_claim_mismatch", goal=goal[:80], proof_kind="direct")
-                self.dag.mark_failed(goal)
-                return False
+
+        # DECIDE the next move via the TOTAL FSM table; the orchestrator EXECUTES the returned Action.
+        event = self._direct_event(res, goal)
+        _next, action = node_transition(NodeState.IN_PROGRESS, event)
+
+        if action is Action.ACCEPT_PROVEN:
+            # A directly-proven, goal-bound ledger. Before promoting, route a NEEDS_REVIEW proof
+            # through the INDEPENDENT adversarial verifier (downgrade-don't-discard).
+            if res.report is not None and res.report.verdict is Verdict.NEEDS_REVIEW:
+                if not self._verify_or_downgrade(goal, res):
+                    return False
             ledger = self._refine(goal, res.ledger)   # Autoreason tournament (no-regression refine)
             self.dag.mark_proven_direct(goal, ledger)
             self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
             return True
-        if res.exhausted:
-            self.dag.mark_failed(goal)
+
+        if action is Action.MARK_FAILED_GAP and event is NodeEvent.GoalClaimMismatch:
+            self.trace.emit("goal_claim_mismatch", goal=goal[:80], proof_kind="direct",
+                            reason=ReasonCode.gap_found.value)
+            self.dag.mark_failed(goal, reason=ReasonCode.gap_found.value)
             return False
 
-        # 2. Decomposition (LEAP), with reviewer gating + backtracking. The FIRST plan is free; each
-        #    further re-plan consumes the global replan budget, so re-decomposition is bounded both
-        #    per-node (max_decomp_attempts) and globally (Budget.max_replan_depth).
+        if action is Action.EXHAUST_STARVED:
+            # Genuine starvation on the direct attempt: no budget left to even decompose.
+            self.dag.mark_exhausted(goal, reason=ReasonCode.budget_starved.value)
+            self.trace.emit("budget", reason="llm_calls_direct", goal=goal[:80],
+                            **self.budget.snapshot())
+            return False
+
+        # The remaining direct-attempt actions (DirectRejected / DirectNeedsReviewNoJudge) BOTH route
+        # to DECOMPOSE. The bug-fix is here: a NEEDS_REVIEW-no-judge exhaustion is a *producible*
+        # state, so it falls through to the decomposition path instead of terminating.
+        assert action is Action.DECOMPOSE, f"unexpected action {action!r} for event {event!r}"
+        if event is NodeEvent.DirectNeedsReviewNoJudge:
+            # ADVERSARIAL VERIFIER + DOWNGRADE-DON'T-DISCARD: route the NEEDS_REVIEW direct proof
+            # through the INDEPENDENT refuting check FIRST. If it refutes (or its inspection is
+            # vacuous), the node is FAILED_ELEMENTARY recording the SPECIFIC offending step — a logged
+            # gap, not a silent discard. If it CANNOT refute, the proof is still unreviewed, so we do
+            # not promote it directly: we suspend and route to a producer (decomposition).
+            if not self._verify_or_downgrade(goal, res):
+                # Re-feed a DirectNeedsReviewNoJudge node through the FSM as an ElementaryViolation so
+                # the terminal state is decided by the table (FAILED_ELEMENTARY), not ad hoc here.
+                _s, vaction = node_transition(NodeState.IN_PROGRESS, NodeEvent.ElementaryViolation)
+                assert vaction is Action.MARK_FAILED_ELEMENTARY
+                return False
+            self.trace.emit("route_decompose", goal=goal[:80],
+                            reason=ReasonCode.needs_review_no_reviewer.value)
+
+        return self._decompose(goal, res, ancestors, key, depth, direct_event=event)
+
+    def _decompose(self, goal: str, res: RalphResult, ancestors: set[str], key: str,
+                   depth: int, direct_event: NodeEvent) -> bool:
+        """Execute the DECOMPOSE action: ask a producer (decomposer) for a blueprint and recurse,
+        with reviewer gating + bounded re-planning. Returns True iff the node proved via children.
+
+        Every terminal give-up here is classified with a ReasonCode so nothing gives up unclassified
+        (T100 P1 item 3)."""
+        # No producer at all -> genuine starvation for this node. Classify WHY: if the direct attempt
+        # only stalled on missing review, the reason is 'needs_review_no_reviewer'; else 'decomposer_absent'.
         if self.decomposer is None:
-            self.dag.mark_failed(goal)
+            reason = (ReasonCode.needs_review_no_reviewer.value
+                      if direct_event is NodeEvent.DirectNeedsReviewNoJudge
+                      else ReasonCode.decomposer_absent.value)
+            self.dag.mark_failed(goal, reason=reason)
+            self.trace.emit("decomposer_absent", goal=goal[:80], reason=reason)
             return False
 
         feedback = list(res.lessons)
         child_ancestors = ancestors | {key}
+        last_reason = ReasonCode.gap_found.value
 
         for attempt in range(self.max_decomp_attempts):
             if attempt > 0:                                   # attempts after the first are re-plans
                 if not self.budget.can_replan():
                     self.trace.emit("replan_exhausted", goal=goal[:80],
                                     replans=self.budget.replans_spent)
+                    last_reason = ReasonCode.budget_starved.value
                     break
                 self.budget.spend_replan()
                 self.trace.emit("replan", goal=goal[:80], replan=self.budget.replans_spent)
             if not self.budget.can_call():
+                last_reason = ReasonCode.budget_starved.value
                 break
             if self.population_k and self.comparator is not None:
                 if self._prove_via_population(goal, feedback, child_ancestors, depth):
@@ -257,18 +364,120 @@ class DagDriver:
                 self.budget.spend_call()
                 sketch, children = self.decomposer.decompose(goal, feedback or None)
                 self.trace.emit("decompose", goal=goal[:80], children=len(children))
-                ok, notes = self._try_decomposition(goal, sketch, children, child_ancestors, depth)
+                ok, notes, reason = self._try_decomposition(goal, sketch, children,
+                                                            child_ancestors, depth)
                 if ok:
                     return True
+                last_reason = reason or last_reason
                 feedback = notes + feedback
 
-        self.dag.mark_failed(goal)
+        # STUCK node: the direct attempt failed AND every normal decomposition attempt failed. As a LAST
+        # resort fire the OpenEvolve fallback decomposer (flag-gated). Its evolved blueprint is committed
+        # ONLY through the SAME _try_decomposition gate (goal-binding + acyclicity + strict-simpler-child
+        # + sketch validity + H0) plus an explicit goal-bound + obligation-discharge pre-check, so a
+        # gameable blueprint can never be committed. Graceful no-op if the backend is unavailable.
+        if self._evolve_fallback_available() and self.budget.can_call():
+            if self._try_evolve_fallback(goal, feedback, child_ancestors, depth):
+                return True
+
+        # Classify the terminal outcome via the FSM table so the state is the table's, not ad hoc:
+        #   * a BUDGET-starved give-up (every decomposition attempt was blocked by an empty LLM-call /
+        #     re-plan budget, not by a real logical gap) is LIMIT-INDUCED -> EXHAUSTED (retryable on a
+        #     later run with more budget). Routing it to mark_failed (FAILED_GAP) here would POISON the
+        #     split-keyed memo: a PROVABLE goal would be permanently reported unprovable even after the
+        #     budget is refilled. The direct-attempt EXHAUST_STARVED arm (DirectExhaustedBudget) already
+        #     does this; a decomposition starvation is the same limit-induced class.
+        #   * an exclusively-elementary-violation failure is a real-but-non-elementary outcome
+        #     (FAILED_ELEMENTARY);
+        #   * any other classified gap (a genuine gap with a producer present and budget remaining) stays
+        #     terminal FAILED_GAP.
+        if last_reason == ReasonCode.budget_starved.value:
+            _s, baction = node_transition(NodeState.IN_PROGRESS, NodeEvent.DirectExhaustedBudget)
+            assert baction is Action.EXHAUST_STARVED
+            self.dag.mark_exhausted(goal, reason=last_reason)
+            self.trace.emit("budget", reason="llm_calls_decompose", goal=goal[:80],
+                            **self.budget.snapshot())
+        elif last_reason == ReasonCode.elementary_violation.value:
+            _s, vaction = node_transition(NodeState.IN_PROGRESS, NodeEvent.ElementaryViolation)
+            assert vaction is Action.MARK_FAILED_ELEMENTARY
+            self.dag.mark_failed(goal, elementary=True, reason=last_reason)
+        else:
+            self.dag.mark_failed(goal, reason=last_reason)
         return False
 
+    def _evolve_fallback_available(self) -> bool:
+        """True iff an OpenEvolve fallback decomposer is configured AND reports itself available.
+
+        Decoupled + graceful: a backend exposing ``available()`` that returns False (e.g. the optional
+        ``openevolve`` package is not installed) is treated as a no-op fallback, never an error."""
+        fb = self.evolve_fallback
+        if fb is None:
+            return False
+        avail = getattr(fb, "available", None)
+        if callable(avail):
+            try:
+                return bool(avail())
+            except Exception:
+                return False
+        return True
+
+    def _blueprint_is_goal_bound_and_discharged(self, goal: str, sketch: str,
+                                                children: list[str]) -> bool:
+        """DETERMINISTIC pre-check for a fallback blueprint: goal-bound (claim+conclusion bind by
+        ``goal_hash``, non-vacuous) AND obligations discharged (the sketch's ``lemma`` steps EXACTLY
+        match the declared child goals). Reuses the bridge's pure ``binds_to_goal``/``is_vacuous`` so the
+        fallback applies the SAME non-gameable binding as the evolutionary fitness and the Elo pre-gate.
+        A blueprint failing this is NEVER committed (the brief's hard requirement for evolved output)."""
+        try:
+            from agent.tools.openevolve_bridge import binds_to_goal, is_vacuous
+        except Exception:
+            return False
+        try:
+            led = parse_ledger(sketch)
+        except LedgerError:
+            return False
+        if not binds_to_goal(led, goal) or is_vacuous(led):
+            return False
+        lemma_keys = _lemma_claims(sketch)
+        if lemma_keys is None:
+            return False
+        return bool(children) and lemma_keys == {goal_hash(cg) for cg in children}
+
+    def _try_evolve_fallback(self, goal: str, feedback: list[str], child_ancestors: set[str],
+                             depth: int) -> bool:
+        """Fire the OpenEvolve fallback decomposer on a STUCK node and try to commit its blueprint.
+
+        Spends one call, asks the fallback for an evolved blueprint, and commits it ONLY if it passes
+        the deterministic goal-bound + obligation-discharge pre-check AND the full _try_decomposition
+        gate (acyclicity / strict-simpler-child / sketch validity / H0). Returns True iff the node proved
+        via the evolved blueprint. Any backend exception is a graceful failure (the node stays stuck)."""
+        self.budget.spend_call()
+        try:
+            sketch, children = self.evolve_fallback.decompose(goal, feedback or None)
+        except Exception as e:
+            self.trace.emit("evolve_fallback_error", goal=goal[:80], detail=str(e)[:120])
+            return False
+        # HARD pre-gate: a non-goal-bound / obligation-undischarged evolved blueprint is never committed.
+        if not self._blueprint_is_goal_bound_and_discharged(goal, sketch, children):
+            self.trace.emit("evolve_fallback_rejected", goal=goal[:80],
+                            children=len(children) if children else 0,
+                            reason=ReasonCode.gap_found.value)
+            return False
+        self.trace.emit("evolve_fallback", goal=goal[:80], children=len(children))
+        ok, _notes, _reason = self._try_decomposition(goal, sketch, children, child_ancestors, depth)
+        if ok:
+            self.trace.emit("prove_node", goal=goal[:80], proof_kind="evolve_fallback")
+        return ok
+
     def _refine(self, goal: str, ledger: str) -> str:
-        """Optionally refine a directly-proven ledger via the incumbent tournament. Monotone: the
+        """Optionally refine a proven champion via the AutoReason incumbent tournament. Monotone: the
         returned ledger is never worse than the input (a challenger must beat it on a blind panel AND
-        stay elementary to displace it)."""
+        stay elementary to displace it).
+
+        EXPLORE/EXPLOIT separation (P3 / brief §9 #6): this is the *exploit* stage that runs AFTER the
+        *explore* stage (OpenEvolve/search produced the champion). The refined output is registered with
+        the explore/exploit barrier so it can NEVER be fed back into the OpenEvolve evolutionary archive
+        as a seed — the two stages stay strictly one-directional (explore -> exploit, never back)."""
         if self.refiner is None or not self.budget.can_call():
             return ledger
         try:
@@ -278,7 +487,20 @@ class DagDriver:
         if result.changed:
             self.trace.emit("refine", goal=goal[:80], passes=result.passes,
                             displacements=result.displacements)
+            # Bar the refined (exploit-side) artifact from ever re-seeding the explore archive.
+            self._bar_from_archive(result.content)
         return result.content
+
+    def _bar_from_archive(self, refined: str) -> None:
+        """Register an AutoReason-refined artifact with the explore/exploit barrier (one-directional).
+
+        Best-effort + decoupled: if the optional evolve bridge is absent, the barrier simply does not
+        exist and there is nothing to register against — the separation is vacuously held."""
+        try:
+            from agent.tools.openevolve_bridge import explore_exploit_barrier
+        except Exception:
+            return
+        explore_exploit_barrier().mark_refined(refined)
 
     def _is_admissible(self, ledger: str) -> bool:
         """A candidate proof is admissible iff it passes the deterministic + soft gate (not rejected).
@@ -288,49 +510,96 @@ class DagDriver:
         except Exception:
             return False
 
+    def _verify_or_downgrade(self, goal: str, res: RalphResult) -> bool:
+        """Route a NEEDS_REVIEW direct proof through the INDEPENDENT adversarial verifier
+        (downgrade-don't-discard). Returns True if the proof survives refutation (may be promoted),
+        False if it was refuted -> the node is FAILED_ELEMENTARY recording the SPECIFIC offending step
+        (a logged gap, never a silent discard).
+
+        ANTI-VACUITY: a vacuous inspection (empty/unparseable ledger) FAILS LOUD — it is treated as a
+        refutation (FAILED_ELEMENTARY), never as a pass."""
+        source = res.report.ledger if (res.report and res.report.ledger is not None) else res.ledger
+        try:
+            verdict = refute_elementary(source, self.toolkit, goal=goal)
+        except VacuousVerificationError as e:
+            # Fail loud: the verifier had nothing to inspect -> do NOT promote. Mark FAILED_ELEMENTARY.
+            self.dag.mark_failed(goal, elementary=True,
+                                 reason=ReasonCode.elementary_violation.value)
+            self.trace.emit("verifier_vacuous", goal=goal[:80], detail=str(e),
+                            reason=ReasonCode.elementary_violation.value)
+            return False
+        if verdict.refuted:
+            self.dag.mark_failed(goal, elementary=True,
+                                 reason=ReasonCode.elementary_violation.value)
+            self.trace.emit("verifier_refuted", goal=goal[:80], step=verdict.offending_step,
+                            detail=verdict.summary(), reason=ReasonCode.elementary_violation.value)
+            return False
+        self.trace.emit("verifier_passed", goal=goal[:80], inspected=verdict.inspected_steps)
+        return True
+
     def _try_decomposition(self, goal: str, sketch: str, children: list[str],
-                           child_ancestors: set[str], depth: int) -> tuple[bool, list[str]]:
-        """Validate + commit + recurse one candidate decomposition. Returns (success, feedback)."""
+                           child_ancestors: set[str], depth: int) -> tuple[bool, list[str], Optional[str]]:
+        """Validate + commit + recurse one candidate decomposition. Returns (success, feedback, reason)
+        where `reason` is a ReasonCode.value classifying why this candidate failed (None on success)."""
         if not children:
-            return False, ["decomposition proposed no sub-lemmas"]
+            return False, ["decomposition proposed no sub-lemmas"], ReasonCode.gap_found.value
 
         # The sketch's `lemma` steps must exactly match the declared children (honest decomposition).
         claims = _lemma_claims(sketch)
         if claims is None:
-            return False, ["decomposition sketch did not parse as a ledger"]
+            return (False, ["decomposition sketch did not parse as a ledger"],
+                    ReasonCode.gap_found.value)
         if claims != {goal_hash(c) for c in children}:
-            return False, ["sketch `lemma` steps do not match the declared child goals"]
+            return (False, ["sketch `lemma` steps do not match the declared child goals"],
+                    ReasonCode.gap_found.value)
 
         # LEAP reviewer + elementary judge (before committing).
         if self.reviewer is not None:
             if not self.budget.can_call():
-                return False, ["budget exhausted before review"]
+                return (False, ["budget exhausted before review"], ReasonCode.budget_starved.value)
             self.budget.spend_call()
             review = self.reviewer.review(goal, sketch, children)
             self.trace.emit("review", goal=goal[:80], useful=review.useful,
                             elementary=review.elementary)
             if not review.ok:
-                return False, review.notes
+                reason = (ReasonCode.elementary_violation.value if not review.elementary
+                          else ReasonCode.gap_found.value)
+                return False, review.notes, reason
 
         # Acyclicity guard.
         if self.dag.would_create_cycle(goal, children, child_ancestors):
-            return False, ["proposed decomposition is cyclic"]
+            return (False, ["proposed decomposition is cyclic"],
+                    ReasonCode.cyclic_decomposition.value)
 
         # The sketch itself must be a valid ledger (children admitted via `lemma` steps).
         sketch_report = evaluate(sketch, self.toolkit)
         if sketch_report.rejected:
-            return False, [str(f) for f in sketch_report.rejects()]
-        # Fail closed: a NEEDS_REVIEW sketch (e.g. an elastic justification routed to Layer 2) with no
-        # reviewer to resolve it must NOT be admitted as a valid decomposition — mirror the direct
-        # node's review-unhandled guard.
+            return False, [str(f) for f in sketch_report.rejects()], ReasonCode.gap_found.value
+        # Fail closed: a NEEDS_REVIEW sketch (e.g. an elastic justification routed to Layer 2) must be
+        # adjudicated. With no reviewer, the OLD behaviour rejected outright. Now the INDEPENDENT
+        # adversarial verifier gets a refuting pass first: an undischarged-elastic / denylist-prose /
+        # goal-binding violation is a SPECIFIC elementary refutation (downgrade-don't-discard); only an
+        # un-refuted-but-still-unreviewed sketch is rejected as needing a reviewer.
         if sketch_report.verdict is Verdict.NEEDS_REVIEW and self.reviewer is None:
-            return False, ["decomposition sketch needs Layer-2 review but no reviewer is configured"]
+            try:
+                vr = refute_elementary(sketch_report.ledger or sketch, self.toolkit, goal=goal)
+            except VacuousVerificationError:
+                return (False, ["decomposition sketch verification was vacuous"],
+                        ReasonCode.elementary_violation.value)
+            if vr.refuted:
+                self.trace.emit("verifier_refuted", goal=goal[:80], step=vr.offending_step,
+                                detail=vr.summary(), proof_kind="decomposition",
+                                reason=ReasonCode.elementary_violation.value)
+                return False, [str(r) for r in vr.refutations], ReasonCode.elementary_violation.value
+            return (False, ["decomposition sketch needs Layer-2 review but no reviewer is configured"],
+                    ReasonCode.needs_review_no_reviewer.value)
 
         # Soundness: the sketch must conclude THIS goal. If its conclusion proves a different
         # statement than the parent goal, the decomposition is not a valid plan for this node.
         concl = _conclusion_claim(sketch)
         if concl is None or goal_hash(concl) != goal_hash(goal):
-            return False, ["sketch conclusion does not prove the parent goal"]
+            return (False, ["sketch conclusion does not prove the parent goal"],
+                    ReasonCode.gap_found.value)
 
         # Snapshot the node so the commit can be rolled back if a child fails to prove. Committing
         # before recursion lets the acyclicity guard see the in-flight edges, but a child failure must
@@ -342,19 +611,234 @@ class DagDriver:
         try:
             self.dag.commit_decomposition(goal, sketch, children, child_ancestors)
         except CycleError:
-            return False, ["commit detected a cycle"]
+            return False, ["commit detected a cycle"], ReasonCode.cyclic_decomposition.value
 
-        # Recurse on children (DFS).
-        for child_goal in children:
-            if not self._prove(child_goal, child_ancestors, depth + 1):
-                self.trace.emit("backtrack", goal=goal[:80])
-                # Roll back the (uncompleted) commit so no stale decomposition lingers on the node.
-                node.proof, node.proof_kind = prev_proof, prev_kind
-                node.children, node.state = prev_children, prev_state
-                return False, []
+        # Prove the committed AND children in width-bounded waves ordered by upward_rank (deepest
+        # critical chain first), the Dilworth antichain width capping the parallel fan-out. This is
+        # SCHEDULING-ONLY and BEHAVIOR-PRESERVING: each `_prove` is idempotent (memoized), child
+        # results are order-independent, and we still short-circuit on the first failure exactly like
+        # the old serial for-loop -> the SAME proven/failed outcome, only the visitation order/grouping
+        # changes. (Used ONLY for committed AND children — never to pick among OR alternatives.)
+        child_ok, child_reason = self._prove_and_children(goal, children, child_ancestors, depth)
+        if not child_ok:
+            self.trace.emit("backtrack", goal=goal[:80], child_reason=child_reason)
+            # Roll back the (uncompleted) commit so no stale decomposition lingers on the node.
+            node.proof, node.proof_kind = prev_proof, prev_kind
+            node.children, node.state = prev_children, prev_state
+            # V1 FIX: propagate the failing CHILD's REAL reason instead of hardcoding gap_found. A
+            # committed child that only EXHAUSTED on a LIMIT (budget_starved / depth_limit) is NOT a
+            # genuine logical gap in the parent's plan — it is retryable. Hardcoding gap_found here
+            # made the caller route the PROVABLE parent to terminal FAILED_GAP, permanently poisoning
+            # the split-keyed memo so a budget-refilled retry of the SAME goal could never prove it
+            # (e.g. with max_decomp_attempts=1, a single budget-starved child sank the parent forever).
+            # The caller (_decompose) routes a budget_starved reason to mark_exhausted (retryable
+            # EXHAUSTED); a genuine child gap stays gap_found -> the parent's terminal FAILED_GAP.
+            return False, [], child_reason or ReasonCode.gap_found.value
+
+        # H0 child-consistency gate (0-cocycle / global-section check) BEFORE composing the children
+        # into the parent's proof. Each child passed LOCALLY; this checks they agree on overlaps so the
+        # composition has a consistent global section. A contradiction (e.g. one child assumes `n is
+        # even`, a sibling `n is odd`) is unsound to compose -> do NOT promote: mark FAILED_ELEMENTARY.
+        h0 = self._check_h0_consistency(goal, children)
+        if h0 is not None and not h0.consistent:
+            node.proof, node.proof_kind = prev_proof, prev_kind
+            node.children, node.state = prev_children, prev_state
+            self.trace.emit("h0_violation", goal=goal[:80], overlap=h0.offending_overlap,
+                            detail=h0.summary(), reason=ReasonCode.elementary_violation.value)
+            return False, [str(c) for c in h0.conflicts] or [h0.summary()], \
+                ReasonCode.elementary_violation.value
+
         self.dag.mark_proven_via_children(goal)
         self.trace.emit("prove_node", goal=goal[:80], proof_kind="decomposition")
-        return True, []
+        return True, [], None
+
+    # ---- next_producers leverage = fan-in x critical-path depth (P3 / §7) -----------------------
+    def _fan_in(self, keys: list[str]) -> dict[str, int]:
+        """In-degree of each key = the number of DISTINCT parent nodes that cite this node as a child
+        (i.e. how many decomposition branches share this ``semantic_goal_hash``). Memoization makes one
+        proven lemma reusable across ALL branches, so a high fan-in lemma is a high-leverage producer.
+        Computed over the WHOLE DAG (not just ``keys``) so a shared lemma's true fan-in is seen."""
+        keyset = set(keys)
+        parents: dict[str, set[str]] = {k: set() for k in keys}
+        for parent_key, node in self.dag.nodes.items():
+            for ckey in node.children:
+                if ckey in keyset:
+                    parents[ckey].add(parent_key)
+        return {k: len(parents[k]) for k in keys}
+
+    def _subtree_depth(self, key: str) -> int:
+        """Critical-path depth = the longest chain of committed sub-lemmas BENEATH ``key`` in the FULL
+        DAG (a leaf with no sub-lemmas has depth 0). Iterative DFS with a visited-guard so a (defensive)
+        cycle cannot loop forever; memoization keeps it linear over the committed decomposition edges.
+        Computed over the WHOLE DAG so a node's true critical-path depth is seen even when its
+        descendants are not in the candidate set being ranked."""
+        memo: dict[str, int] = {}
+
+        def depth(k: str, stack: frozenset) -> int:
+            if k in memo:
+                return memo[k]
+            node = self.dag.get(k)
+            if node is None or k in stack or not node.children:
+                return 0
+            d = 1 + max((depth(c, stack | {k}) for c in node.children), default=0)
+            memo[k] = d
+            return d
+
+        return depth(key, frozenset())
+
+    def _critical_path_depths(self, keys: list[str]) -> dict[str, int]:
+        return {k: self._subtree_depth(k) for k in keys}
+
+    def leverage_over_dag(self, keys: list[str]) -> dict[str, int]:
+        """Leverage of each OPEN shared sub-lemma = fan-in (#distinct parents citing it) MULTIPLIED BY
+        its critical-path depth (longest committed sub-lemma chain beneath it in the FULL DAG) (P3 / §7).
+
+        Fan-in ALONE lets a shallow high-fan-in lemma starve a deep critical chain; weighting leverage
+        by critical-path depth fixes that — a deep critical-path lemma can out-rank a shallow high-fan-in
+        one. A lemma with depth 0 (a leaf with no sub-lemmas below it) still gets a baseline leverage of
+        its fan-in (we use ``depth + 1`` so a leaf is not zeroed out, but a deeper node strictly dominates
+        an equally-fanned-in shallower node). Returns ``{key: leverage}`` over exactly ``keys``."""
+        if not keys:
+            return {}
+        depths = self._critical_path_depths(keys)
+        fan_in = self._fan_in(keys)
+        # leverage = fan_in * (depth + 1): multiplicative, monotone in BOTH fan-in and depth, so a deep
+        # critical chain is not starved by a shallow high-fan-in lemma.
+        return {k: fan_in.get(k, 0) * (depths.get(k, 0) + 1) for k in keys}
+
+    def order_open_lemmas_by_leverage(self, keys: list[str]) -> list[str]:
+        """The OPEN shared sub-lemmas ordered so a deep CRITICAL chain is scheduled FIRST (never starved
+        by a shallow high-fan-in lemma).
+
+        CRITICAL-PATH GUARD (P3 / §7 invariant): the multiplicative leverage `fan_in*(depth+1)` ALONE
+        still lets a shallow high-fan-in lemma (fan_in 5, depth 0 -> 5) out-rank a deeper critical chain
+        (fan_in 1, depth 3 -> 4), contradicting the invariant 'a high-fan-in shallow lemma does NOT
+        starve a deep critical chain'. So the PRIMARY ordering key is the critical-path DEPTH (the
+        irreducible-sequential length below the lemma — the part that cannot be parallelized away);
+        leverage (fan_in x depth) breaks ties among equally-deep lemmas, then key for stability. A deep
+        critical lemma therefore always sorts ahead of a shallower one regardless of fan-in.
+
+        Results are ORDER-INDEPENDENT (an AND-node needs EVERY child proven), so this only changes the
+        visitation order, never which goals prove — serial/parallel parity is preserved."""
+        if not keys:
+            return []
+        lev = self.leverage_over_dag(keys)
+        depths = self._critical_path_depths(keys)
+        # Primary: deepest critical path first (protect the irreducible-sequential chain). Then leverage
+        # (fan-in x depth) among equal-depth lemmas. Then key for a stable, deterministic order.
+        return sorted(keys, key=lambda k: (-depths.get(k, 0), -lev.get(k, 0), k))
+
+    # ---- width-bounded, rank-ordered AND-children scheduling ------------------------------------
+    def _and_child_precedence(self, children: list[str]) -> list[tuple[str, str]]:
+        """Precedence edges among the committed AND children for the Dilworth/rank computation. An
+        edge `(u, v)` ("u precedes v") exists iff child `v` already (transitively, via committed
+        decomposition edges) NEEDS child `u` — i.e. u is a sub-lemma of v in the current DAG, so u must
+        prove before v. For a flat decomposition this is empty (the children are precedence-independent
+        by construction -> the acyclicity guard) so the width is exactly the child count. A genuine
+        chain among shared sub-lemmas yields edges -> width collapses toward 1 (don't over-spawn)."""
+        keys = {c: goal_hash(c) for c in children}
+        edges: list[tuple[str, str]] = []
+        for v in children:
+            for u in children:
+                if u is v:
+                    continue
+                # v's subtree reaches u  =>  u must be proven before v  =>  edge u -> v.
+                if self.dag.reaches(keys[v], keys[u]):
+                    edges.append((u, v))
+        return edges
+
+    def _budget_fanout_limit(self) -> int:
+        """A budget-derived ceiling on concurrent child-proving: never schedule a wave wider than the
+        remaining LLM-call budget could service. Keeps budget/rate-limit caps as scheduler inputs
+        (forge_relevance_study §7) rather than only CPU cores. At least 1 so progress is always made."""
+        remaining = self.budget.max_llm_calls - self.budget.calls_spent
+        return max(1, remaining)
+
+    def _failing_child_reason(self, child_goal: str) -> str:
+        """Classify WHY a committed child failed, read from the child node the driver just left behind.
+
+        A child left EXHAUSTED (budget_starved / depth_limit) is a LIMIT-induced failure: the parent's
+        plan is NOT a genuine gap, so we propagate budget_starved (retryable) up so the parent is
+        EXHAUSTED, not poisoned to terminal FAILED_GAP (V1). A child terminally FAILED (a real gap /
+        non-elementary) propagates its own gap/elementary reason. A missing/odd node defaults to a
+        genuine gap (never spuriously retryable)."""
+        node = self.dag.get(goal_hash(child_goal))
+        if node is None:
+            return ReasonCode.gap_found.value
+        if node.state is NodeState.EXHAUSTED:
+            # EXHAUSTED is only ever reached via a LIMIT (budget_starved / depth_limit) — both retryable.
+            # Normalize to budget_starved so the parent classifier in _decompose routes it to
+            # mark_exhausted (a retryable EXHAUSTED parent), never to a terminal FAILED_GAP (V1).
+            return ReasonCode.budget_starved.value
+        if node.state is NodeState.FAILED_ELEMENTARY:
+            return ReasonCode.elementary_violation.value
+        # FAILED_GAP / IN_PROGRESS / anything else -> a genuine gap for this plan.
+        return node.reason or ReasonCode.gap_found.value
+
+    def _prove_and_children(self, goal: str, children: list[str], child_ancestors: set[str],
+                            depth: int) -> tuple[bool, Optional[str]]:
+        """Prove every committed AND child, scheduling them in width-bounded waves ordered DEPTH-FIRST
+        (the critical-path guard), the Dilworth antichain width capping the parallel fan-out. Returns
+        ``(all_proven, failing_reason)``: ``(True, None)`` iff ALL children proved; on the first failure
+        ``(False, <ReasonCode.value>)`` carrying the failing child's REAL reason (V1 propagation).
+        Short-circuits on the first failure (same as the serial loop). Behavior-preserving on
+        deterministic stubs (only the visitation order/grouping changes; results are order-independent).
+
+        CRITICAL-PATH GUARD (V5 / P3 §7): the scheduler orders children DEPTH-PRIMARY — the same
+        (-critical_path_depth, -leverage, key) order as ``order_open_lemmas_by_leverage`` — so a deep
+        critical chain is visited NO LATER than a shallow high-fan-in lemma. Leverage = fan-in x
+        (critical-path depth + 1) ALONE still lets a shallow high-fan-in lemma out-rank a deeper chain;
+        making critical-path DEPTH the primary key fixes that. Results are order-independent (an AND-node
+        needs EVERY child proven), so this only changes the visitation order, never which goals prove —
+        serial/parallel parity is preserved."""
+        edges = self._and_child_precedence(children)
+        try:
+            width = dilworth_width(children, edges)
+        except CyclicPosetError:
+            # Defensive: the committed children should be acyclic (commit guards it). If they are not,
+            # fall back to the serial order rather than guessing a width.
+            width = 1
+        ranks = upward_rank(children, edges)
+        # Cap = min(antichain width, budget-derived limit, operator ceiling). A deep chain -> width 1.
+        cap = max(1, min(width, self._budget_fanout_limit(), self.fanout_cap))
+        # DEPTH-PRIMARY critical-path order (V5): protect the irreducible-sequential chain. Primary key
+        # is the critical-path DEPTH over the committed DAG; leverage (fan-in x depth) breaks ties among
+        # equal-depth children; within-decomposition upward_rank then goal text for a stable order.
+        ckeys = {c: goal_hash(c) for c in children}
+        child_keys = [ckeys[c] for c in children]
+        depths = self._critical_path_depths(child_keys)
+        lev = self.leverage_over_dag(child_keys)
+        ordered = sorted(
+            children,
+            key=lambda c: (-depths.get(ckeys[c], 0), -lev.get(ckeys[c], 0), -ranks.get(c, 0), c))
+        self.trace.emit("and_fanout", goal=goal[:80], children=len(children),
+                        width=width, cap=cap, max_rank=max(ranks.values(), default=0),
+                        max_leverage=max(lev.values(), default=0),
+                        max_depth=max(depths.values(), default=0))
+        # Width-bounded waves. Proving is order-independent and idempotent, so grouping into waves of
+        # size <= cap yields the same result as proving them one-by-one; we short-circuit on first fail.
+        for start in range(0, len(ordered), cap):
+            wave = ordered[start:start + cap]
+            for child_goal in wave:
+                if not self._prove(child_goal, child_ancestors, depth + 1):
+                    return False, self._failing_child_reason(child_goal)
+        return True, None
+
+    def _child_proof_map(self, children: list[str]) -> dict[str, Optional[str]]:
+        """The proven artifact (direct ledger or decomposition sketch) of each child, for the H0 gate."""
+        out: dict[str, Optional[str]] = {}
+        for c in children:
+            node = self.dag.get(goal_hash(c))
+            out[c] = node.proof if node is not None else None
+        return out
+
+    def _check_h0_consistency(self, goal: str, children: list[str]):
+        """Run the H0 child-consistency gate over the (now all-proven) children. Returns the H0Result,
+        or None when the gate is disabled. ANTI-VACUITY is the gate's own concern: a check that could
+        inspect nothing returns consistent=False (reason vacuous_check), never a vacuous pass."""
+        if not self.h0_consistency:
+            return None
+        return check_children_consistency(children, self._child_proof_map(children))
 
     def _compare_budget_ok(self) -> bool:
         """One pairwise comparison costs one model call (checked + spent atomically)."""
@@ -363,10 +847,61 @@ class DagDriver:
             return True
         return False
 
+    def _population_hard_filter(self, goal: str) -> Callable[[Candidate], bool]:
+        """A DETERMINISTIC hard pre-gate (goal-binding + obligation-discharge) for the Elo tournament.
+
+        A candidate decomposition is admitted to the ranking ONLY if (P3 / openevolve_stacking_brief §9
+        #5):
+          * its sketch PARSES, and
+          * the FULL deterministic gate does NOT REJECT it — we call ``gate.evaluate()`` (the same gate
+            commit uses, semantics UNCHANGED) and admit ONLY a candidate whose verdict is
+            PASSED_DETERMINISTIC or NEEDS_REVIEW. A candidate the gate REJECTS (e.g. a ``case_split``
+            step missing its ``case_cover`` obligation -> verdict REJECTED / ``missing_obligation``) is
+            dropped HERE so it is NEVER ranked, instead of being admitted to the tournament and only
+            blocked later at commit, and
+          * it binds to the goal by deterministic ``goal_hash`` equality on BOTH the top-level claim
+            and the terminal conclusion, and is NOT vacuous (no LLM vote — the same non-gameable check
+            the evolve fitness uses), and
+          * its declared obligations are discharged structurally: the sketch's ``lemma`` steps (the
+            deferred obligations) EXACTLY match the candidate's declared child goals (an honest
+            decomposition — no hidden/over-claimed sub-lemma).
+
+        A candidate that fails ANY clause is NEVER ranked or selected — the Elo/BT/PUCT machinery only
+        ever sees gate-passing candidates. Reuses the bridge's pure ``binds_to_goal``/``is_vacuous`` so
+        the filter and the evolutionary fitness apply the SAME deterministic binding."""
+        from agent.tools.openevolve_bridge import binds_to_goal, is_vacuous
+
+        def _ok(c: Candidate) -> bool:
+            try:
+                led = parse_ledger(c.content)
+            except LedgerError:
+                return False
+            # FULL GATE (semantics unchanged — we only call it): a candidate the deterministic gate
+            # REJECTS is dropped before ranking. Admit ONLY PASSED_DETERMINISTIC / NEEDS_REVIEW. A gate
+            # internal error fails closed (rejected) inside evaluate(); any unexpected exception here is
+            # treated as a rejection too (no fail-open admission).
+            try:
+                if evaluate(c.content, self.toolkit).rejected:
+                    return False
+            except Exception:
+                return False
+            if not binds_to_goal(led, goal) or is_vacuous(led):
+                return False
+            # Obligation discharge: the sketch's `lemma` steps must match the declared child goals.
+            lemma_keys = _lemma_claims(c.content)
+            if lemma_keys is None:
+                return False
+            return lemma_keys == {goal_hash(cg) for cg in c.children}
+
+        return _ok
+
     def _prove_via_population(self, goal: str, feedback: list[str],
                              child_ancestors: set[str], depth: int) -> bool:
         """Generate K candidate decompositions, rank them by an Elo comparison tournament, and try
-        them best-first (AlphaProof_Nexus population/Elo over incomplete sketches)."""
+        them best-first (AlphaProof_Nexus population/Elo over incomplete sketches).
+
+        Candidates pass a DETERMINISTIC hard pre-gate (goal-binding + obligation-discharge) BEFORE the
+        tournament — a gate-gaming candidate is never ranked or selected (P3 / brief §9 #5)."""
         cands: list[Candidate] = []
         for i in range(self.population_k):
             if not self.budget.can_call():
@@ -379,9 +914,16 @@ class DagDriver:
         if not cands:
             return False
 
-        pop = EloPopulation()
+        # Hard pre-gate: a candidate failing goal-binding / obligation-discharge is NEVER admitted, so
+        # the Elo/BT/PUCT machinery (unchanged) only ranks gate-passing candidates.
+        pop = EloPopulation(hard_filter=self._population_hard_filter(goal))
         for c in cands:
             pop.add(c)
+        if not pop.candidates:
+            # Every candidate failed the hard filter — nothing safe to rank.
+            self.trace.emit("population_all_filtered", goal=goal[:80],
+                            candidates=len(cands), rejected=pop.rejected_by_filter)
+            return False
         comparisons = pop.tournament(self.comparator, rounds=self.population_rounds,
                                      budget_ok=self._compare_budget_ok)
         # Bradley-Terry latent strengths from the tournament win matrix (a stable batch estimate over
@@ -390,13 +932,13 @@ class DagDriver:
         self.trace.emit("population", goal=goal[:80], candidates=len(cands), comparisons=comparisons)
 
         tried = 0
-        while tried < min(self.max_decomp_attempts, len(cands)):
+        while tried < min(self.max_decomp_attempts, len(pop.candidates)):
             cand = pop.select_puct()
             if cand is None:
                 break
             tried += 1
-            ok, _notes = self._try_decomposition(goal, cand.content, cand.children,
-                                                 child_ancestors, depth)
+            ok, _notes, _reason = self._try_decomposition(goal, cand.content, cand.children,
+                                                          child_ancestors, depth)
             if ok:
                 return True
             cand.alive = False          # don't reselect a failed candidate

@@ -146,3 +146,49 @@ def test_without_population_first_candidate_loses():
                        max_decomp_attempts=1)
     res = driver.run("G")
     assert not res.proven
+
+
+# ---- (P3 / #5) HARD-FILTER pre-gate: a gate-failing candidate is NEVER ranked by Elo -----------
+
+def test_hard_filter_rejects_candidate_before_ranking():
+    # A candidate failing the hard pre-gate is never admitted, so the Elo machinery never sees it.
+    rejected = []
+    pop = EloPopulation(hard_filter=lambda c: c.id != "bad")
+    a = pop.add(Candidate("good", "G"))
+    b = pop.add(Candidate("bad", "B"))   # rejected by the filter
+    assert a is not None and b is None
+    assert pop.rejected_by_filter == 1
+    assert [c.id for c in pop.candidates] == ["good"]
+
+
+def test_hard_filtered_candidate_never_ranked_even_if_judges_love_it():
+    # The judge ADORES the gameable candidate, but the hard filter bars it -> it is never ranked or
+    # selected. The Elo/BT/PUCT machinery itself is unchanged; it just never sees the barred candidate.
+    pop = EloPopulation(hard_filter=lambda c: c.id != "gameable")
+    pop.add(Candidate("honest", "H", meta={"s": 1.0}))
+    pop.add(Candidate("gameable", "X", meta={"s": 100.0}))  # high judge score, but barred
+    # The comparator would rank "gameable" first if it were present.
+    cmp = KeyComparator(key=lambda c: c.meta["s"])
+    pop.tournament(cmp, rounds=2)
+    pop.set_ratings_from_bradley_terry()
+    ids = [c.id for c in pop.ranking()]
+    assert "gameable" not in ids                 # never ranked
+    assert pop.select_puct().id == "honest"      # never selectable
+    assert ids == ["honest"]
+
+
+def test_hard_filter_fails_closed_on_filter_exception():
+    # A hard filter that ERRORS on a candidate rejects it (never admits an un-vouched candidate).
+    def boom(c):
+        raise RuntimeError("filter blew up")
+    pop = EloPopulation(hard_filter=boom)
+    assert pop.add(Candidate("c", "x")) is None
+    assert pop.candidates == []
+
+
+def test_no_filter_is_back_compat_unconditional_add():
+    # With no hard_filter the population admits everything (the original behaviour).
+    pop = EloPopulation()
+    for i in range(3):
+        assert pop.add(Candidate(f"c{i}", "x")) is not None
+    assert len(pop.candidates) == 3 and pop.rejected_by_filter == 0

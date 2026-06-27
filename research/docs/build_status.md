@@ -39,7 +39,7 @@ components + the elementary gate as the product* — is in [`system_design.md`](
 | **HIGH 3** | HARD gate = dependency audit + restricted env + V_leg AST legality | **Partial.** Dependency-closure + axiom-whitelist audit **built + live**; restricted-import env **intentionally skipped** (memo: coarse/brittle, backstopped by the audit); **V_leg AST legality deferred** → gap #8. |
 | **HIGH 4** | Self-correction repair + Autoreason incumbent tournament | **Built.** Repair loop **live**; **Autoreason tournament now built + wired** (`tournament.py`; PUCT + Bradley-Terry; `max_replan_depth` consumed). |
 | **MED 5** | Retrieval bias to an elementary index | **Built.** Loogle + BM25 + **neural bi-encoder (`bge-small-en-v1.5`)** via `HybridRetriever`. |
-| **MED 6** | Construction/witness finder (Axplorer) | **Partial** — `numeric.py` grounding only; no population search-as-tool. |
+| **MED 6** | Construction/witness finder (Axplorer) | **Partial** — `numeric.py` grounding only. A population search-as-tool now exists as an **optional** path: the OpenEvolve ledger-evolution backend (`tools/openevolve_bridge.py`, gate-scored, no-exec), but it is a `Decomposer`, not a numeric-construction finder. |
 | **MED 7** | Skill cards + immutable objective spec | **Partial** — toolkit/denylist YAML + method files; immutability not architecturally enforced. |
 | **MED 8** | AXLE/LeanDojo artifact cleanup + verified-lemma cache | **Not built.** |
 | **LOW 9–12** | Trained prover, LeanProgress reranker, data-gen flywheel, orchestration shells | **Deferred to v2** (a cross-encoder reranker *hook* exists in the neural retriever). |
@@ -174,6 +174,7 @@ non-contaminative **ArXivMath benchmark** adapter + harness.
 | Semantic retrieval | `agent/tools/semantic_retrieval.py` | Local BM25 + HybridRetriever over elementary Mathlib subset | built+unit-tested |
 | Neural retrieval | `agent/tools/neural_retrieval.py` | Dense bi-encoder (`bge-small-en-v1.5`) + optional cross-encoder reranker; graceful degrade; offline `HashingEmbedder` for tests | built+unit-tested (model stubbed); **live opt-in** |
 | Answer checker | `agent/tools/answer_check.py` | SymPy answer-equivalence (symbolic / numeric / set-tuple / string) for final-answer benchmarks | built+unit-tested |
+| OpenEvolve bridge | `agent/tools/openevolve_bridge.py` | Evolve proof-sketch **ledgers** (MAP-Elites) scored by the deterministic gate as fitness oracle; mutations driven by a real **AlphaEvolve-style LLM ensemble** via the `claude` CLI — **Sonnet = breadth** (fast, high sampling weight, many candidates) + **Opus = depth** (stronger, low weight, occasional high-quality), mirroring AlphaEvolve's Flash/Pro split; reads ledger as text — **never exec/eval/imports** the artifact; `OpenEvolveBackend` is a `Decomposer` for `DagDriver`. **Optional dep** (`pip install mathagent[evolve]`); `available()` probes without importing; offline-testable via `StubEvolveLLM`. Ranks/filters only — does **not** certify elementary (only Layer 4 does). | built+unit-tested *(optional-dep)* |
 
 ### 3.5 Orchestrator / harness (`agent/orchestrator/`)
 
@@ -320,9 +321,10 @@ refactor; a regression test pinning the Lean shadow-elaborator class is advisabl
 | Paper / system | Mapped component |
 |---|---|
 | **LEAP** | AND-OR DAG with memoization — `agent/orchestrator/dag.py`, `dag_driver.py` |
-| **AlphaProof_Nexus** | Per-goal Ralph loop + population/Elo search — `agent/orchestrator/ralph.py`, `population.py` |
+| **AlphaProof_Nexus** | Per-goal Ralph loop + **population/Elo candidate search** (Elo + Bradley-Terry + PUCT) — `agent/orchestrator/ralph.py`, `population.py` |
 | **Autoreason** | Incumbent / "do-nothing" revision tournament (k=2 stop, margin gate) — **built**: `agent/orchestrator/tournament.py`, wired into `DagDriver(refiner=…)` |
-| **AlphaEvolve** | Population/Elo candidate-decomposition ranking (PUCT + Bradley-Terry, driver-driven) — `agent/orchestrator/population.py` |
+| **AlphaEvolve** | Two narrow lessons (**not** the population machinery — that is AlphaProof_Nexus): the **cheap-first evaluation cascade** (`agent/gates/gate.py` layer ordering) + the **"no hard projection for elementarity"** lesson (→ Layer 4 is a verification gate, not a projection). |
+| **OpenEvolve** (AlphaEvolve OSS) | **Optional** evolutionary backend: MAP-Elites population search over proof-sketch **ledgers**, gate-scored fitness, no-exec, driven by a real **AlphaEvolve-style Sonnet-breadth + Opus-depth ensemble** (via the `claude` CLI) — `agent/tools/openevolve_bridge.py` (`OpenEvolveBackend` is a `DagDriver` `Decomposer`). |
 | **AXLE** | Adversarial statement-faithfulness panel — `agent/orchestrator/faithfulness.py` |
 | **Loogle / LeanSearch / LeanExplore** | Mathlib lemma retrieval — `agent/tools/retrieval.py` (Loogle) + BM25 (`semantic_retrieval.py`) + neural bi-encoder (`neural_retrieval.py`) |
 | **MathArena ArXivMath** | Non-contaminative final-answer benchmark adapter + SymPy grader — `agent/benchmarks/arxivmath.py`, `agent/tools/answer_check.py` |

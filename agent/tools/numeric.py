@@ -303,3 +303,143 @@ def verify_residue_cover(modulus: int, residues: Iterable[int]) -> CoverCheck:
         covered.add(r % modulus)
     missing = sorted(set(range(modulus)) - covered)
     return CoverCheck(ok=not missing, modulus=modulus, covered=sorted(covered), missing=missing)
+
+
+def verify_descent_decreases(
+    measure_expr: str,
+    next_expr: str,
+    variables: list[str],
+    bounds: dict[str, tuple[int, int]],
+) -> SolutionCheck:
+    """Confirm `next_expr < measure_expr` at EVERY point of the closed box (strict descent).
+
+    Returns a SolutionCheck whose ``ok`` is True iff the constructed next-value's measure is strictly
+    below the current measure everywhere in the box. ``counterexamples`` holds up to a few witnesses
+    where ``next - measure >= 0`` (i.e. where descent does NOT strictly decrease). Both expressions are
+    parsed by the same restricted no-eval integer AST as everything else here; nothing is ever
+    eval/exec'd. A vacuous (empty/zero-width) measure or next expression that fails to parse raises
+    NumericError, surfacing as an obligation failure upstream rather than a silent pass.
+    """
+    # ``(next) - (measure) >= 0`` anywhere is a descent violation. find_points_where_nonneg parses
+    # the combined expression through the restricted AST, so measure/next are validated there too.
+    bad = find_points_where_nonneg(f"({next_expr}) - ({measure_expr})", variables, bounds)
+    return SolutionCheck(
+        ok=not bad,
+        solutions=[],
+        counterexamples=bad,
+        box={v: tuple(bounds[v]) for v in variables},
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# Witness/construction SPEC checker (Layer-3 evolution mode). A "spec" is a small JSON object that
+# NAMES one exact-integer obligation kind and its data; it is parsed with json.loads (data only — no
+# code) and dispatched to the checkers above. Every embedded EXPRESSION still goes through the
+# restricted no-eval AST in `_safe_parse`, so a spec can never smuggle executable code: json.loads
+# yields plain str/int/list/dict, and any expression string is only ever handed to the AST walker.
+# --------------------------------------------------------------------------------------------------
+@dataclass
+class SpecCheck:
+    ok: bool
+    kind: str
+    detail: str = ""
+    error: Optional[str] = None  # set iff the spec was malformed/unparseable (a HARD failure)
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+# Imported lazily to keep the module import light and avoid a top-level json dependency surprise.
+def _spec_obj(spec):
+    import json as _json
+
+    if isinstance(spec, dict):
+        return spec
+    if not isinstance(spec, str):
+        raise NumericError(f"witness spec must be a JSON object or string; got {type(spec).__name__}")
+    text = spec.strip()
+    if not text:
+        raise NumericError("witness spec is empty")
+    try:
+        obj = _json.loads(text)
+    except Exception as e:  # noqa: BLE001 - any JSON error is a malformed spec
+        raise NumericError(f"could not parse witness spec JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise NumericError("witness spec must be a JSON object")
+    return obj
+
+
+def _coerce_box(raw, variables: list[str]) -> dict[str, tuple[int, int]]:
+    """Coerce a JSON ``{var: [lo, hi]}`` mapping into the {var: (lo,hi)} bounds dict (validated)."""
+    if not isinstance(raw, dict):
+        raise NumericError("spec 'bounds' must be an object {var: [lo, hi]}")
+    box: dict[str, tuple[int, int]] = {}
+    for v in variables:
+        if v not in raw:
+            raise NumericError(f"spec 'bounds' missing variable {v!r}")
+        pair = raw[v]
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+            raise NumericError(f"spec bound for {v!r} must be a [lo, hi] pair")
+        lo, hi = pair
+        if not (isinstance(lo, int) and isinstance(hi, int)) or isinstance(lo, bool) or isinstance(hi, bool):
+            raise NumericError(f"spec bound for {v!r} must be integers")
+        box[v] = (int(lo), int(hi))
+    return box
+
+
+def check_witness_spec(spec) -> SpecCheck:
+    """Score a NUMERIC witness/construction spec with the exact-integer checker (no eval, ever).
+
+    ``spec`` is a JSON object (or its text) of one of these shapes — the ``kind`` field selects the
+    checker; everything else is plain data and embedded expressions go through the restricted AST:
+
+      {"kind": "residue_cover", "modulus": M, "residues": [r0, r1, ...]}
+          -> verify_residue_cover: the residues must cover a complete residue system mod M.
+
+      {"kind": "descent", "measure_expr": "...", "next_expr": "...",
+       "variables": ["x", ...], "bounds": {"x": [lo, hi], ...}}
+          -> verify_descent_decreases: next-value's measure < current measure everywhere in the box.
+
+      {"kind": "solution_set", "expression": "...", "variables": [...],
+       "bounds": {...}, "claimed": [{"x": .., ...}, ...]}
+          -> verify_solution_set: the claimed set is exactly the box's solution set (no missing/spurious).
+
+    Returns a SpecCheck. A malformed/unparseable spec sets ``error`` and ``ok=False`` (a HARD failure —
+    callers must NOT reward it). This NEVER eval/exec/imports the spec: json.loads parses data only, and
+    each expression string is handed solely to the no-eval AST in `_safe_parse`.
+    """
+    try:
+        obj = _spec_obj(spec)
+        kind = obj.get("kind")
+        if kind == "residue_cover":
+            res = verify_residue_cover(obj["modulus"], obj["residues"])
+            if res.modulus < 2:
+                return SpecCheck(False, "residue_cover", error=f"vacuous modulus {res.modulus} (need >= 2)")
+            detail = f"mod {res.modulus} covered={res.covered} missing={res.missing}"
+            return SpecCheck(bool(res.ok), "residue_cover", detail=detail)
+        if kind == "descent":
+            variables = list(obj["variables"])
+            box = _coerce_box(obj.get("bounds", {}), variables)
+            res = verify_descent_decreases(obj["measure_expr"], obj["next_expr"], variables, box)
+            detail = ("strict decrease verified over box" if res.ok
+                      else f"non-decrease at e.g. {res.counterexamples[0]}")
+            return SpecCheck(bool(res.ok), "descent", detail=detail)
+        if kind == "solution_set":
+            variables = list(obj["variables"])
+            box = _coerce_box(obj.get("bounds", {}), variables)
+            claimed = obj.get("claimed", [])
+            if not isinstance(claimed, list):
+                raise NumericError("spec 'claimed' must be a list of assignments")
+            res = verify_solution_set(obj["expression"], variables, box, claimed)
+            detail = (f"solution set verified ({len(res.solutions)} sols)" if res.ok
+                      else f"missing={res.counterexamples} spurious={res.spurious_claims}")
+            return SpecCheck(bool(res.ok), "solution_set", detail=detail)
+        return SpecCheck(False, str(kind), error=f"unknown witness-spec kind {kind!r}")
+    except NumericError as e:
+        kind = ""
+        if isinstance(spec, dict):
+            kind = str(spec.get("kind", ""))
+        return SpecCheck(False, kind, error=str(e))
+    except Exception as e:  # noqa: BLE001 - a KeyError/TypeError from a missing field is still a
+        # malformed spec; surface it as a HARD failure (never an uncaught crash, never a silent pass).
+        return SpecCheck(False, "", error=f"{type(e).__name__}: {e}")

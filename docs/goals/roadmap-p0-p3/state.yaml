@@ -1,0 +1,199 @@
+# GoalBuddy v2 state.yaml — board truth. goal.md is the charter.
+version: 2
+
+goal:
+  title: "Implement report roadmaps P0-P3 + adversarial verification"
+  slug: "roadmap-p0-p3"
+  kind: existing_plan
+  tranche: "Land P0+P1 (both roadmaps), then P2, then P3 — verifying each slice — then an adversarial audit; continue until all three oracle conditions hold."
+  status: done   # P0-P3 built + 6 remediation rounds; oracle 1+2 hold; oracle-3 residual is the ACCEPTED trivial-cover spoof (search-signal only, never a false certificate, Layer-4-bounded, documented + pinned)
+  oracle:
+    signal: "full offline pytest green (baseline 398 passed / 8 skipped) + new deterministic invariant tests pass + an adversarial re-attack (Codex refuter + Opus skeptics) finds no soundness/reward-hacking hole"
+    cadence: "after each Worker package and at final audit"
+    final_proof: "receipts showing: suite green; FSM totality + NEEDS_REVIEW->decompose + terminal-absorbing + stale-context-miss + reward-hacking-trap + fitness-zeroing tests pass; adversarial audit reports no exploitable path"
+  intake:
+    original_request: "Build the intended structures in the live reports completely (ALL P0/P1/...) with slash goal loops + multiple Opus 4.8 workers; verify adversarially."
+    interpreted_outcome: "Implement every prioritized structure from forge_relevance_study.md §7 and openevolve_stacking_brief.md §9, keep the suite green, and prove it survives adversarial re-attack."
+    input_shape: existing_plan
+    audience: "the MathAgent maintainer (the user)"
+    authority: approved
+    proof_type: test
+    completion_proof: "all three oracle conditions hold with receipts"
+    likely_misfire: "adding P2/P3 parallelism/diversity on top of a still-gameable fitness or still-broken give-up path; refactoring without the proptests that prove the invariants"
+    blind_spots_considered:
+      - "T100 (orchestrator) and T101 (OpenEvolve fitness) must edit DISJOINT files to run in parallel"
+      - "changes to the gate/ledger could affect openevolve_bridge.score_ledger -> keep evaluate() semantics unchanged; final full-suite is authoritative"
+      - "the FSM refactor must be behavior-preserving except the one deliberate NEEDS_REVIEW->decompose fix"
+    existing_plan_facts:
+      - "P0 (forge): suspending fix at agent/orchestrator/dag_driver.py:229-231"
+      - "P1 (forge): total node_transition table + reason codes + split-keyed memo (semantic_goal_hash + proof_context_hash) + adversarial verifier + downgrade-don't-discard"
+      - "P0 (openevolve): hard fitness-zeroing goal-binding+vacuity gate at archive insertion in openevolve_bridge.score_ledger; NEEDS_REVIEW(0.5) is not a win"
+      - "P1 (openevolve): numeric-grounding evolution mode (exact-integer checker; NO eval) + vector fitness + obligation-debt"
+      - "P2: Dilworth width + upward_rank + H0 child-consistency + event-driven AND scheduling"
+      - "P3: rank-aware model routing; next_producers = fan-in x critical-path; Elo/BT/PUCT over hard-filtered elites; AutoReason one-way; OpenEvolve fallback decomposer + strategy MAP-Elites + retrieval islands"
+      - "8 forge regression tests + reward-hacking trap test"
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 2   # user EXPLICITLY asked for parallel Opus workers; T100/T101 have proven-disjoint scopes
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  goal_pressure_requires_oracle: true
+  no_completion_on_weak_proof: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: installed
+  worker: installed
+  judge: installed
+
+visual_board:
+  selected: none   # execution is driven by parallel Opus Workflow workers; board is the durable PM record
+  local:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy board docs/goals/roadmap-p0-p3"
+
+active_task: null   # roadmap built + audited; V6 residual accepted-by-decision (search-only, Layer-4-bounded); pending commit
+
+tasks:
+  - id: T100
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: high
+    objective: "PHASE-1 ORCHESTRATOR SOUNDNESS (P0+P1 forge): suspending-scheduler fix + total node_transition FSM (Action enum, enum-cartesian totality proptest, invariants) + blocker reason codes + split-keyed memo (semantic_goal_hash + proof_context_hash) + adversarial elementary-verifier with downgrade-don't-discard."
+    inputs:
+      - "research/docs/forge_relevance_study.md §7 (P0+P1)"
+      - "agent/orchestrator/dag_driver.py, state.py, dag.py; agent/gates/ledger.py, toolkit.py, gate.py"
+    constraints:
+      - "Behavior-preserving except the one deliberate NEEDS_REVIEW-no-judge -> decompose fix."
+      - "FSM totality enforced by an enum-cartesian proptest (Python has no exhaustiveness check)."
+      - "Fail-closed preserved; do NOT change gate.evaluate() verdict semantics (openevolve_bridge depends on it)."
+    allowed_files:
+      - "agent/orchestrator/dag_driver.py"
+      - "agent/orchestrator/state.py"
+      - "agent/orchestrator/dag.py"
+      - "agent/orchestrator/node_fsm.py (new)"
+      - "agent/orchestrator/elementary_verifier.py (new)"
+      - "agent/gates/ledger.py"
+      - "agent/gates/toolkit.py"
+      - "tests/test_node_fsm.py (new), tests/test_dag_driver.py, tests/test_dag.py, tests/test_proof_context.py (new)"
+    verify:
+      - "python -m pytest tests/test_node_fsm.py tests/test_dag_driver.py tests/test_dag.py tests/test_proof_context.py -q"
+      - "python -m pytest -q -p no:cacheprovider"
+    stop_if:
+      - "A change would alter gate.evaluate() verdict semantics."
+      - "Full suite cannot be made green."
+    receipt: null
+  - id: T101
+    type: worker
+    assignee: Worker
+    status: done   # PARALLEL with T100 (disjoint files); executed in the same Opus Workflow wave
+    reasoning_hint: high
+    objective: "PHASE-1 OPENEVOLVE FITNESS (P0+P1 openevolve): hard fitness-ZEROING goal-binding + vacuity gate at archive insertion in score_ledger; 'NEEDS_REVIEW(0.5) is not a win'; vector fitness (hard checks zero combined_score, graded terms feed it, strategy descriptors as MAP-Elites axes); obligation-debt; numeric-grounding evolution mode (exact-integer checker, NO eval); reward-hacking trap test."
+    inputs:
+      - "research/docs/openevolve_stacking_brief.md §9 (P0+P1 + cross-cutting)"
+      - "agent/tools/openevolve_bridge.py, numeric.py"
+    constraints:
+      - "NEVER exec/eval evolved text; evaluator only READS + gates."
+      - "Goal-binding = deterministic goal_hash equality, NOT an LLM vote."
+      - "Disjoint from T100 (no edits to orchestrator/gate files)."
+    allowed_files:
+      - "agent/tools/openevolve_bridge.py"
+      - "agent/tools/numeric.py"
+      - "tests/test_openevolve_bridge.py"
+      - "tests/test_evolve_fitness.py (new)"
+    verify:
+      - "python -m pytest tests/test_openevolve_bridge.py tests/test_evolve_fitness.py tests/test_numeric.py -q"
+      - "python -m pytest -q -p no:cacheprovider"
+    stop_if:
+      - "Any path could exec/eval evolved content."
+      - "Full suite cannot be made green."
+    receipt: null
+  - id: T200
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Phase-boundary review of P0+P1: confirm the suite is green, the new invariants pass, and the soundness fixes are real (not vacuous); select the P2 Worker package."
+    inputs: ["T100 receipt", "T101 receipt", "last verification"]
+    constraints: ["Do not implement.", "Reject if any invariant test is vacuous or the give-up path is still reachable."]
+    expected_output: ["complete|not_complete for P0+P1", "P2 Worker objective + allowed_files + verify + stop_if"]
+    receipt: null
+  - id: T300
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: high
+    objective: "PHASE-2 THROUGHPUT (P2): Dilworth-width fan-out + upward_rank over committed AND children only (never OR alternatives); H0 child-consistency (assumption/definition/lemma-signature) gate before composing a parent; event-driven AND-node scheduling over the shared memo; budget/rate-limits as scheduler inputs. Port Forge's stdlib dilworth_width + Hopcroft-Karp."
+    inputs: ["research/docs/forge_relevance_study.md §7 (P2)", "Phase-1 outputs"]
+    constraints: ["Build on the Phase-1 FSM/memo.", "Only for committed AND children.", "Keep the suite green."]
+    allowed_files:
+      - "agent/orchestrator/dag_driver.py"
+      - "agent/orchestrator/dilworth.py (new)"
+      - "agent/orchestrator/h0_consistency.py (new)"
+      - "tests/test_dilworth.py (new), tests/test_h0_consistency.py (new), tests/test_dag_driver.py"
+    verify: ["python -m pytest tests/test_dilworth.py tests/test_h0_consistency.py tests/test_dag_driver.py -q", "python -m pytest -q -p no:cacheprovider"]
+    stop_if: ["Fan-out used for OR alternatives.", "Suite not green."]
+    receipt: null
+  - id: T400
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: high
+    objective: "PHASE-3 ADAPTIVITY (P3 + OpenEvolve P2/P3): rank-aware model routing (Sonnet/Opus weight by upward_rank/uncertainty); next_producers leverage = fan-in x critical-path depth; Elo/BT/PUCT over HARD-FILTERED elites; AutoReason one-way polish; OpenEvolve fallback decomposer on stuck nodes committing only goal-bound blueprints; strategy-keyed MAP-Elites + retrieval-seeded islands; search-fitness vs reporting-status separation (categorical user states)."
+    inputs: ["both reports (P3 + openevolve P2/P3)", "Phase-1/2 outputs"]
+    constraints: ["Elo only over hard-filtered elites.", "AutoReason output must NOT feed back into the evolutionary archive.", "Keep the suite green."]
+    allowed_files:
+      - "agent/orchestrator/dag_driver.py"
+      - "agent/tools/openevolve_bridge.py"
+      - "agent/orchestrator/population.py"
+      - "scripts/prove.py"
+      - "tests/test_openevolve_bridge.py, tests/test_dag_driver.py, tests/test_population.py"
+    verify: ["python -m pytest -q -p no:cacheprovider"]
+    stop_if: ["Elo ranks non-hard-filtered candidates.", "AutoReason output re-enters the archive.", "Suite not green."]
+    receipt: null
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: xhigh
+    objective: "FINAL ADVERSARIAL AUDIT: run the full suite + an independent different-family refuter (Codex GPT-5.5-xHigh) + Opus skeptics that try to (a) make a NEEDS_REVIEW node give up without decomposing, (b) reuse a stale PROVEN after a ruleset change, (c) raise fitness by relabel/weaken/hide-obligation, (d) exec evolved text. Confirm all three oracle conditions hold with receipts."
+    inputs: ["all done receipts", "last verification", "current dirty diff", "goal.md oracle"]
+    constraints: ["Do not implement.", "Default to NOT complete if any re-attack succeeds or any invariant test is vacuous."]
+    expected_output: ["complete|not_complete", "full_outcome_complete: true|false", "any exploitable path found", "remaining work if not complete"]
+    receipt: null
+
+checks:
+  dirty_fingerprint: phase1-applied
+  last_verification:
+    result: pass
+    task: "Phase 1 (T100+T101)"
+    commands:
+      - cmd: "python -m pytest -q -p no:cacheprovider"
+        status: "FINAL: 745 passed, 8 skipped, 0 failed (398 baseline -> 745; +347 tests over P0-P3 + 6 remediation rounds)"
+  receipts:
+    T1003_FINAL: "GOAL COMPLETE (accept+document). R6: honest split-coprimality false-cap removed (0.365 -> 0.817 PASSED via gate-enforced provenance grounding); syntactic fakes STILL capped (relabel 0.32, method_ref 0.34, restatement 0.32, all < 0.60 floor); no new laundering channel; KNOWN-LIMITATION documented in score_ledger + cap docstrings + research/docs/openevolve_stacking_brief.md; pinned by test_known_limitation_trivial_cover_citation_spoof_is_search_only. Suite 745 passed / 8 skipped, verify independently confirmed via live score_ledger. ACCEPTED RESIDUAL: trivial-cover citation spoof reaches PASSED in the SOFT fitness (undecidable offline = content-entailment = proof-checking); SEARCH-SIGNAL ONLY, never a false authoritative_elementary (Layer-4 is the sole certifier). Soundness never breached in any round."
+    T1002: "REMEDIATION R5: structural cap APPLIED + enforced (score_ledger demotes verdict to NEEDS_REVIEW iff conclusion's load-bearing support contains >=1 un-grounded crux; bands disjoint NR<=0.41 < PASSED 0.60) + saturating non-pumpable discharged credit. ALL documented prior breaks now capped below PASSED & monotone non-increasing (mod-3 width pump 0.30-0.373, off-relevance chain 0.30-0.365, method_ref 0.342, restatement flat). Suite 740 green. RESIDUAL (theoretical wall, SEARCH-SIGNAL ONLY, never a false certificate): (A) trivial-cover citation spoof still reaches PASSED 0.817 (fake depends_on a complete mod-3 cover -> declared grounded; distinguishing from honest use = content-entailment = undecidable offline = why Layer-4 exists); (B) honest false-cap: sanctioned gcd_coprimality->split_coprimality pattern demoted to 0.365. Entangled (tightening A worsens B). Workflow harness threw on audit agent malformed JSON; recovered manually. full_outcome_complete=False on oracle-3 search-fitness; AWAITING user decision on resolution. Orchestrator (V1-V5) remains CLOSED."
+    T1001: "REMEDIATION R3: ORCHESTRATOR CLOSED (non-vacuously, auditor drove real run()): V1 committed-child budget starvation -> retryable EXHAUSTED (reason propagated, not hardcoded gap_found); V4 H0 relation-keyed lemma sigs (g<h vs g|h pass, contradictions still reject); V5 real scheduler _prove_and_children depth-primary. Suite 725. FITNESS R4 partial: closed mod-2/multi-anchor/nested/mid-chain/tag-mix/depth-monotone/vierzahlensatz BUT diverse re-attack found new breaks (all = structural-presence proxy gamed): mod-3 discharged-PUMP > honest, off-relevance independent-chain anchor, method_ref lone crux 0.697 PASSED, restatement depth-pump. Root: grounding checks PRESENCE not RELEVANT DEPENDENCY. -> R5."
+    T1002: "REMEDIATION R5 (in progress, fitness only; orchestrator FROZEN): end the arms race with a PROVEN STRUCTURAL CAP — relevant-dependency grounding (drop modulus/presence proxies), saturating non-pumpable discharged credit, method_ref is NOT a deterministic anchor (-> NEEDS_REVIEW), and the invariant: ANY ledger whose conclusion rests on >=1 un-grounded crux is hard-capped < PASSED floor. General property test over a ledger battery."
+    T1000: "REMEDIATION R2 (partial): CLOSED V2 (memo read-through), V3 (population filter calls evaluate()), V7 (barrier canonical fp for named perturbations), V8 (goal=None evaluator path). Suite 706. BUT re-audit proved 4 fixes VACUOUS/partial (tests asserted on orphaned helpers): V6 relabel-under-algebra defeated by LAUNDERING (1 trivial case_cover grounds whole closure; laundered fake 0.865 > honest 0.815; lone crux 0.7133 in PASSED band); V1 committed-child budget starvation still poisons memo (dag_driver:627 hardcodes gap_found); V5 critical-path guard orphaned (real scheduler still leverage-primary); V4 new false positive (g<h vs g|h collide). -> Round-3 T1001."
+    T1001: "REMEDIATION R3 (in progress): defeat laundering (local grounding + per-crux additive debt + relevant non-vacuous obligations + grounded-only depth bonus); committed-child reason propagation (budget_starved -> retryable EXHAUSTED); real-scheduler depth-primary order; H0 relation-keyed lemma sigs. Tests MUST hit the real path; perspective-diverse re-attack (laundering + relevance angles) + suite + re-audit."
+    T999: "AUDIT FOUND HOLES (full_outcome_complete=FALSE): suite green (682) but 2 invariants refuted + 1 reward-hacking hole. MUST-FIX: (1) budget-starved decompose -> terminal FAILED_GAP not retryable EXHAUSTED (memo poisons a provable goal after refill); (2) relabel-under-algebra: obligation-debt allowlist misses generic obligation:none cruxes -> deeper fakes score higher; (3) _population_hard_filter doesn't call evaluate() -> gate-rejected candidate reaches Elo. SHOULD-FIX: memo read-through, H0 false-negatives, leverage starves deep chain, barrier raw-byte fp, goal=None skips binding. NONE mint a false PROVEN. Codex orch re-attack INCONCLUSIVE (monthly quota until Jul 27); Opus skeptics covered it. Remediation -> T1000/T1001."
+    T100: "DONE — suspending fix + total node_fsm.py FSM (enum-cartesian totality proptest + invariants) + reason codes + split-keyed memo (semantic_goal_hash + proof_context_hash) + elementary_verifier.py (downgrade-don't-discard, anti-vacuity). 235 lane tests pass."
+    T101: "DONE — hard fitness-zeroing goal-binding/vacuity gate at archive insertion; vector fitness (graded + obligation-debt); strategy MAP-Elites axes; numeric-grounding evolve_witnesses mode (no eval); Ljunggren reward-hacking trap test. 69 lane tests pass."
+    T400: "DONE — rank-aware model routing (RankSignal/rank_aware_weights + telemetry); next_producers leverage = fan-in x depth; Elo over HARD-FILTERED elites (population hard_filter pre-gate); AutoReason one-way (ExploreExploitBarrier); OpenEvolve fallback decomposer on stuck nodes; retrieval-seeded islands; ReportStatus categorical enum. 682 passed, +33 tests."
+    T300: "DONE — dilworth.py (width=max-antichain via Koenig/Hopcroft-Karp, raises on cycle) + upward_rank; AND-children fan-out (width+budget capped, rank-ordered, AND-only, serial-parity) + h0_consistency.py child-consistency gate (rejects contradictory siblings, anti-vacuity) + event-driven wave/memo scheduling. 649 passed, +46 tests. NOTE: scheduling is synchronous wave+memo (result-correct), not async."
+    T200: "JUDGE: P0+P1 complete. Full suite green (603/8); all 7 invariants hold non-vacuously (FSM totality, NEEDS_REVIEW->decompose, terminal-absorb, stale-context-miss, fitness-zeroing, reward-hacking-trap, no-exec). Proceed to P2."

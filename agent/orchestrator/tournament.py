@@ -136,8 +136,13 @@ class RevisionController:
             # Admissibility gate: a challenger that fails it cannot enter (elementary-incumbent guard).
             fresh = [c for c in (cand_b, cand_ab) if c and c.strip() and c != inc.content]
             admissible = [c for c in fresh if is_admissible is None or is_admissible(c)]
-            new_cands = [pop.add(Candidate(id=f"rev{len(pop.candidates)}", content=c, goal=goal))
-                         for c in _dedupe(admissible)]
+            # pop.add returns None if a (population-level) hard filter rejects a candidate; drop those
+            # so new_cands holds only admitted candidates. (The refiner sets no hard filter today, so
+            # this is purely defensive against a future one.)
+            new_cands = [c for c in
+                         (pop.add(Candidate(id=f"rev{len(pop.candidates)}", content=cc, goal=goal))
+                          for cc in _dedupe(admissible))
+                         if c is not None]
 
             if not new_cands:
                 consec += 1
