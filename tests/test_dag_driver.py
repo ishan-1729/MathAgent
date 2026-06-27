@@ -1342,3 +1342,210 @@ def test_formalize_audit_result_outcome_helpers():
     assert _verdict_unavailable().lean_unavailable is True
     # The unavailable verdict is NOT misclassified as a (re-attemptable) non-compile.
     assert _verdict_unavailable().lean_could_not_formalize is False
+
+
+# ==================================================================================================
+# P4 — OPT-IN AND-NODE SORRY-SKETCH COMPILATION (Lean COMPOSITION check, LEAP §2.2/§2.5).
+#
+# A sketch_verifier=None DagDriver runs the BYTE-IDENTICAL pre-P4 decomposition path (asserted below).
+# When a sketch_verifier is supplied, a candidate decomposition — after the reviewer + acyclicity +
+# sketch-validity + conclusion-binding checks and BEFORE commit — has its SKETCH formalized as a
+# SORRY-FREE composition theorem (parent from children-as-hypotheses) and compiled+audited via Lean:
+#   * COMPILED + audited elementary  -> COMMIT, stamp sketch_lean_verified=True on the node.
+#   * NOT compiled+elementary        -> REJECT the candidate (never committed; try next / backtrack).
+# The LEAP parent-composition rule (mark_proven_via_children):
+#   parent.lean_verified = sketch_lean_verified AND all(child.lean_verified for child in children).
+# No NodeState / NodeEvent member is added; lean_verified/sketch_lean_verified are bool annotations.
+# ==================================================================================================
+
+class ScriptedSketchVerifier:
+    """A canned per-AND-node composition verifier: returns a fixed FormalizeAuditResult-shaped verdict
+    for every sketch and records the (parent_goal, sketch_text, child_goals) calls it saw. Stands in
+    for formalize_bridge.make_sketch_gate so the commit/reject logic is tested OFFLINE (no Lean/model).
+    """
+    def __init__(self, verdict: FormalizeAuditResult):
+        self._verdict = verdict
+        self.calls: list[tuple[str, str, list[str]]] = []
+
+    def __call__(self, parent_goal: str, sketch_text: str,
+                 child_goals: list[str]) -> FormalizeAuditResult:
+        self.calls.append((parent_goal, sketch_text, list(child_goals)))
+        return self._verdict
+
+
+def _leaf_pass_verifier():
+    """A leaf node_verifier that PASSES every leaf (stamps child.lean_verified=True) so a P4 test can
+    drive the all-children-discharged branch of the LEAP composition rule."""
+    return ScriptedLeafVerifier(_verdict_pass())
+
+
+# ---- the CRUCIAL invariant: sketch_verifier=None is the BYTE-IDENTICAL default path ----
+
+def test_sketch_verifier_none_is_default_byte_identical_path():
+    """With sketch_verifier=None (the default) a decomposition commits exactly as before: no sketch_lean
+    event fires, sketch_lean_verified stays False, the parent's lean_verified stays False (soft PROVEN),
+    and the prove_node(decomposition) trace is unchanged. Regression guard that the P4 arm is inert."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW])).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert g.sketch_lean_verified is False               # never stamped on the default path
+    assert g.lean_verified is False                       # soft PROVEN, unchanged behavior
+    assert res.trace.by_kind("sketch_lean") == []         # the P4 composition arm never fired
+    assert res.trace.by_kind("prove_node")                # the ordinary decomposition trace still fires
+
+
+def test_default_ornode_sketch_lean_verified_is_false():
+    # A freshly-created node carries the new composition annotation defaulting False (additive field).
+    from agent.orchestrator.dag import ProofDAG
+    n = ProofDAG().get_or_create("G")
+    assert n.sketch_lean_verified is False
+
+
+# ---- (b) a NON-COMPILING sketch is NOT committed (decomposition rejected) ----
+
+def test_noncompiling_sketch_is_not_committed():
+    """A sketch the verifier reports as NOT elementary_verified (here a could-not-compile verdict) must
+    NOT be committed: the decomposition is rejected and the parent does not prove via it."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    sv = ScriptedSketchVerifier(_verdict_noncompile())   # the composition did not compile
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, max_decomp_attempts=1).run("G")
+    assert not res.proven                                 # the only plan's sketch did not compile
+    g = res.dag.get(goal_hash("G"))
+    assert not g.proven
+    assert g.proof_kind is None and g.children == []      # rolled back: no committed decomposition
+    assert sv.calls and sv.calls[0][0] == "G"             # the sketch verifier was actually consulted
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
+    assert ev[0].data["sketch_lean_verified"] is False
+
+
+def test_audit_rejected_sketch_is_not_committed():
+    """A sketch that COMPILED but the audit REJECTED (non-elementary body dep) is likewise not committed."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    sv = ScriptedSketchVerifier(_verdict_reject())
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, max_decomp_attempts=1).run("G")
+    assert not res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind is None and g.children == []
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "elementary_violation"
+
+
+def test_unavailable_sketch_verifier_does_not_commit_fail_closed():
+    """An UNAVAILABLE Lean toolchain fails CLOSED on commit (we never commit a composition we could not
+    Lean-check): the candidate is rejected and classified lean_unavailable on the trace."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    sv = ScriptedSketchVerifier(_verdict_unavailable())
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, max_decomp_attempts=1).run("G")
+    assert not res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind is None and g.children == []
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "lean_unavailable"
+
+
+def test_crashing_sketch_verifier_rejects_candidate():
+    """A crashing sketch verifier fails CLOSED on commit (never commit an un-checkable composition)."""
+    from agent.orchestrator.dag import goal_hash
+
+    class Boom:
+        def __call__(self, parent_goal, sketch_text, child_goals):
+            raise RuntimeError("sketch verifier exploded")
+
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=Boom(), max_decomp_attempts=1).run("G")
+    assert not res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind is None and g.children == []
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "verifier_error"
+
+
+# ---- (c) a COMPILING sketch commits; with all children lean_verified -> parent.lean_verified True ----
+
+def test_compiling_sketch_commits_and_all_children_verified_sets_parent_lean_verified():
+    """A sketch the verifier ELEMENTARY-VERIFIES is committed (sketch_lean_verified=True). When EVERY
+    child is itself lean_verified (here a passing LEAF node_verifier discharges each child), the LEAP
+    composition rule sets parent.lean_verified=True."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    sv = ScriptedSketchVerifier(_verdict_pass())          # the composition compiled + audited elementary
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, node_verifier=_leaf_pass_verifier(),
+                  max_decomp_attempts=1).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert g.sketch_lean_verified is True                 # the composition compiled in Lean
+    # every child discharged (leaf-verified) AND the composition compiled -> parent lean_verified.
+    assert res.dag.get(goal_hash("A")).lean_verified is True
+    assert res.dag.get(goal_hash("B")).lean_verified is True
+    assert g.lean_verified is True
+    ev = res.trace.by_kind("sketch_lean")
+    assert ev and ev[0].data["outcome"] == "elementary_verified"
+
+
+# ---- (d) a COMPILING sketch but a child NOT lean_verified -> parent.lean_verified False ----
+
+def test_compiling_sketch_but_child_not_verified_leaves_parent_lean_verified_false():
+    """The composition compiled (sketch_lean_verified=True) but a CHILD is not lean_verified (here NO
+    leaf node_verifier runs, so each child is soft PROVEN with lean_verified=False). The LEAP rule then
+    leaves parent.lean_verified=False — the composition is incomplete (a hypothesis is undischarged in
+    Lean) even though the parent is (soft) PROVEN via children."""
+    from agent.orchestrator.dag import goal_hash
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    sv = ScriptedSketchVerifier(_verdict_pass())          # composition compiles ...
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, max_decomp_attempts=1).run("G")  # ... but no leaf verifier
+    assert res.proven                                     # still (soft) PROVEN via the children
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition"
+    assert g.sketch_lean_verified is True                 # the composition itself compiled
+    assert res.dag.get(goal_hash("A")).lean_verified is False   # children not Lean-discharged
+    assert res.dag.get(goal_hash("B")).lean_verified is False
+    assert g.lean_verified is False                       # composition incomplete -> parent NOT verified
+
+
+def test_rejected_sketch_then_compiling_retry_commits():
+    """A first decomposition whose sketch does not compile is rejected; a second attempt whose sketch
+    compiles is committed. Proves the reject path backtracks to the next attempt rather than terminating."""
+    from agent.orchestrator.dag import goal_hash
+
+    class _SeqSketchVerifier:
+        """Returns a sequence of verdicts (one per sketch call), repeating the last."""
+        def __init__(self, verdicts):
+            self._v = list(verdicts)
+            self.calls = 0
+
+        def __call__(self, parent_goal, sketch_text, child_goals):
+            v = self._v[min(self.calls, len(self._v) - 1)]
+            self.calls += 1
+            return v
+
+    prover = DictProver({"A": valid_ledger("A")})
+    # Two attempts: the ScriptedDecomposer returns the same plan twice (a re-plan).
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"]), (sketch("G", ["A"]), ["A"])])
+    sv = _SeqSketchVerifier([_verdict_noncompile(), _verdict_pass()])
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                  sketch_verifier=sv, max_decomp_attempts=2).run("G")
+    assert res.proven                                     # the second (compiling) sketch committed
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof_kind == "decomposition" and g.sketch_lean_verified is True
+    assert sv.calls == 2                                  # rejected once, then committed

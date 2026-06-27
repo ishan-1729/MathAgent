@@ -214,6 +214,14 @@ class OrNode:
     # configured (the byte-identical default path), or when formalization could not compile (a
     # re-attemptable soft PROVEN). It never gates promotion; it records WHETHER Lean confirmed the leaf.
     lean_verified: bool = False
+    # OPT-IN per-AND-node Lean COMPOSITION annotation (P4, LEAP §2.2/§2.5): set True ONLY when an
+    # optional sketch verifier compiled + audited this node's WINNING decomposition sketch as a
+    # SORRY-FREE composition theorem (the parent follows from the children-as-hypotheses, body deps
+    # elementary). Like `lean_verified` it is a pure ANNOTATION — NOT a new NodeState/NodeEvent. False
+    # by default and on the byte-identical path (no sketch verifier). It records WHETHER the COMPOSITION
+    # compiled in Lean; the LEAP parent-composition rule (mark_proven_via_children) reads it together
+    # with each child's `lean_verified` to set the parent's `lean_verified`.
+    sketch_lean_verified: bool = False
 
     @property
     def proven(self) -> bool:
@@ -264,6 +272,10 @@ class ProofDAG:
             node.children = []
             node.proof_context = None
             node.reason = None
+            # Clear the OPT-IN Lean annotations too: a stale certificate's Lean stamps (leaf or
+            # composition) are not valid under the new context and must be re-earned on re-attempt.
+            node.lean_verified = False
+            node.sketch_lean_verified = False
             self.stale_invalidations += 1
             return True
         return False
@@ -355,6 +367,15 @@ class ProofDAG:
         node.state = NodeState.PROVEN
         node.proof_context = self.context   # certificate is valid only under the current context
         node.reason = None
+        # P4 LEAP parent-composition rule: a parent is lean_verified ONLY when its COMPOSITION sketch
+        # compiled in Lean (sketch_lean_verified, stamped by the driver before this call) AND EVERY
+        # child is itself lean_verified (every hypothesis discharged). This is the LEAP invariant: a
+        # parent's per-node Lean authority requires both the composition AND all the discharged
+        # children. When no sketch verifier ran (sketch_lean_verified stays False — the byte-identical
+        # default path) this leaves lean_verified False (soft PROVEN), unchanged behavior.
+        node.lean_verified = bool(
+            node.sketch_lean_verified
+            and all(self.nodes[ck].lean_verified for ck in node.children))
         return node
 
     def mark_failed(self, goal: str, *, elementary: bool = False,

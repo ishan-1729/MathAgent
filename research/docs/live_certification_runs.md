@@ -83,3 +83,18 @@ invariant), opt-in, `elementary_verified`-level (per-leaf faithfulness deferred 
 open: **P4** AND-node `sorry`-sketch compilation (the LEAP *composition* check), **P5** a first-class
 `LEAN_VERIFIED` state, and the standing **autoformalization reach** caveat (worked on these easy leaves;
 harder leaves may fail-open to soft `PROVEN`).
+
+### P4 — AND-node sketch-compilation (the LEAP composition check), live-validated
+
+A decomposition now commits only if its **sketch** compiles in Lean. Mode A: `make_sketch_gate` formalizes
+the sketch with each child-lemma as an **axiomatized hypothesis** (`theorem T (h0 : ⟨child0⟩) (h1 : ⟨child1⟩)
+… : ⟨parent⟩ := <sorry-free body>`); if it compiles + audits elementary the composition is Lean-valid, and
+`_try_decomposition` commits it (fail-closed: a non-compiling/unavailable/crashing sketch rejects the
+candidate and backtracks). The parent becomes Lean-verified by the composition rule
+`parent.lean_verified = sketch_lean_verified ∧ all(child.lean_verified)` — i.e. only when the composition
+compiled **and** every hypothesis (child) is itself Lean-verified.
+
+Live (`make_sketch_gate(ClaudeFormalizer, warm LeanServer)`): parent `∀n, n+0=n ∧ 0+n=n` with the two
+conjuncts supplied as hypotheses → **`elementary_verified=True`, `audit.passed=True`, axioms `{}`** (8 s).
+Offline: **775 passed / 10 skipped**, default path byte-identical, no new `NodeState`/`NodeEvent`. Remaining:
+**P5** first-class `LEAN_VERIFIED` state, and the autoformalization-reach work for hard sketches/leaves.

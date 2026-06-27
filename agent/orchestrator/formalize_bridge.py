@@ -36,6 +36,13 @@ class Formalizer(Protocol):
 
 
 @runtime_checkable
+class SketchFormalizer(Protocol):
+    def formalize_sketch(self, parent_goal: str, sketch_text: str,
+                         child_goals: list[str]) -> FormalizationResult:
+        ...
+
+
+@runtime_checkable
 class FaithfulnessChecker(Protocol):
     def check(self, informal_claim: str, lean_source: str, theorem_name: str) -> FaithfulnessVerdict:
         ...
@@ -308,5 +315,124 @@ def make_node_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None,
                                    informal_claim=node_goal,
                                    faithfulness_checker=None, server=server,
                                    retriever=retriever, repair_iters=repair_iters)
+
+    return gate
+
+
+# --------------------------------------------------------------------------------------------------
+# P4: AND-node sorry-sketch composition gate (LEAP §2.2/§2.5 COMPOSITION check).
+#
+# A decomposition sketch is formalized as a SORRY-FREE Lean theorem proving the PARENT goal ASSUMING
+# the child goals as named hypotheses h0, h1, ... (children-as-hypotheses, MODE A). Because the body
+# is sorry-free, the SAME `audit_lean_source` path applies VERBATIM: `elementary_verified` then means
+# the SKETCH compiled (the composition is Lean-valid) AND the body's own axioms/deps are elementary.
+# faithfulness is None here (deferred to the root terminal gate); the per-CHILD lemmas are verified by
+# their own per-node gate. This is the AND-node twin of `make_node_gate` (the LEAF gate).
+# --------------------------------------------------------------------------------------------------
+
+def formalize_sketch_and_audit(parent_goal: str, sketch_text: str, child_goals: list[str],
+                               formalizer: SketchFormalizer,
+                               toolkit: Optional[Toolkit] = None,
+                               project_dir: Optional[str | Path] = None,
+                               timeout_s: int = 600,
+                               faithfulness_checker: Optional[FaithfulnessChecker] = None,
+                               server: Optional[object] = None,
+                               retriever: Optional[object] = None,
+                               repair_iters: int = 0) -> FormalizeAuditResult:
+    """Formalize a DECOMPOSITION sketch (children-as-hypotheses) -> compile + Layer-4 audit, with an
+    optional Lean-error repair loop. Mirrors `formalize_and_audit` but drives the formalizer's
+    `formalize_sketch(parent_goal, sketch_text, child_goals)` path. The emitted theorem is SORRY-FREE
+    (the children are HYPOTHESES, not sorries), so `audit_lean_source` is reused verbatim and
+    `.elementary_verified` means the COMPOSITION compiled AND the body's deps/axioms are elementary."""
+    toolkit = toolkit or load_toolkit()
+    if project_dir is None and server is None:
+        project_dir = lean_bridge.find_mathlib_project()
+
+    fr = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals)
+    if not fr.ok:
+        return FormalizeAuditResult(formalized=False, notes=fr.notes)
+    source, name = fr.lean_source, fr.theorem_name
+    last_error: Optional[str] = None
+
+    for i in range(repair_iters + 1):
+        attempts = i + 1
+        try:
+            audit = lean_bridge.audit_lean_source(
+                source, name, toolkit=toolkit,
+                project_dir=project_dir, timeout_s=timeout_s, server=server)
+        except lean_bridge.LeanUnavailable as e:
+            return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
+                                        lean_source=source, error=str(e), attempts=attempts)
+        except lean_bridge.LeanBridgeError as e:
+            last_error = str(e)
+            if i >= repair_iters:
+                break
+            lemmas = retriever.retrieve(parent_goal, last_error) if retriever is not None else []
+            fr2 = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals,
+                                              prior_source=source, errors=[last_error], lemmas=lemmas)
+            if not fr2.ok:
+                break
+            source, name = fr2.lean_source, fr2.theorem_name
+            continue
+
+        # Compiled. If the audit REJECTED (sorry in the BODY / non-elementary dependency) and repair
+        # budget remains, feed the reject reasons back for a clean, elementary composition.
+        if not audit.passed and i < repair_iters:
+            last_error = "; ".join(str(f) for f in audit.rejects())
+            lemmas = retriever.retrieve(parent_goal, last_error) if retriever is not None else []
+            fr2 = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals,
+                                              prior_source=source, errors=[last_error], lemmas=lemmas)
+            if fr2.ok:
+                source, name = fr2.lean_source, fr2.theorem_name
+                continue
+
+        faith: Optional[FaithfulnessVerdict] = None
+        if faithfulness_checker is not None:
+            faith = faithfulness_checker.check(parent_goal, source, name)
+        return FormalizeAuditResult(formalized=True, compiled=True, theorem_name=name,
+                                    lean_source=source, audit=audit, faithfulness=faith,
+                                    attempts=attempts)
+
+    return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
+                                lean_source=source, error=last_error, attempts=repair_iters + 1)
+
+
+def make_sketch_gate(formalizer: SketchFormalizer, toolkit: Optional[Toolkit] = None,
+                     project_dir: Optional[str | Path] = None,
+                     server: Optional[object] = None,
+                     retriever: Optional[object] = None,
+                     repair_iters: int = 0,
+                     timeout_s: int = 600) -> Callable[[str, str, list[str]], FormalizeAuditResult]:
+    """A PER-AND-NODE composition verifier for DagDriver:
+    ``(parent_goal, sketch_text, child_goals) -> FormalizeAuditResult``.
+
+    A SIBLING of `make_node_gate` (the LEAF gate, whose semantics are untouched). It formalizes the
+    decomposition SKETCH as a SORRY-FREE Lean theorem proving the parent ASSUMING the children as
+    hypotheses (the LEAP §2.2/§2.5 composition step), compiles it, and runs the Layer-4 audit. Per the
+    open-decision default its authority is `elementary_verified` ONLY (compiled AND audit.passed): the
+    sketch COMPILED (the composition is Lean-valid) AND the body's axioms/deps are elementary.
+
+    It passes `faithfulness_checker=None`: composition-level faithfulness is DEFERRED to the root
+    terminal gate (`make_terminal_gate`), which checks the assembled proof faithfully captures the ROOT
+    goal. The per-CHILD lemmas are verified by their own per-node gate, so a sketch only needs to be
+    *audited elementary* here.
+
+    Unavailability is detected up front (same as `make_node_gate`): with no Lean toolchain reachable
+    the gate returns `lean_unavailable=True` (compiled=False) WITHOUT a compile, so the driver can fall
+    back to the byte-identical offline path rather than misclassifying it.
+    """
+    toolkit = toolkit or load_toolkit()
+
+    def gate(parent_goal: str, sketch_text: str, child_goals: list[str]) -> FormalizeAuditResult:
+        if not _lean_available(server, project_dir):
+            return FormalizeAuditResult(formalized=False, compiled=False,
+                                        error="lean toolchain unavailable",
+                                        lean_unavailable=True)
+        # faithfulness_checker=None: composition-level faithfulness is deferred to the root gate.
+        return formalize_sketch_and_audit(parent_goal, sketch_text, child_goals, formalizer,
+                                          toolkit=toolkit, project_dir=project_dir,
+                                          timeout_s=timeout_s, faithfulness_checker=None,
+                                          server=server, retriever=retriever,
+                                          repair_iters=repair_iters)
 
     return gate

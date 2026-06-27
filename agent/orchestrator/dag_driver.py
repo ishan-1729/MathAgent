@@ -145,6 +145,7 @@ class DagDriver:
         h0_consistency: bool = True,
         evolve_fallback: Optional[Decomposer] = None,
         node_verifier: Optional[Callable[[str, str], object]] = None,
+        sketch_verifier: Optional[Callable[[str, str, list[str]], object]] = None,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -203,6 +204,18 @@ class DagDriver:
         # BYTE-IDENTICAL code path it ran before this feature existed — nothing in the default path calls
         # the verifier or touches lean_verified.
         self.node_verifier = node_verifier
+        # OPT-IN per-AND-node Lean COMPOSITION authority (P4, LEAP §2.2/§2.5): a callable
+        # (parent_goal, sketch_text, child_goals) -> verdict (a FormalizeAuditResult, e.g. from
+        # formalize_bridge.make_sketch_gate). When set, a candidate decomposition — AFTER it passes the
+        # reviewer + acyclicity + sketch-validity + conclusion-binding checks and BEFORE commit — has its
+        # SKETCH formalized as a SORRY-FREE composition theorem (the parent from children-as-hypotheses)
+        # and compiled+audited via Lean. The decomposition is COMMITTED only if the sketch compiled +
+        # audited elementary (res.elementary_verified True); a non-compiling/rejected sketch REJECTS the
+        # candidate (backtrack / next attempt) and is never committed. A committed sketch stamps
+        # sketch_lean_verified=True on the node, which mark_proven_via_children reads for the LEAP
+        # parent-composition rule. When None (the default) _try_decomposition runs the BYTE-IDENTICAL
+        # pre-P4 path — nothing calls the verifier or touches sketch_lean_verified.
+        self.sketch_verifier = sketch_verifier
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
@@ -631,6 +644,49 @@ class DagDriver:
         self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
         return True
 
+    def _verify_sketch(self, goal: str, sketch: str,
+                       children: list[str]) -> tuple[bool, bool, list[str]]:
+        """OPT-IN per-AND-node Lean COMPOSITION check (P4, LEAP §2.2/§2.5). Only ever called when
+        `self.sketch_verifier is not None`. Formalizes this candidate's sketch as a SORRY-FREE
+        composition theorem (parent from children-as-hypotheses), compiles + audits it, and decides
+        whether the decomposition may be COMMITTED.
+
+        Returns ``(committed, sketch_lean_verified, reject_notes)``:
+          * COMMIT (True, True, [])  iff the composition compiled AND audited elementary
+            (`res.elementary_verified`): the parent provably follows from the children-as-hypotheses
+            and the body's own deps/axioms are elementary. The node is stamped sketch_lean_verified.
+          * REJECT (False, False, notes) otherwise — a non-compiling / audit-rejected / unavailable
+            sketch is NOT a Lean-valid composition, so this candidate is dropped (the caller tries the
+            next attempt / backtracks). The decomposition is never committed without a compiling sketch.
+
+        FAIL-CLOSED on commit: an UNAVAILABLE toolchain or a crashing verifier rejects the candidate
+        (we never commit a composition we could not Lean-check). This only fires when a sketch_verifier
+        is explicitly configured; the None default never reaches here (byte-identical path)."""
+        try:
+            verdict = self.sketch_verifier(goal, sketch, children)
+        except Exception as e:
+            self.trace.emit("sketch_lean", goal=goal[:80], outcome="verifier_error",
+                            sketch_lean_verified=False, detail=str(e)[:120])
+            return False, False, [f"sketch verifier error: {str(e)[:120]}"]
+
+        elementary_verified = bool(getattr(verdict, "elementary_verified", False))
+        if elementary_verified:
+            self.trace.emit("sketch_lean", goal=goal[:80], outcome="elementary_verified",
+                            sketch_lean_verified=True, children=len(children))
+            return True, True, []
+
+        # Not compiled+elementary -> never commit. Classify for the trace (unavailable vs rejected vs
+        # non-compile) without changing the (uniform) reject decision.
+        if bool(getattr(verdict, "lean_unavailable", False)):
+            outcome, note = "lean_unavailable", "lean toolchain unavailable for the composition check"
+        elif bool(getattr(verdict, "lean_compiled_but_rejected", False)):
+            outcome, note = "elementary_violation", "composition compiled but the audit rejected it"
+        else:
+            outcome, note = "lean_could_not_formalize", "composition sketch did not compile"
+        self.trace.emit("sketch_lean", goal=goal[:80], outcome=outcome,
+                        sketch_lean_verified=False, children=len(children))
+        return False, False, [note]
+
     def _try_decomposition(self, goal: str, sketch: str, children: list[str],
                            child_ancestors: set[str], depth: int) -> tuple[bool, list[str], Optional[str]]:
         """Validate + commit + recurse one candidate decomposition. Returns (success, feedback, reason)
@@ -695,17 +751,36 @@ class DagDriver:
             return (False, ["sketch conclusion does not prove the parent goal"],
                     ReasonCode.gap_found.value)
 
+        # P4 (LEAP §2.2/§2.5 COMPOSITION check): when a sketch_verifier is configured, formalize this
+        # candidate's SKETCH as a SORRY-FREE Lean theorem proving the parent ASSUMING the children as
+        # hypotheses, then compile + audit it. COMMIT the decomposition ONLY if the composition compiled
+        # + audited elementary (res.elementary_verified True); a non-compiling/rejected sketch REJECTS
+        # this candidate (caller tries the next attempt / backtracks). When None (the default) this is a
+        # no-op and the path below is the BYTE-IDENTICAL pre-P4 commit. A passing sketch sets
+        # sketch_ok=True here and is stamped onto the node AFTER commit (read by the LEAP composition
+        # rule in mark_proven_via_children).
+        sketch_ok = False
+        if self.sketch_verifier is not None:
+            committed, sketch_ok, sk_reject = self._verify_sketch(goal, sketch, children)
+            if not committed:
+                return False, sk_reject, ReasonCode.gap_found.value
+
         # Snapshot the node so the commit can be rolled back if a child fails to prove. Committing
         # before recursion lets the acyclicity guard see the in-flight edges, but a child failure must
         # NOT leave stale 'decomposition' metadata behind (assemble()/proof_bundle would render it).
         node = self.dag.get_or_create(goal)
         prev_proof, prev_kind = node.proof, node.proof_kind
         prev_children, prev_state = list(node.children), node.state
+        prev_sketch_lean = node.sketch_lean_verified
 
         try:
             self.dag.commit_decomposition(goal, sketch, children, child_ancestors)
         except CycleError:
             return False, ["commit detected a cycle"], ReasonCode.cyclic_decomposition.value
+        # Stamp the composition's Lean verdict on the committed node (P4). It is read by the LEAP
+        # parent-composition rule when the children all prove (mark_proven_via_children) and is rolled
+        # back together with the rest of the commit if a child / H0 fails below.
+        node.sketch_lean_verified = sketch_ok
 
         # Prove the committed AND children in width-bounded waves ordered by upward_rank (deepest
         # critical chain first), the Dilworth antichain width capping the parallel fan-out. This is
@@ -719,6 +794,7 @@ class DagDriver:
             # Roll back the (uncompleted) commit so no stale decomposition lingers on the node.
             node.proof, node.proof_kind = prev_proof, prev_kind
             node.children, node.state = prev_children, prev_state
+            node.sketch_lean_verified = prev_sketch_lean
             # V1 FIX: propagate the failing CHILD's REAL reason instead of hardcoding gap_found. A
             # committed child that only EXHAUSTED on a LIMIT (budget_starved / depth_limit) is NOT a
             # genuine logical gap in the parent's plan — it is retryable. Hardcoding gap_found here
@@ -737,6 +813,7 @@ class DagDriver:
         if h0 is not None and not h0.consistent:
             node.proof, node.proof_kind = prev_proof, prev_kind
             node.children, node.state = prev_children, prev_state
+            node.sketch_lean_verified = prev_sketch_lean
             self.trace.emit("h0_violation", goal=goal[:80], overlap=h0.offending_overlap,
                             detail=h0.summary(), reason=ReasonCode.elementary_violation.value)
             return False, [str(c) for c in h0.conflicts] or [h0.summary()], \
