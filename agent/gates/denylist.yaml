@@ -59,6 +59,14 @@ lean_denylist_decls:
   - Mathlib.NumberTheory.Cyclotomic
   - Mathlib.NumberTheory.Catalan
   - Mathlib.AlgebraicGeometry
+  # Imaginary-quadratic rings Z[√d] and the Gaussian integers Z[i]: dropping into a quadratic ring and
+  # using its unique-factorization / Euclidean structure (coprime factors of a cube are cubes) is the
+  # classic NON-elementary shortcut for Diophantine equations (e.g. x^2+1=y^3). The elementary toolkit
+  # forces a proof over Z (descent/bounding/congruence). The prose scanner already flags "unique
+  # factorization domain"; this gives Layer-4 the matching content decls so it does not wave it through.
+  - GaussianInt
+  - Zsqrtd
+  - Mathlib.NumberTheory.Zsqrtd
 
 lean_infrastructure_allowlist:
   - WellFounded.fix
