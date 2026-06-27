@@ -207,6 +207,13 @@ class OrNode:
     # Precise blocker classification for a failed/exhausted node (ReasonCode.value) so no give-up is
     # unclassified (T100 P1 item 3). None while OPEN/IN_PROGRESS/PROVEN.
     reason: Optional[str] = None
+    # OPT-IN per-leaf Lean authority annotation (P0/P2): set True ONLY when an optional per-node
+    # verifier compiled + audited this leaf's proof as elementary. It is a pure ANNOTATION on a node
+    # that is PROVEN by the existing path — NOT a new NodeState and NOT a new NodeEvent (the
+    # enum-cartesian FSM proptest is untouched). False by default and when no per-node verifier is
+    # configured (the byte-identical default path), or when formalization could not compile (a
+    # re-attemptable soft PROVEN). It never gates promotion; it records WHETHER Lean confirmed the leaf.
+    lean_verified: bool = False
 
     @property
     def proven(self) -> bool:

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from agent.gates.toolkit import Toolkit
+from agent.tools.claude_cli import ClaudeConfig, _run_claude
 from agent.tools.codex_prover import CodexConfig, _run_codex
 
 DEFAULT_THEOREM_NAME = "ma_target"
@@ -94,6 +95,58 @@ class CodexFormalizer:
         else:
             prompt = self._fresh_prompt(ledger_text)
         raw = _run_codex(prompt, self.cfg)
+        src = extract_lean(raw)
+        if not src:
+            return FormalizationResult(ok=False, raw=raw, notes=["no Lean code block found"])
+        name = first_decl_name(src) or DEFAULT_THEOREM_NAME
+        return FormalizationResult(ok=True, lean_source=src, theorem_name=name, raw=raw)
+
+
+class ClaudeFormalizer:
+    """Opus-backed twin of :class:`CodexFormalizer` — same prompts/_RULES/parsing/repair contract and
+    same :class:`FormalizationResult`, but generates via the headless Claude CLI (``--model opus``)
+    instead of Codex. A drop-in for the same ``Formalizer`` Protocol used by ``formalize_and_audit`` /
+    ``make_terminal_gate``."""
+
+    def __init__(self, toolkit: Toolkit, cfg: Optional[ClaudeConfig] = None):
+        self.toolkit = toolkit
+        self.cfg = cfg or ClaudeConfig(model="opus")
+
+    # Identical rule block to CodexFormalizer: the elementary/faithfulness contract is the same
+    # regardless of which model generates the Lean.
+    _RULES = CodexFormalizer._RULES
+
+    def _fresh_prompt(self, ledger_text: str) -> str:
+        return (
+            "You are formalizing an ALREADY-VERIFIED elementary number-theory proof into Lean 4.\n"
+            f"Produce a Lean 4 theorem named `{DEFAULT_THEOREM_NAME}` with a COMPLETE, compiling proof.\n"
+            + self._RULES +
+            "\nOutput ONLY one fenced ```lean code block (imports + the theorem). No prose.\n\n"
+            f"INFORMAL STEP-LEDGER (a gate-passed elementary proof):\n{ledger_text}\n"
+        )
+
+    def _repair_prompt(self, ledger_text: str, prior_source: str,
+                       errors: list[str], lemmas: Optional[list[str]]) -> str:
+        err = "\n".join(f"- {e}" for e in (errors or [])[:8])
+        lem = ("\nReal Mathlib declarations you may use (retrieved — these EXIST, prefer them over "
+               "guessed names):\n" + "\n".join(f"- {x}" for x in lemmas[:15]) if lemmas else "")
+        return (
+            "Your previous Lean 4 formalization FAILED to compile. Fix it.\n" + self._RULES +
+            f"\nPREVIOUS ATTEMPT:\n```lean\n{prior_source}\n```\n\n"
+            f"LEAN COMPILER ERRORS:\n{err}\n{lem}\n\n"
+            "Return the CORRECTED, complete, compiling theorem. Keep the name and the (faithful) "
+            f"statement; only fix what's broken. Output ONLY one fenced ```lean code block.\n\n"
+            f"INFORMAL STEP-LEDGER (the proof to formalize):\n{ledger_text}\n"
+        )
+
+    def formalize(self, ledger_text: str, prior_source: Optional[str] = None,
+                  errors: Optional[list[str]] = None,
+                  lemmas: Optional[list[str]] = None) -> FormalizationResult:
+        if prior_source:
+            prompt = self._repair_prompt(ledger_text, prior_source, errors or [], lemmas)
+        else:
+            prompt = self._fresh_prompt(ledger_text)
+        raw = _run_claude(prompt, self.cfg)
         src = extract_lean(raw)
         if not src:
             return FormalizationResult(ok=False, raw=raw, notes=["no Lean code block found"])

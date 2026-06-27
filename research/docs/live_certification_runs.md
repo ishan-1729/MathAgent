@@ -48,3 +48,38 @@ Decidable` error" repair hint. This is a prompt/repair improvement, not an archi
 
 > Reproducibility: Lean 4.30.0 + Mathlib v4.30.0 via the persistent REPL server. Runs were one-shot at
 > xHigh; the `prove.py` trace JSONL for each is under the run's `--out` prefix.
+
+---
+
+## 2026-06-27 — Per-node Lean verification (P0–P2), live-validated
+
+Closing the LEAP "engine gap": LEAP verifies **every node** with the Lean compiler, whereas MathAgent
+previously verified each node with the soft deterministic gate and ran Lean only as an *optional,
+default-off, root-level* terminal pass (so a default run reported `PROVEN` with **zero** Lean). P0–P2
+add an **opt-in per-node verifier** (`DagDriver(node_verifier=…)`, default `None` so the offline suite
+is byte-identical): a LEAF resolves `lean_verified=True` only after its ledger is formalized, **compiled
+against Mathlib**, and passes the Layer-4 axiom/denylist audit. Routing is fail-closed on a Lean *reject*
+(→ `FAILED_ELEMENTARY`) and fail-open to soft `PROVEN` if formalization won't compile (gap #1 defense).
+
+Generator/formalizer: **Claude (opus)** behind the prover-agnostic interfaces — `CodexProver`/
+`CodexFormalizer` were quota-blocked (monthly cap, resets Jul 27), and the new `ClaudeFormalizer` is a
+drop-in for the `Formalizer` protocol. Verifier = `make_node_gate(ClaudeFormalizer, server=warm LeanServer)`.
+
+**Part 1 — per-node gate on a live ledger (formalize → compile → audit):**
+
+| leaf | `elementary_verified` | `audit.passed` | axioms | constants | wall |
+|---|---|---|---|---|---|
+| `n + 0 = n` | ✅ | ✅ | `{propext}` | 56 | 10 s |
+| `n² ≡ 0 or 1 (mod 4)` | ✅ | ✅ | `{propext, Classical.choice, Quot.sound}` | 235 | 35 s |
+| `¬∃ x,y>0. x² = 2y²` (√2 irr.) | ✅ | ✅ | `{propext, Classical.choice, Quot.sound}` | 124 | 436 s |
+
+**Part 2 — full `DagDriver` integration (`n+0=n`):** the gate-passing leaf routes through `node_verifier`
+→ `node.state = PROVEN`, **`node.lean_verified = True`**, `node_lean` trace event
+`outcome='elementary_verified'`. Offline: **758 passed / 9 skipped**, default path byte-identical, no new
+`NodeState`/`NodeEvent`.
+
+**What this validates / scope:** per-node Lean is now a real authority for **leaf** nodes (the LEAP
+invariant), opt-in, `elementary_verified`-level (per-leaf faithfulness deferred to the root gate). Still
+open: **P4** AND-node `sorry`-sketch compilation (the LEAP *composition* check), **P5** a first-class
+`LEAN_VERIFIED` state, and the standing **autoformalization reach** caveat (worked on these easy leaves;
+harder leaves may fail-open to soft `PROVEN`).

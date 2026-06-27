@@ -144,6 +144,7 @@ class DagDriver:
         fanout_cap: int = 16,
         h0_consistency: bool = True,
         evolve_fallback: Optional[Decomposer] = None,
+        node_verifier: Optional[Callable[[str, str], object]] = None,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -193,6 +194,15 @@ class DagDriver:
         # acyclicity/strict-simpler-child + H0 checks as a normal decomposition (no weaker gate). None =>
         # disabled (graceful no-op); also a no-op if the backend reports itself unavailable.
         self.evolve_fallback = evolve_fallback
+        # OPT-IN per-node Lean authority (P0/P2): a callable (node_goal, node_proof_text) -> verdict
+        # (a FormalizeAuditResult, e.g. from formalize_bridge.make_node_gate). When set, a LEAF about to
+        # be marked PROVEN-direct is additionally routed through Lean: a compiled+audited leaf is stamped
+        # lean_verified; a compiled-but-REJECTED leaf REFUTES elementarity (downgrade to
+        # FAILED_ELEMENTARY); a non-compiling formalization FAILS OPEN (soft PROVEN, re-attemptable); an
+        # UNAVAILABLE toolchain is a retryable EXHAUSTED. When None (the default) `_prove` runs the
+        # BYTE-IDENTICAL code path it ran before this feature existed — nothing in the default path calls
+        # the verifier or touches lean_verified.
+        self.node_verifier = node_verifier
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
@@ -286,6 +296,11 @@ class DagDriver:
                 if not self._verify_or_downgrade(goal, res):
                     return False
             ledger = self._refine(goal, res.ledger)   # Autoreason tournament (no-regression refine)
+            # OPT-IN per-node Lean authority (P2): when a node_verifier is configured, route this LEAF
+            # through Lean before/at promotion. When it is None (the default) this is a no-op and the
+            # arm below is the BYTE-IDENTICAL pre-feature path (mark_proven_direct + the same trace).
+            if self.node_verifier is not None:
+                return self._verify_leaf_and_route(goal, ledger)
             self.dag.mark_proven_direct(goal, ledger)
             self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
             return True
@@ -535,6 +550,85 @@ class DagDriver:
                             detail=verdict.summary(), reason=ReasonCode.elementary_violation.value)
             return False
         self.trace.emit("verifier_passed", goal=goal[:80], inspected=verdict.inspected_steps)
+        return True
+
+    def _verify_leaf_and_route(self, goal: str, ledger: str) -> bool:
+        """OPT-IN per-node Lean authority (P2): route a LEAF that the existing path already accepted
+        (a goal-bound, gate-passed direct ledger about to be marked PROVEN) through the configured
+        `node_verifier` and classify the FOUR mutually-exclusive outcomes. Only ever called when
+        `self.node_verifier is not None`; the None default never reaches here (byte-identical path).
+
+        Fail-CLOSED on the elementarity claim, fail-OPEN on inability to formalize:
+          (i)   PASS  (compiled AND audit.passed / .elementary_verified) -> mark_proven_direct AND
+                set node.lean_verified=True. Lean CONFIRMED the leaf is elementary.
+          (ii)  REJECT (compiled but the audit rejected: sorry / denylist / non-whitelist axiom) ->
+                this REFUTES elementarity -> mark_failed(elementary=True, elementary_violation)
+                (downgrade-don't-discard; the offending dep is recorded on the trace).
+          (iii) COULD-NOT-COMPILE (no Lean produced / a compile error) -> FAIL OPEN: still
+                mark_proven_direct (the informal gate already passed it) with lean_verified=False
+                (re-attemptable; do NOT poison search).
+          (iv)  UNAVAILABLE (server down / lean not installed) -> mark_exhausted (a retryable,
+                budget_starved-equivalent 'lean_unavailable'); the leaf is re-attemptable when Lean is
+                back. NOT a terminal failure.
+
+        The verifier is independent; any unexpected exception in it is treated as fail-OPEN (soft
+        PROVEN) so a flaky verifier never poisons a goal that the informal gate already admitted."""
+        try:
+            verdict = self.node_verifier(goal, ledger)
+        except Exception as e:
+            # A crashing verifier must not refute or starve: the informal gate already passed this leaf.
+            # Fail OPEN -> soft PROVEN (lean_verified=False), exactly as a non-compile outcome.
+            self.dag.mark_proven_direct(goal, ledger)
+            self.trace.emit("node_lean", goal=goal[:80], outcome="verifier_error",
+                            lean_verified=False, detail=str(e)[:120])
+            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+            return True
+
+        unavailable = bool(getattr(verdict, "lean_unavailable", False))
+        elementary_verified = bool(getattr(verdict, "elementary_verified", False))
+        compiled = bool(getattr(verdict, "compiled", False))
+        audit = getattr(verdict, "audit", None)
+        # 'compiled-but-rejected' is the hard refutation; prefer the read-only helper if the verdict
+        # exposes it, else derive it from (compiled AND audit ran AND audit did not pass).
+        rejected = bool(getattr(verdict, "lean_compiled_but_rejected",
+                                compiled and audit is not None and not bool(getattr(audit, "passed", False))))
+
+        # (iv) UNAVAILABLE -> retryable EXHAUSTED (do NOT poison; re-attemptable when Lean is back).
+        if unavailable:
+            self.dag.mark_exhausted(goal, reason=ReasonCode.budget_starved.value)
+            self.trace.emit("node_lean", goal=goal[:80], outcome="lean_unavailable",
+                            lean_verified=False, reason="lean_unavailable")
+            return False
+
+        # (i) PASS -> promote AND stamp lean_verified.
+        if elementary_verified:
+            node = self.dag.mark_proven_direct(goal, ledger)
+            node.lean_verified = True
+            self.trace.emit("node_lean", goal=goal[:80], outcome="elementary_verified",
+                            lean_verified=True)
+            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+            return True
+
+        # (ii) REJECT (compiled but audit refuted) -> downgrade-don't-discard to FAILED_ELEMENTARY.
+        if rejected:
+            detail = ""
+            if audit is not None:
+                try:
+                    detail = "; ".join(str(f) for f in audit.rejects())[:200]
+                except Exception:
+                    detail = (audit.summary() if hasattr(audit, "summary") else "")[:200]
+            self.dag.mark_failed(goal, elementary=True,
+                                 reason=ReasonCode.elementary_violation.value)
+            self.trace.emit("node_lean", goal=goal[:80], outcome="elementary_violation",
+                            lean_verified=False, detail=detail,
+                            reason=ReasonCode.elementary_violation.value)
+            return False
+
+        # (iii) COULD-NOT-COMPILE (no Lean / compile error) -> FAIL OPEN: soft PROVEN, re-attemptable.
+        self.dag.mark_proven_direct(goal, ledger)
+        self.trace.emit("node_lean", goal=goal[:80], outcome="lean_could_not_formalize",
+                        lean_verified=False)
+        self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
         return True
 
     def _try_decomposition(self, goal: str, sketch: str, children: list[str],

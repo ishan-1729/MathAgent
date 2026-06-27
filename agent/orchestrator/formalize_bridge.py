@@ -52,11 +52,36 @@ class FormalizeAuditResult:
     error: Optional[str] = None
     attempts: int = 1   # formalization attempts used (1 + repair iterations consumed)
     notes: list[str] = field(default_factory=list)
+    # Read-only annotation (per-node gate, P0/P2): True iff the Lean toolchain was UNAVAILABLE (server
+    # down / `lean` not installed) so no compile could even be attempted. Distinct from a compile that
+    # ran and FAILED. Purely additive — none of the existing `elementary_verified`/`faithful`/
+    # `authoritative` properties read it, so their semantics are unchanged (a result with
+    # lean_unavailable=True has compiled=False and is therefore not elementary_verified, as before).
+    lean_unavailable: bool = False
 
     @property
     def elementary_verified(self) -> bool:
         """Compiled AND passed the Lean dependency/axiom audit."""
         return bool(self.compiled and self.audit is not None and self.audit.passed)
+
+    # ---- per-node-gate outcome classification (read-only; P2 driver routing) --------------------
+    # The DAG driver's optional per-node verifier routes a LEAF on FOUR mutually-exclusive outcomes.
+    # These read-only helpers name them off the existing fields so the driver does not re-derive the
+    # classification inline (and so the semantics live next to the data). They DO NOT change any gate.
+
+    @property
+    def lean_compiled_but_rejected(self) -> bool:
+        """Compiled, the audit RAN, and it REJECTED (sorry / denylist / non-whitelist axiom). This
+        REFUTES elementarity for the leaf (a hard, fail-CLOSED signal), distinct from a proof that
+        could not be formalized/compiled at all."""
+        return bool(self.compiled and self.audit is not None and not self.audit.passed)
+
+    @property
+    def lean_could_not_formalize(self) -> bool:
+        """The toolchain was available but the proof could not be turned into a compiling Lean term
+        (no Lean produced, or a compile error). NOT a refutation of elementarity — a fail-OPEN signal:
+        the leaf stays softly proven and is re-attemptable. Excludes the unavailable case."""
+        return bool(not self.lean_unavailable and not self.compiled)
 
     @property
     def faithful(self) -> bool:
@@ -220,6 +245,68 @@ def make_terminal_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None
                                    project_dir=project_dir, timeout_s=timeout_s,
                                    informal_claim=root_goal,
                                    faithfulness_checker=faithfulness_checker, server=server,
+                                   retriever=retriever, repair_iters=repair_iters)
+
+    return gate
+
+
+def _lean_available(server: Optional[object], project_dir: Optional[str | Path]) -> bool:
+    """Is the Lean toolchain reachable for a per-node audit? A persistent `server` whose `available()`
+    reports True, OR (no server) a `lean`/`lake` on PATH. Best-effort + fail-SAFE: any probe error is
+    treated as UNAVAILABLE (the node gate then routes the leaf to a retryable 'lean_unavailable', never
+    a spurious refutation). Read-only: no compile is run here."""
+    if server is not None:
+        avail = getattr(server, "available", None)
+        if callable(avail):
+            try:
+                return bool(avail())
+            except Exception:
+                return False
+        # A server object without an availability probe is assumed usable (its audit() will surface a
+        # LeanUnavailable if not, which the caller maps to lean_unavailable).
+        return True
+    try:
+        if project_dir is not None:
+            return lean_bridge.find_lake() is not None
+        return lean_bridge.available()
+    except Exception:
+        return False
+
+
+def make_node_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None,
+                   project_dir: Optional[str | Path] = None,
+                   server: Optional[object] = None,
+                   retriever: Optional[object] = None,
+                   repair_iters: int = 0,
+                   timeout_s: int = 600) -> Callable[[str, str], FormalizeAuditResult]:
+    """A PER-LEAF verifier for DagDriver: (node_goal, node_proof_text) -> FormalizeAuditResult.
+
+    A SIBLING of `make_terminal_gate` (whose semantics are untouched). It formalizes a SINGLE node's
+    proof, compiles it, and runs the Layer-4 dependency/axiom audit — but per the open-decision default
+    its per-leaf AUTHORITY is `elementary_verified` ONLY (compiled AND audit.passed). It deliberately
+    passes `faithfulness_checker=None`: per-leaf statement-faithfulness is DEFERRED to the root terminal
+    gate (`make_terminal_gate`), which checks the assembled proof faithfully captures the ROOT goal. A
+    leaf only needs to be *audited elementary*; running an expensive faithfulness panel at every leaf
+    would be redundant with the root check and is intentionally omitted here.
+
+    Unavailability is detected up front: if no Lean toolchain is reachable, the gate returns a result
+    flagged `lean_unavailable=True` (compiled=False) WITHOUT attempting a compile, so the driver can
+    route the leaf to a retryable 'lean_unavailable' rather than misclassifying it as a non-compile.
+    This keeps `formalize_and_audit`'s own behaviour unchanged (we never rely on it to disambiguate
+    unavailable-vs-compile-failure).
+    """
+    toolkit = toolkit or load_toolkit()
+
+    def gate(node_goal: str, node_proof_text: str) -> FormalizeAuditResult:
+        if not _lean_available(server, project_dir):
+            return FormalizeAuditResult(formalized=False, compiled=False,
+                                        error="lean toolchain unavailable",
+                                        lean_unavailable=True)
+        # faithfulness_checker=None: per-leaf authority is elementary_verified only (see docstring).
+        return formalize_and_audit(node_proof_text, formalizer, toolkit=toolkit,
+                                   project_dir=project_dir, timeout_s=timeout_s,
+                                   informal_claim=node_goal,
+                                   faithfulness_checker=None, server=server,
                                    retriever=retriever, repair_iters=repair_iters)
 
     return gate

@@ -1144,3 +1144,201 @@ def test_v5_and_fanout_emits_critical_path_depth():
     assert res.proven
     ev = res.trace.by_kind("and_fanout")
     assert ev and "max_depth" in ev[0].data
+
+
+# ==================================================================================================
+# P0+P2 — OPT-IN PER-NODE LEAN VERIFICATION (Lean as a per-leaf authority).
+#
+# A node_verifier=None DagDriver runs the BYTE-IDENTICAL pre-feature path (asserted below). When a
+# verifier is supplied, a LEAF about to be marked PROVEN-direct is routed through Lean and the FOUR
+# outcomes route deterministically:
+#   (i)   PASS (compiled + audit.passed)        -> PROVEN + node.lean_verified True
+#   (ii)  REJECT (compiled but audit rejected)  -> FAILED_ELEMENTARY (refutes elementarity)
+#   (iii) could-not-compile (no Lean produced)  -> soft PROVEN + node.lean_verified False
+#   (iv)  UNAVAILABLE (lean not installed)      -> EXHAUSTED (retryable)
+# No NodeState / NodeEvent member is added; the FSM proptest is untouched.
+# ==================================================================================================
+
+from agent.orchestrator.formalize_bridge import FormalizeAuditResult, make_node_gate  # noqa: E402
+from agent.gates.lean_audit import LeanAuditResult, LeanVerdict  # noqa: E402
+from agent.gates.report import Finding, Severity, LAYER_LEAN  # noqa: E402
+
+
+def _verdict_pass() -> FormalizeAuditResult:
+    """Outcome (i): compiled AND the Lean audit PASSED -> elementary_verified is True."""
+    audit = LeanAuditResult(verdict=LeanVerdict.PASS, findings=[])
+    return FormalizeAuditResult(formalized=True, compiled=True, theorem_name="t",
+                                lean_source="theorem t : True := trivial", audit=audit)
+
+
+def _verdict_reject() -> FormalizeAuditResult:
+    """Outcome (ii): compiled but the audit REJECTED (a non-whitelist axiom / denylist dep)."""
+    rej = Finding(LAYER_LEAN, Severity.REJECT, "sorry_axiom", "proof uses non-whitelisted axiom 'sorryAx'")
+    audit = LeanAuditResult(verdict=LeanVerdict.REJECT, findings=[rej])
+    return FormalizeAuditResult(formalized=True, compiled=True, theorem_name="t",
+                                lean_source="theorem t : True := sorry", audit=audit)
+
+
+def _verdict_noncompile() -> FormalizeAuditResult:
+    """Outcome (iii): the toolchain was available but no compiling Lean was produced (fail OPEN)."""
+    return FormalizeAuditResult(formalized=False, compiled=False, error="formalizer produced no Lean")
+
+
+def _verdict_unavailable() -> FormalizeAuditResult:
+    """Outcome (iv): the Lean toolchain was UNAVAILABLE (server down / not installed) -> retryable."""
+    return FormalizeAuditResult(formalized=False, compiled=False,
+                                error="lean toolchain unavailable", lean_unavailable=True)
+
+
+class ScriptedLeafVerifier:
+    """A canned per-node verifier: returns a fixed FormalizeAuditResult-shaped verdict for every leaf
+    and records the (goal, proof_text) calls it saw. Stands in for formalize_bridge.make_node_gate so
+    the four routing outcomes are tested OFFLINE (no Lean / model)."""
+    def __init__(self, verdict: FormalizeAuditResult):
+        self._verdict = verdict
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, node_goal: str, node_proof_text: str) -> FormalizeAuditResult:
+        self.calls.append((node_goal, node_proof_text))
+        return self._verdict
+
+
+def _node_driver(verifier, prover_map=None):
+    return _driver(DictProver(prover_map if prover_map is not None else {"G": valid_ledger("G")}),
+                   node_verifier=verifier)
+
+
+# ---- the CRUCIAL invariant: node_verifier=None is the BYTE-IDENTICAL default path ----
+
+def test_node_verifier_none_is_default_byte_identical_path():
+    """With node_verifier=None (the default) a directly-proven leaf is marked PROVEN exactly as before:
+    no node_lean event is emitted, lean_verified stays False, and the prove_node(direct) trace is
+    unchanged. This is the regression guard that the new arm is inert when the verifier is absent."""
+    from agent.orchestrator.dag import goal_hash
+    res = _driver(DictProver({"G": valid_ledger("G")})).run("G")   # no node_verifier
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.proof_kind == "direct"
+    assert g.lean_verified is False                       # never stamped on the default path
+    assert res.trace.by_kind("node_lean") == []          # the per-node Lean arm never fired
+    assert res.trace.by_kind("prove_node")               # the ordinary direct-prove trace still fires
+
+
+def test_default_ornode_lean_verified_is_false():
+    # A freshly-created node carries the new annotation defaulting False (a pure additive field).
+    from agent.orchestrator.dag import ProofDAG
+    n = ProofDAG().get_or_create("G")
+    assert n.lean_verified is False
+
+
+# ---- (i) PASS -> PROVEN + lean_verified True ----
+
+def test_node_verifier_pass_marks_proven_and_lean_verified():
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _node_driver(v).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.proof_kind == "direct"
+    assert g.lean_verified is True                        # Lean confirmed the leaf elementary
+    assert v.calls and v.calls[0][0] == "G"               # the verifier was actually consulted
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "elementary_verified" and ev[0].data["lean_verified"] is True
+
+
+# ---- (ii) REJECT -> FAILED_ELEMENTARY (refutes elementarity) ----
+
+def test_node_verifier_reject_refutes_to_failed_elementary():
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_reject())
+    res = _node_driver(v).run("G")
+    assert not res.proven                                 # a compiled-but-rejected leaf is NOT promoted
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.FAILED_ELEMENTARY         # downgrade-don't-discard
+    assert g.reason == ReasonCode.elementary_violation.value
+    assert g.lean_verified is False
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "elementary_violation"
+
+
+# ---- (iii) could-not-compile -> soft PROVEN + lean_verified False (re-attemptable) ----
+
+def test_node_verifier_noncompile_fails_open_soft_proven():
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_noncompile())
+    res = _node_driver(v).run("G")
+    assert res.proven                                     # the informal gate passed it -> soft PROVEN
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.proof_kind == "direct"
+    assert g.lean_verified is False                       # Lean did NOT confirm it -> re-attemptable
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
+
+
+# ---- (iv) UNAVAILABLE -> EXHAUSTED (retryable, never poisons the memo) ----
+
+def test_node_verifier_unavailable_exhausts_retryable():
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_unavailable())
+    res = _node_driver(v).run("G")
+    assert not res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.EXHAUSTED                 # limit-induced, retryable
+    assert g.state not in (NodeState.FAILED_GAP, NodeState.FAILED_ELEMENTARY)
+    assert g.lean_verified is False
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "lean_unavailable"
+    # Retryable: re-running with a verifier that now PASSES proves the SAME goal (no memo poisoning).
+    res2 = ScriptedLeafVerifier(_verdict_pass())
+    driver = _node_driver(res2)
+    driver.dag = res.dag                                  # reuse the DAG carrying the EXHAUSTED node
+    assert driver.run("G").proven
+
+
+# ---- a crashing verifier fails OPEN (never refutes / starves a gate-passed leaf) ----
+
+def test_node_verifier_exception_fails_open_soft_proven():
+    from agent.orchestrator.dag import goal_hash
+
+    class Boom:
+        def __call__(self, goal, proof_text):
+            raise RuntimeError("verifier exploded")
+
+    res = _node_driver(Boom()).run("G")
+    assert res.proven                                     # a crashing verifier does not sink a leaf
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.lean_verified is False
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "verifier_error"
+
+
+# ---- make_node_gate: faithfulness deferred (None) and unavailable detection without Lean ----
+
+def test_make_node_gate_reports_unavailable_when_no_lean():
+    """With no Lean toolchain reachable (no server, no project_dir, `lean` absent in CI), make_node_gate
+    returns a result flagged lean_unavailable WITHOUT attempting a compile — the offline-safe path that
+    routes a leaf to retryable EXHAUSTED. (If Lean happens to be installed in this environment the gate
+    would instead try to compile; this test only asserts the no-Lean classification.)"""
+    from agent.gates import lean_bridge
+
+    class _NoFormalizer:
+        def formalize(self, ledger_text, **kw):
+            raise AssertionError("formalize must not be called when Lean is unavailable")
+
+    if lean_bridge.available():
+        pytest.skip("Lean is installed in this environment; the unavailable path is not exercised")
+    gate = make_node_gate(_NoFormalizer(), toolkit=TOOLKIT)
+    verdict = gate("G", valid_ledger("G"))
+    assert verdict.lean_unavailable is True
+    assert verdict.compiled is False and verdict.elementary_verified is False
+
+
+def test_formalize_audit_result_outcome_helpers():
+    """The read-only classification helpers name the four outcomes off the existing fields."""
+    assert _verdict_pass().elementary_verified is True
+    assert _verdict_reject().lean_compiled_but_rejected is True
+    assert _verdict_reject().elementary_verified is False
+    assert _verdict_noncompile().lean_could_not_formalize is True
+    assert _verdict_unavailable().lean_unavailable is True
+    # The unavailable verdict is NOT misclassified as a (re-attemptable) non-compile.
+    assert _verdict_unavailable().lean_could_not_formalize is False
