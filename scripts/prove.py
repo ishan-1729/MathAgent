@@ -22,6 +22,10 @@ from agent.gates.toolkit import load_toolkit
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.orchestrator import Budget, RunTrace, RalphLoop, DagDriver
 from agent.orchestrator.dag import goal_hash
+from agent.orchestrator.run_profile import (
+    BudgetProfile, ElementarityLevel, LeanProfile, Mode, ProviderKey, RoleSpec, RolesProfile,
+    RunProfile, StageProfile,
+)
 from agent.tools.codex_prover import (CodexProver, CodexDecomposer, CodexReviewer, CodexComparator,
                                       CodexConfig, make_codex_refiner)
 
@@ -66,6 +70,136 @@ def report_status(*, proven: bool, has_candidate: bool = False,
     if has_candidate:
         return ReportStatus.CANDIDATE_INCOMPLETE
     return ReportStatus.REJECTED
+
+
+# --------------------------------------------------------------------------------------------------
+# profile_from_args (W6): the THIN, total argparse -> RunProfile mapping. Every structural CLI flag
+# maps to exactly one profile field, so the builder (build_driver) becomes the single DagDriver
+# construction site. This CLI is the LEGACY Codex prover; with NO --profile it keeps Codex roles so the
+# live output is byte-identical to before. The shipped profiles/default.yaml uses Claude (the maintainer
+# default); pass --profile to swap providers/stages wholesale, and individual flags then OVERRIDE the
+# loaded profile's structural fields (so e.g. `--profile codex.yaml --population 4` works).
+# --------------------------------------------------------------------------------------------------
+def _codex_roles(args) -> RolesProfile:
+    """The legacy Codex role table for prove.py (every role -> codex, honoring --model/--effort).
+
+    prove.py historically drove Codex for EVERY role, so the back-compat profile pins provider=codex
+    with the CLI's --model/--effort/--timeout. The formalizer honors --formalizer-model (codex|claude)."""
+    codex = RoleSpec(provider=ProviderKey.codex, model=args.model,
+                     effort=args.effort, timeout_s=args.timeout)
+    formalizer = (RoleSpec(provider=ProviderKey.claude, model="opus", timeout_s=args.timeout)
+                  if getattr(args, "formalizer_model", "codex") == "claude" else codex)
+    return RolesProfile(prover=codex, decomposer=codex, reviewer=codex, comparator=codex,
+                        judge=codex, formalizer=formalizer, faithfulness=codex, refiner=codex)
+
+
+def _elementarity_from_args(args) -> ElementarityLevel:
+    """Map the certification flags to the elementarity level (the single enforcement knob).
+
+    --terminal-gate (Layer-4 terminal authoritative gate) => authoritative; otherwise soft (the
+    in-engine elementarity refutation still enforces). prove.py has no 'none' flag — solution-only
+    runs go through profiles/solution-only.yaml via --profile."""
+    return (ElementarityLevel.authoritative if getattr(args, "terminal_gate", False)
+            else ElementarityLevel.soft)
+
+
+# The structural flags profile_from_args reads, with their argparse defaults. A flag "overrides" a
+# loaded --profile base ONLY when it differs from its default — so loading authoritative.yaml does not
+# get its lean.per_node silently clobbered by the (default-False) --lean-per-node flag, while an
+# explicit `--profile codex.yaml --population 4` still takes effect.
+_FLAG_DEFAULTS = {
+    "direct": False, "terminal_gate": False, "lean_per_node": False, "lean_strict": False,
+    "server": False, "refine": False, "population": 0, "evolve_fallback": 0,
+    "budget": 60, "max_depth": 3, "max_decomp": 2, "episodes": 3,
+}
+
+
+def _explicitly_set(args) -> set[str]:
+    """The structural flags the user actually changed from their default (so a --profile base is only
+    overridden where the CLI was explicit). store_true flags can only be set True, so default-equality
+    correctly means 'not passed'; valued flags set to their default value are a harmless no-op override."""
+    return {k for k, default in _FLAG_DEFAULTS.items()
+            if getattr(args, k, default) != default}
+
+
+def profile_from_args(args, base: "RunProfile | None" = None) -> RunProfile:
+    """Map the parsed CLI args to a RunProfile (the one control lever the builder consumes).
+
+    With NO ``base`` this is the legacy Codex profile (Codex roles, every flag mapped), so a bare
+    `prove.py GOAL` builds the SAME wiring it always did. With a ``base`` (from --profile) the base is
+    the starting point — its roles/identity AND its structural fields are preserved — and ONLY the CLI
+    flags the user EXPLICITLY set override it (see :func:`_explicitly_set`); loading authoritative.yaml
+    therefore keeps its Lean wiring unless you pass the corresponding flag.
+
+    The mapping is total over the structural flags: --direct->mode; --max-depth/--max-decomp/--episodes/
+    --budget->budgets; --population/--refine/--evolve-fallback->stages; --terminal-gate->elementarity
+    (+lean.terminal); --lean-per-node/--lean-strict/--server->lean."""
+    normalize_lean_flags(args)
+    if base is None:
+        # Legacy path: every flag maps (full, byte-identical Codex profile).
+        return _profile_all_flags(args, _codex_roles(args), name="prove-cli", seed=0, notes="")
+    # --profile path: start from the base, then layer ONLY explicit flag overrides.
+    explicit = _explicitly_set(args)
+    if not explicit:
+        return base
+    # Build a full flag-derived profile, then copy across only the explicitly-set fields.
+    full = _profile_all_flags(args, base.roles, name=base.name, seed=base.seed, notes=base.notes)
+    update: dict = {}
+    if {"direct"} & explicit:
+        update["mode"] = full.mode
+    if {"terminal_gate"} & explicit:
+        update["elementarity"] = full.elementarity
+    stage_keys = {"direct": ("decompose", "review"), "population": ("population",),
+                  "evolve_fallback": ("evolve_fallback",), "refine": ("refine",)}
+    stage_update = {f: getattr(full.stages, f)
+                    for flag, fields in stage_keys.items() if flag in explicit for f in fields}
+    if stage_update:
+        update["stages"] = base.stages.model_copy(update=stage_update)
+    budget_keys = {"budget": "max_llm_calls", "max_depth": "max_depth",
+                   "max_decomp": "max_decomp_attempts", "episodes": "episodes"}
+    budget_update = {field: getattr(full.budgets, field)
+                     for flag, field in budget_keys.items() if flag in explicit}
+    if budget_update:
+        update["budgets"] = base.budgets.model_copy(update=budget_update)
+    lean_keys = {"lean_per_node": "per_node", "terminal_gate": "terminal",
+                 "lean_strict": "strict", "server": "server"}
+    lean_update = {field: getattr(full.lean, field)
+                   for flag, field in lean_keys.items() if flag in explicit}
+    if lean_update:
+        update["lean"] = base.lean.model_copy(update=lean_update)
+    return base.model_copy(update=update)
+
+
+def _profile_all_flags(args, roles: RolesProfile, *, name: str, seed: int, notes: str) -> RunProfile:
+    """Build a RunProfile mapping EVERY structural flag (the total argparse->profile mapping)."""
+    return RunProfile(
+        name=name,
+        seed=seed,
+        notes=notes,
+        mode=Mode.direct if args.direct else Mode.dag,
+        elementarity=_elementarity_from_args(args),
+        roles=roles,
+        stages=StageProfile(
+            decompose=not args.direct,
+            review=not args.direct,
+            population=int(args.population),
+            evolve_fallback=int(args.evolve_fallback),
+            refine=bool(args.refine),
+            h0_consistency=True,
+        ),
+        budgets=BudgetProfile(
+            max_llm_calls=int(args.budget),
+            max_depth=int(args.max_depth),
+            max_decomp_attempts=int(args.max_decomp),
+            episodes=int(args.episodes),
+        ),
+        lean=LeanProfile(
+            per_node=bool(args.lean_per_node),
+            terminal=bool(getattr(args, "terminal_gate", False)),
+            strict=bool(args.lean_strict),
+            server=bool(args.server),
+        ),
+    )
 
 
 def build_lean_node_gates(args, toolkit, cfg, server, retriever=None):
@@ -131,7 +265,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     flag wiring (e.g. ``--lean-per-node`` -> DagDriver) can be driven through the ACTUAL argparse path in
     tests, not a hand-rolled stub."""
     ap = argparse.ArgumentParser(description="Prove a number-theory goal with the Codex-backed harness.")
-    ap.add_argument("goal", help="the goal/theorem statement to prove")
+    ap.add_argument("goal", nargs="?", help="the goal/theorem statement to prove")
+    ap.add_argument("--profile", type=Path, metavar="PATH",
+                    help="load a RunProfile YAML as the base wiring (roles/stages/budget/lean); the "
+                         "structural CLI flags then OVERRIDE its fields. The shipped profiles/ presets "
+                         "(default.yaml=Claude, codex.yaml=legacy, solution-only.yaml, authoritative.yaml) "
+                         "are good starting points.")
+    ap.add_argument("--dump-profile", action="store_true",
+                    help="print the EFFECTIVE RunProfile (after merging --profile + flags) as YAML and "
+                         "exit WITHOUT running — for inspecting/diffing the exact wiring a run would use.")
     ap.add_argument("--model", default="gpt-5.5")
     ap.add_argument("--effort", default="xhigh", choices=["low", "medium", "high", "xhigh"])
     ap.add_argument("--direct", action="store_true", help="single Ralph loop, no DAG decomposition")
@@ -210,11 +352,34 @@ def normalize_lean_flags(args) -> None:
         args.server = True
 
 
+def effective_profile(args) -> RunProfile:
+    """The EFFECTIVE RunProfile for this invocation: the --profile base (if any) overridden by the
+    structural CLI flags. The single source of truth shared by --dump-profile and the DAG build."""
+    base = RunProfile.from_yaml(args.profile) if getattr(args, "profile", None) else None
+    return profile_from_args(args, base=base)
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     normalize_lean_flags(args)
 
-    if not CodexProver.available():
+    # --dump-profile: print the effective profile (after merging --profile + flags) and exit. Pure data
+    # — performs NO model/Lean call, so it works even with no goal and no backend installed.
+    if args.dump_profile:
+        import yaml as _yaml
+        prof = effective_profile(args)
+        print(_yaml.safe_dump(prof.model_dump(mode="json"), sort_keys=False), end="")
+        return 0
+
+    if not args.goal:
+        print("ERROR: a goal is required (or use --dump-profile to inspect the profile).",
+              file=sys.stderr)
+        return 2
+
+    # The legacy (no --profile) path builds Codex components directly, so it hard-requires the Codex CLI.
+    # The --profile path resolves providers through the registry and lets the supervisor (inside
+    # build_driver) check provider availability per the profile's roles, so it need not require Codex.
+    if not getattr(args, "profile", None) and not CodexProver.available():
         print("ERROR: codex CLI not found on PATH.", file=sys.stderr)
         return 2
 
@@ -369,43 +534,57 @@ def main() -> int:
         elif ok and res.ledger:
             print("\n--- ledger ---\n" + res.ledger)
     else:
-        terminal_gate = None
-        if args.terminal_gate:
-            from agent.tools.formalizer import CodexFormalizer
-            from agent.orchestrator.formalize_bridge import make_terminal_gate
-            terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
-                                               faithfulness_checker=faith, server=server,
-                                               retriever=retriever, repair_iters=args.repair)
-        # Codex-backed search/revision machinery (population Elo+BT+PUCT; Autoreason refiner).
-        comparator = CodexComparator(cfg) if args.population else None
-        refiner = (make_codex_refiner(cfg, n_judges=args.judges, budget=budget, trace=trace)
-                   if args.refine else None)
-        # OpenEvolve fallback decomposer (fires ONLY on stuck nodes; commits only goal-bound,
-        # obligation-discharged blueprints). Graceful no-op if openevolve is unavailable.
-        evolve_fallback = None
-        if args.evolve_fallback:
-            from agent.tools.openevolve_bridge import OpenEvolveBackend
-            from agent.tools.claude_cli import ClaudeConfig
-            if OpenEvolveBackend.available():
-                evolve_fallback = OpenEvolveBackend(
-                    toolkit, ClaudeConfig(timeout_s=args.timeout),
-                    generations=args.evolve_fallback, retriever=retriever)
-            else:
-                print("# (--evolve-fallback requested but openevolve not installed; "
-                      "pip install mathagent[evolve] — fallback disabled)")
-        # Single argparse->DagDriver construction site (factored into build_dag_driver so the wiring is
-        # testable). It builds the per-node Lean verifiers from --lean-per-node and threads lean_strict +
-        # the warm Lean server in; without --lean-per-node the driver is byte-identical to before.
-        args._retriever = retriever
-        if args.lean_per_node:
-            print(f"# --lean-per-node: Lean-verifying every leaf + AND-composition "
-                  f"(formalizer={args.formalizer_model}, strict={bool(args.lean_strict)})")
-        driver = build_dag_driver(
-            args, prover=prover, toolkit=toolkit, cfg=cfg, budget=budget, trace=trace,
-            server=server, terminal_gate=terminal_gate, comparator=comparator,
-            refiner=refiner, evolve_fallback=evolve_fallback,
-        )
+        if getattr(args, "profile", None):
+            # PROFILE-DRIVEN path (W6): delegate construction to the builder — the single
+            # RunProfile -> supervisor -> registry -> DagDriver site. The supervisor fails CLOSED
+            # before any model/Lean call if the loaded profile is inadmissible.
+            from agent.orchestrator.builder import build_driver
+            prof = effective_profile(args)
+            print(f"# profile: {args.profile} (hash {prof.profile_hash[:12]}, "
+                  f"elementarity={prof.elementarity.value})")
+            driver = build_driver(prof, toolkit=toolkit, trace=trace)
+        else:
+            terminal_gate = None
+            if args.terminal_gate:
+                from agent.tools.formalizer import CodexFormalizer
+                from agent.orchestrator.formalize_bridge import make_terminal_gate
+                terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
+                                                   faithfulness_checker=faith, server=server,
+                                                   retriever=retriever, repair_iters=args.repair)
+            # Codex-backed search/revision machinery (population Elo+BT+PUCT; Autoreason refiner).
+            comparator = CodexComparator(cfg) if args.population else None
+            refiner = (make_codex_refiner(cfg, n_judges=args.judges, budget=budget, trace=trace)
+                       if args.refine else None)
+            # OpenEvolve fallback decomposer (fires ONLY on stuck nodes; commits only goal-bound,
+            # obligation-discharged blueprints). Graceful no-op if openevolve is unavailable.
+            evolve_fallback = None
+            if args.evolve_fallback:
+                from agent.tools.openevolve_bridge import OpenEvolveBackend
+                from agent.tools.claude_cli import ClaudeConfig
+                if OpenEvolveBackend.available():
+                    evolve_fallback = OpenEvolveBackend(
+                        toolkit, ClaudeConfig(timeout_s=args.timeout),
+                        generations=args.evolve_fallback, retriever=retriever)
+                else:
+                    print("# (--evolve-fallback requested but openevolve not installed; "
+                          "pip install mathagent[evolve] — fallback disabled)")
+            # Single argparse->DagDriver construction site (factored into build_dag_driver so the wiring
+            # is testable). It builds the per-node Lean verifiers from --lean-per-node and threads
+            # lean_strict + the warm Lean server in; without --lean-per-node the driver is byte-identical.
+            args._retriever = retriever
+            if args.lean_per_node:
+                print(f"# --lean-per-node: Lean-verifying every leaf + AND-composition "
+                      f"(formalizer={args.formalizer_model}, strict={bool(args.lean_strict)})")
+            driver = build_dag_driver(
+                args, prover=prover, toolkit=toolkit, cfg=cfg, budget=budget, trace=trace,
+                server=server, terminal_gate=terminal_gate, comparator=comparator,
+                refiner=refiner, evolve_fallback=evolve_fallback,
+            )
         res = driver.run(args.goal)
+        # In the --profile path the builder constructed its OWN budget from the profile; point the
+        # final "calls spent" report at the budget the driver actually spent (not main's unused one).
+        if getattr(args, "profile", None):
+            budget = res.budget
         ok = res.proven
         print(f"result: {'PROVEN' if ok else 'NOT PROVEN'}")
         print(f"dag: {res.dag.stats()}")

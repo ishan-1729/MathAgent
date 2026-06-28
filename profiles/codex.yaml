@@ -1,0 +1,34 @@
+# The LEGACY baseline profile: every role backed by Codex (the historical prove.py default).
+#
+# Same stages as default.yaml (soft elementarity, decompose + review, no Lean), but with the Codex
+# provider for every role. Use this to reproduce the pre-Claude baseline behavior of scripts/prove.py.
+name: codex-baseline
+notes: "Legacy Codex baseline: all roles -> codex, soft elementarity, decompose+review."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+roles:
+  prover: {provider: codex}
+  decomposer: {provider: codex}
+  reviewer: {provider: codex}
+  comparator: {provider: codex}
+  judge: {provider: codex}
+  formalizer: {provider: codex}
+  faithfulness: {provider: codex}
+  refiner: {provider: codex}
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

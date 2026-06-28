@@ -1,0 +1,27 @@
+# SOLUTION-ONLY profile: elementarity NOT enforced (no Lean gates, no in-engine elementarity refute).
+#
+# elementarity=none downgrades a FAILED_ELEMENTARY outcome to soft PROVEN — soundness (goal<->claim
+# binding, acyclicity, obligation discharge, H0, conclusion-binding) is UNAFFECTED, but a non-elementary
+# proof is admitted. Use this when you only want *a* correct proof, elementary or not. All Lean flags
+# must stay false here (the supervisor's S4 guard rejects any Lean flag with elementarity=none).
+name: solution-only
+notes: "elementarity=none: admit non-elementary proofs; soundness unchanged. Claude roles."
+mode: dag
+elementarity: none
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

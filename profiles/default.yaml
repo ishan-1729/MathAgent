@@ -1,0 +1,28 @@
+# The DEFAULT MathAgent profile (the maintainer default: Claude roles).
+#
+# Today's wiring: elementarity enforced in-engine (soft), decompose + review on, no breadth search
+# (population/refine/evolve off), no Lean gates, DAG mode, depth 3. This is the BYTE-IDENTICAL
+# pre-feature search path expressed as data; it relies on the RunProfile field defaults (so every role
+# is provider=claude with its per-role default model: prover/refiner=opus, decomposer/reviewer/
+# formalizer/faithfulness=sonnet, comparator/judge=haiku).
+name: default
+notes: "Claude-backed default: soft elementarity, decompose+review, no Lean."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

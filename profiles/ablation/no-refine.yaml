@@ -1,0 +1,26 @@
+# ABLATION: the default profile with the REFINE stage explicitly OFF.
+#
+# refine=False -> the builder injects refiner=None; a directly-proven node's ledger is NOT run through
+# the AutoReason incumbent tournament. (The default already ships refine OFF, so this ablation pairs with
+# a refine-ON sweep profile to measure the refiner's contribution; on its own it equals default.)
+name: ablation-no-refine
+notes: "Ablation: refine OFF (refiner=None) — pair with a refine-ON profile to isolate the refiner."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

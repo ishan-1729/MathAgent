@@ -1,0 +1,23 @@
+# ABLATION: default profile with the REVIEW stage disabled.
+# review=False -> the builder injects reviewer=None; decomposition sketches are not soft-reviewed.
+name: ablation-no-review
+notes: "Ablation of the default profile: review OFF (reviewer=None)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: false
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

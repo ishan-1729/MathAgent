@@ -1,0 +1,23 @@
+# ABLATION: default profile with the DECOMPOSE stage disabled (direct-only, no blueprint).
+# decompose=False -> the builder injects decomposer=None; the driver never asks for a decomposition.
+name: ablation-no-decompose
+notes: "Ablation of the default profile: decompose OFF (decomposer=None)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: false
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

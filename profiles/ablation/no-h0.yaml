@@ -1,0 +1,24 @@
+# ABLATION: default profile with the H0 child-consistency gate disabled.
+# h0_consistency=False -> the driver skips the 0-cocycle check that sibling children's assumption/
+# binding/lemma signatures agree before an AND-node is composed.
+name: ablation-no-h0
+notes: "Ablation of the default profile: H0 child-consistency gate OFF."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: false
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

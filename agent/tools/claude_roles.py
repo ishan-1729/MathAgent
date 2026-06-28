@@ -1,116 +1,36 @@
-"""Codex (GPT-5.5-xHigh) as the focused-prover tool — the AlphaProof substitute.
+"""First-class Claude (Opus/Sonnet/Haiku) roles — the in-repo Claude backend for the DAG harness.
 
-AlphaProof_Nexus calls a strong RL-trained prover (AlphaProof) on subgoals. We don't have that model,
-but we do have the Codex CLI (GPT-5.5 at xHigh reasoning) locally. This module shells out to
-`codex exec` non-interactively and exposes three roles that plug into the DAG harness via the existing
-Protocols:
+Mirrors :mod:`agent.tools.codex_prover` role-for-role, but generates via the headless Claude CLI
+(:func:`agent.tools.claude_cli._run_claude`) instead of ``codex exec``. Same ``agent/roles/*.md``
+prompts, same shared CLI-JSON parsers (:mod:`agent.tools._cli_json`), and the SAME return types
+(``ReviewVerdict``, ``Candidate`` ordering, ``SingleVerdict``/``FaithfulnessVerdict``,
+``RevisionController``) so every role plugs into the EXISTING Protocols the DAG/tournament expect.
 
-  - CodexProver     : prove a goal -> a step-ledger (the focused prover; AlphaProof's role)
-  - CodexDecomposer : propose a blueprint -> a sketch ledger citing `lemma` sub-goals (LEAP's planner)
-  - CodexReviewer   : judge a decomposition for "does it simplify?" + "is it elementary?" (LEAP reviewer)
+Each role takes a per-role :class:`ClaudeConfig` (so the registry can pin ``model=spec.model`` —
+prover/refiner=opus, decomposer/reviewer/faithfulness=sonnet, comparator/judge=haiku). The default
+model is the codex/maintainer-sensible one for that role.
 
-Invocation is read-only, ephemeral, in a throwaway cwd, with the prompt on stdin and the model's final
-message captured via `--output-last-message`. Model + reasoning effort are configurable (default
-gpt-5.5 / xhigh, matching ~/.codex/config.toml). The deterministic gate remains authoritative; these
-are just the generation/soft-review tools.
+SAFETY: like the Codex roles, these only *generate text*. Nothing here ``exec``/``eval``/``import``s
+model output — every CLI response is parsed by the deterministic ``_cli_json`` helpers and handed to
+the deterministic gate downstream. ``ClaudeFormalizer`` already lives in ``formalizer.py``; reuse it.
 """
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from agent.orchestrator.dag_driver import ReviewVerdict
-# Shared CLI-output JSON parsers (lifted into agent/tools/_cli_json.py so the Codex and Claude CLI
-# backends share ONE implementation). Re-exported below for backwards compatibility — callers and
-# tests that import these names from `codex_prover` keep working unchanged.
-from agent.tools._cli_json import (  # noqa: F401  (re-exported)
-    _FENCED_JSON_RE,
-    _CLOSERS,
-    _last_balanced,
-    _extract_json,
+from agent.orchestrator.population import Candidate
+from agent.orchestrator.faithfulness import SingleVerdict, PanelFaithfulnessChecker
+from agent.orchestrator.tournament import RevisionController
+from agent.tools.claude_cli import ClaudeConfig, _run_claude
+from agent.tools._cli_json import (
     _extract_json_object,
     _json_array,
     children_from_sketch,
 )
-from agent.orchestrator.population import Candidate
-from agent.orchestrator.faithfulness import SingleVerdict, PanelFaithfulnessChecker
-from agent.orchestrator.tournament import RevisionController
 
 _ROLE_DIR = Path(__file__).resolve().parents[1] / "roles"
-
-
-class CodexError(RuntimeError):
-    pass
-
-
-def find_codex() -> Optional[str]:
-    """Locate a non-interactive Codex launcher (prefer the Windows .cmd shim)."""
-    for name in ("codex.cmd", "codex.exe", "codex"):
-        p = shutil.which(name)
-        if p:
-            return p
-    guess = Path.home() / ".local" / "nodejs" / "codex.cmd"
-    return str(guess) if guess.exists() else None
-
-
-@dataclass
-class CodexConfig:
-    model: str = "gpt-5.5"
-    reasoning_effort: str = "xhigh"
-    sandbox: str = "read-only"
-    timeout_s: int = 1200
-    launcher: Optional[str] = None
-
-
-def _run_codex(prompt: str, cfg: CodexConfig) -> str:
-    launcher = cfg.launcher or find_codex()
-    if not launcher:
-        raise CodexError("codex CLI not found on PATH")
-
-    out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex_out_")
-    os.close(out_fd)
-    workdir = tempfile.mkdtemp(prefix="codex_cwd_")
-    # TOML override values are passed UNQUOTED: they fail TOML parse and are used as raw literals,
-    # which avoids any shell quote-mangling through cmd.exe.
-    flags = [
-        "exec", "--skip-git-repo-check", "--ephemeral",
-        "-s", cfg.sandbox, "--color", "never",
-        "-c", f"model={cfg.model}",
-        "-c", f"model_reasoning_effort={cfg.reasoning_effort}",
-        "-o", out_path,
-    ]
-    if launcher.lower().endswith((".cmd", ".bat")):
-        argv = [os.environ.get("COMSPEC", "cmd.exe"), "/c", launcher, *flags]
-    else:
-        argv = [launcher, *flags]
-
-    try:
-        proc = subprocess.run(
-            argv, input=prompt, capture_output=True,
-            encoding="utf-8", errors="replace",  # prompts contain Unicode (->, math); avoid cp1252
-            timeout=cfg.timeout_s, cwd=workdir,
-        )
-        if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "").strip()[-600:]
-            raise CodexError(f"codex exec failed (exit {proc.returncode}): {tail}")
-        msg = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
-        if not msg:
-            raise CodexError("codex returned an empty final message")
-        return msg
-    except subprocess.TimeoutExpired as e:
-        raise CodexError(f"codex exec timed out after {cfg.timeout_s}s") from e
-    finally:
-        for p in (out_path,):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _role(name: str) -> str:
@@ -129,16 +49,12 @@ def _feedback_block(feedback: Optional[list[str]]) -> str:
     return f"\n\nThe previous attempt was rejected. Fix exactly these issues and re-emit the WHOLE ledger:\n{items}\n"
 
 
-class CodexProver:
-    """Focused prover: goal -> step-ledger text (parsed downstream by the gate)."""
+class ClaudeProver:
+    """Focused prover: goal -> step-ledger text (parsed downstream by the gate). Opus by default."""
 
-    def __init__(self, toolkit, cfg: Optional[CodexConfig] = None):
+    def __init__(self, toolkit, cfg: Optional[ClaudeConfig] = None):
         self.toolkit = toolkit
-        self.cfg = cfg or CodexConfig()
-
-    @staticmethod
-    def available() -> bool:
-        return find_codex() is not None
+        self.cfg = cfg or ClaudeConfig(model="opus")
 
     def prove(self, goal: str, feedback: Optional[list[str]] = None) -> str:
         prompt = (
@@ -149,15 +65,15 @@ class CodexProver:
             "Output ONLY one fenced ```json block containing the step-ledger. No prose before or after. "
             "Do not read or modify any files."
         )
-        return _run_codex(prompt, self.cfg)
+        return _run_claude(prompt, self.cfg)
 
 
-class CodexDecomposer:
+class ClaudeDecomposer:
     """Planner: goal -> (sketch ledger citing `lemma` sub-goals, child goals derived from those steps)."""
 
-    def __init__(self, toolkit, cfg: Optional[CodexConfig] = None):
+    def __init__(self, toolkit, cfg: Optional[ClaudeConfig] = None):
         self.toolkit = toolkit
-        self.cfg = cfg or CodexConfig()
+        self.cfg = cfg or ClaudeConfig(model="sonnet")
 
     def decompose(self, goal: str, feedback: Optional[list[str]] = None) -> tuple[str, list[str]]:
         prompt = (
@@ -173,17 +89,17 @@ class CodexDecomposer:
             f"{_feedback_block(feedback)}\n"
             "Output ONLY the fenced ```json ledger. Do not read or modify any files."
         )
-        sketch = _run_codex(prompt, self.cfg)
+        sketch = _run_claude(prompt, self.cfg)
         # Children are the claims of the `lemma` steps — keeps the sketch and children consistent.
         return sketch, children_from_sketch(sketch)
 
 
-class CodexReviewer:
-    """Decomposition reviewer + elementary judge -> ReviewVerdict."""
+class ClaudeReviewer:
+    """Decomposition reviewer + elementary judge -> ReviewVerdict. Sonnet by default."""
 
-    def __init__(self, toolkit, cfg: Optional[CodexConfig] = None):
+    def __init__(self, toolkit, cfg: Optional[ClaudeConfig] = None):
         self.toolkit = toolkit
-        self.cfg = cfg or CodexConfig()
+        self.cfg = cfg or ClaudeConfig(model="sonnet")
 
     def review(self, goal: str, sketch: str, child_goals: list[str]) -> ReviewVerdict:
         kids = "\n".join(f"- {c}" for c in child_goals)
@@ -197,7 +113,7 @@ class CodexReviewer:
             f"GOAL:\n{goal}\n\nPROPOSED SUB-LEMMAS:\n{kids}\n\nSKETCH LEDGER:\n{sketch}\n\n"
             'Output ONLY a JSON object: {"useful": <bool>, "elementary": <bool>, "notes": [<strings>]}'
         )
-        raw = _run_codex(prompt, self.cfg)
+        raw = _run_claude(prompt, self.cfg)
         obj = _extract_json_object(raw)
         if obj is None:
             return ReviewVerdict(useful=False, elementary=False,
@@ -209,11 +125,13 @@ class CodexReviewer:
         )
 
 
-class CodexComparator:
-    """Pairwise judge for the population/Elo search: which candidate decomposition is more promising?"""
+class ClaudeComparator:
+    """Pairwise judge for the population/Elo search: which candidate decomposition is more promising?
 
-    def __init__(self, cfg: Optional[CodexConfig] = None):
-        self.cfg = cfg or CodexConfig()
+    Mirrors :class:`agent.tools.codex_prover.CodexComparator`; Haiku by default (cheap pairwise calls)."""
+
+    def __init__(self, cfg: Optional[ClaudeConfig] = None):
+        self.cfg = cfg or ClaudeConfig(model="haiku")
 
     def compare(self, a: Candidate, b: Candidate) -> int:
         prompt = (
@@ -225,7 +143,7 @@ class CodexComparator:
             f"GOAL:\n{a.goal}\n\n=== CANDIDATE A ===\n{a.content}\n\n=== CANDIDATE B ===\n{b.content}\n\n"
             'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}'
         )
-        raw = _run_codex(prompt, self.cfg)
+        raw = _run_claude(prompt, self.cfg)
         obj = _extract_json_object(raw)
         if obj is None:
             return 0
@@ -245,8 +163,8 @@ _LENS_FOCUS = {
 }
 
 
-class _CodexFaithJudge:
-    def __init__(self, cfg: CodexConfig):
+class _ClaudeFaithJudge:
+    def __init__(self, cfg: ClaudeConfig):
         self.cfg = cfg
 
     def __call__(self, claim: str, lean_source: str, name: str, lens: str) -> SingleVerdict:
@@ -260,7 +178,7 @@ class _CodexFaithJudge:
             f"LEAN SOURCE (the statement under check is theorem/lemma `{name}`):\n{lean_source}\n\n"
             'Output ONLY a JSON object: {"faithful": <bool>, "issues": [<short strings>]}'
         )
-        raw = _run_codex(prompt, self.cfg)
+        raw = _run_claude(prompt, self.cfg)
         obj = _extract_json_object(raw)
         if obj is None:
             return SingleVerdict(lens=lens, faithful=False, issues=["unparseable judge output"])
@@ -268,13 +186,13 @@ class _CodexFaithJudge:
                              issues=list(obj.get("issues", []) or []))
 
 
-class CodexFaithfulnessChecker:
-    """Adversarial faithfulness panel backed by Codex (one judge per diverse lens)."""
+class ClaudeFaithfulnessChecker:
+    """Adversarial faithfulness panel backed by Claude (one judge per diverse lens). Sonnet by default."""
 
-    def __init__(self, cfg: Optional[CodexConfig] = None, lenses: Optional[list[str]] = None,
+    def __init__(self, cfg: Optional[ClaudeConfig] = None, lenses: Optional[list[str]] = None,
                  max_unfaithful: int = 0):
-        self.cfg = cfg or CodexConfig()
-        self._panel = PanelFaithfulnessChecker(_CodexFaithJudge(self.cfg), lenses=lenses,
+        self.cfg = cfg or ClaudeConfig(model="sonnet")
+        self._panel = PanelFaithfulnessChecker(_ClaudeFaithJudge(self.cfg), lenses=lenses,
                                                max_unfaithful=max_unfaithful)
 
     def check(self, informal_claim: str, lean_source: str, theorem_name: str):
@@ -282,21 +200,20 @@ class CodexFaithfulnessChecker:
 
 
 # --------------------------------------------------------------------------------------------------
-# Autoreason incumbent-tournament roles, backed by Codex (the revision controller's critic / author /
-# synthesizer / judge). These are GENERIC over a "candidate" string — a proof ledger (DagDriver
-# refiner) OR a free-form solution (benchmark harness) — so the same tournament drives both. See
-# agent/orchestrator/tournament.py.
+# Autoreason incumbent-tournament roles, backed by Claude (critic / author / synthesizer / judge).
+# GENERIC over a "candidate" string — a proof ledger (DagDriver refiner) OR a free-form solution
+# (benchmark harness). Mirrors the Codex tournament roles in agent/tools/codex_prover.py.
 # --------------------------------------------------------------------------------------------------
 
 _NON_ELEM = ("class groups, elliptic curves, modular forms, Baker's theorem, Mihăilescu/Catalan, "
              "p-adic machinery beyond v_p, algebraic number fields, analytic number theory")
 
 
-class CodexCritic:
-    """Adversarial failure-analysis of a candidate (problems only, no fixes)."""
+class ClaudeCritic:
+    """Adversarial failure-analysis of a candidate (problems only, no fixes). Opus by default."""
 
-    def __init__(self, cfg: Optional[CodexConfig] = None):
-        self.cfg = cfg or CodexConfig()
+    def __init__(self, cfg: Optional[ClaudeConfig] = None):
+        self.cfg = cfg or ClaudeConfig(model="opus")
 
     def critique(self, goal: str, incumbent: str) -> list[str]:
         prompt = (
@@ -308,14 +225,14 @@ class CodexCritic:
             'Output ONLY a JSON array of short strings (e.g. ["flaw 1","flaw 2"]); use [] if flawless. '
             "Do not read or modify any files."
         )
-        return _json_array(_run_codex(prompt, self.cfg))
+        return _json_array(_run_claude(prompt, self.cfg))
 
 
-class CodexAuthor:
-    """Revise a candidate to address a critique, preserving its output format."""
+class ClaudeAuthor:
+    """Revise a candidate to address a critique, preserving its output format. Opus by default."""
 
-    def __init__(self, cfg: Optional[CodexConfig] = None):
-        self.cfg = cfg or CodexConfig()
+    def __init__(self, cfg: Optional[ClaudeConfig] = None):
+        self.cfg = cfg or ClaudeConfig(model="opus")
 
     def revise(self, goal: str, incumbent: str, critique: list[str]) -> str:
         issues = "\n".join(f"- {c}" for c in critique) or "(no specific issues; improve rigor/clarity)"
@@ -328,14 +245,14 @@ class CodexAuthor:
             f"PROBLEM:\n{goal}\n\nCURRENT CANDIDATE:\n{incumbent}\n\nISSUES TO FIX:\n{issues}\n\n"
             "Output ONLY the revised candidate. Do not read or modify any files."
         )
-        return _run_codex(prompt, self.cfg)
+        return _run_claude(prompt, self.cfg)
 
 
-class CodexSynthesizer:
-    """Merge two candidates into a single stronger one (blind to which is the incumbent)."""
+class ClaudeSynthesizer:
+    """Merge two candidates into a single stronger one (blind to which is the incumbent). Opus by default."""
 
-    def __init__(self, cfg: Optional[CodexConfig] = None):
-        self.cfg = cfg or CodexConfig()
+    def __init__(self, cfg: Optional[ClaudeConfig] = None):
+        self.cfg = cfg or ClaudeConfig(model="opus")
 
     def synthesize(self, goal: str, a: str, b: str) -> str:
         prompt = (
@@ -346,14 +263,17 @@ class CodexSynthesizer:
             f"PROBLEM:\n{goal}\n\n=== CANDIDATE 1 ===\n{a}\n\n=== CANDIDATE 2 ===\n{b}\n\n"
             "Output ONLY the merged solution. Do not read or modify any files."
         )
-        return _run_codex(prompt, self.cfg)
+        return _run_claude(prompt, self.cfg)
 
 
-class CodexSolutionComparator:
-    """Pairwise judge for the incumbent tournament: which candidate solution/proof is better?"""
+class ClaudeJudge:
+    """Pairwise judge for the incumbent tournament: which candidate solution/proof is better?
 
-    def __init__(self, cfg: Optional[CodexConfig] = None):
-        self.cfg = cfg or CodexConfig()
+    Mirrors :class:`agent.tools.codex_prover.CodexSolutionComparator` (the ``judge`` role); Haiku by
+    default. Returns 1 if A is better, -1 if B, 0 for a tie (a :class:`Comparator`)."""
+
+    def __init__(self, cfg: Optional[ClaudeConfig] = None):
+        self.cfg = cfg or ClaudeConfig(model="haiku")
 
     def compare(self, a: Candidate, b: Candidate) -> int:
         prompt = (
@@ -363,7 +283,7 @@ class CodexSolutionComparator:
             f"PROBLEM:\n{a.goal}\n\n=== CANDIDATE A ===\n{a.content}\n\n=== CANDIDATE B ===\n{b.content}\n\n"
             'Output ONLY a JSON object: {"winner": "A" | "B" | "tie"}. Do not read or modify any files.'
         )
-        raw = _run_codex(prompt, self.cfg)
+        raw = _run_claude(prompt, self.cfg)
         obj = _extract_json_object(raw)
         if obj is None:
             return 0
@@ -371,14 +291,16 @@ class CodexSolutionComparator:
         return 1 if w == "a" else (-1 if w == "b" else 0)
 
 
-def make_codex_refiner(cfg: Optional[CodexConfig] = None, *, n_judges: int = 1,
-                       budget=None, trace=None, max_passes: int = 2, k_stop: int = 2,
-                       margin: int = 1, seed: int = 0) -> RevisionController:
-    """A fully Codex-backed Autoreason incumbent tournament (critic + author + synthesizer + an
-    n_judges-strong Codex judge panel). PUCT + Bradley-Terry run on the judges' win matrix inside the
-    controller; the caller supplies the admissibility gate (e.g. the elementary gate) to refine()."""
-    cfg = cfg or CodexConfig()
-    judges = [CodexSolutionComparator(cfg) for _ in range(max(1, n_judges))]
-    return RevisionController(CodexCritic(cfg), CodexAuthor(cfg), CodexSynthesizer(cfg), judges,
+def make_claude_refiner(cfg: Optional[ClaudeConfig] = None, *, n_judges: int = 1,
+                        budget=None, trace=None, max_passes: int = 2, k_stop: int = 2,
+                        margin: int = 1, seed: int = 0) -> RevisionController:
+    """A fully Claude-backed Autoreason incumbent tournament (critic + author + synthesizer + an
+    n_judges-strong Claude judge panel). Mirrors
+    :func:`agent.tools.codex_prover.make_codex_refiner`. PUCT + Bradley-Terry run on the judges' win
+    matrix inside the controller; the caller supplies the admissibility gate (e.g. the elementary
+    gate) to refine()."""
+    cfg = cfg or ClaudeConfig(model="opus")
+    judges = [ClaudeJudge(cfg) for _ in range(max(1, n_judges))]
+    return RevisionController(ClaudeCritic(cfg), ClaudeAuthor(cfg), ClaudeSynthesizer(cfg), judges,
                               max_passes=max_passes, k_stop=k_stop, margin=margin,
                               budget=budget, trace=trace, seed=seed)

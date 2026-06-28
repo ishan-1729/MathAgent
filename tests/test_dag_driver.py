@@ -2003,3 +2003,152 @@ def test_raising_terminal_gate_does_not_crash_run():
     err = res.trace.by_kind("terminal_gate_error")
     assert err and err[0].data["error_type"] == "RuntimeError"
     assert not res.trace.by_kind("terminal_gate")  # the success-path event is NOT emitted on a raise
+
+
+# ==================================================================================================
+# W5 — enforce_elementarity FLAG: the elementarity dimension is the ONLY thing it relaxes.
+#
+# enforce_elementarity=True (the DEFAULT) runs the BYTE-IDENTICAL pre-flag path: every refute_elementary
+# chokepoint REJECTS on denylist-prose / undischarged-elastic / goal-binding and a refuted NEEDS_REVIEW
+# proof becomes FAILED_ELEMENTARY. enforce_elementarity=False ADMITS the elementarity dimension ONLY:
+# a purely-elementarity refutation (denylist_prose / undischarged_elastic) no longer rejects (a
+# FAILED_ELEMENTARY downgrades to soft PROVEN), while a non-goal-bound proof is STILL rejected and a
+# vacuous inspection STILL fails loud. Soundness (goal<->claim, acyclicity, obligation, H0, conclusion)
+# is UNAFFECTED. No NodeState / NodeEvent member is added; the FSM is untouched.
+# ==================================================================================================
+
+from agent.orchestrator.elementary_verifier import (  # noqa: E402
+    VacuousVerificationError as _VacuousErr,
+)
+
+
+def denylist_prose_needs_review_sketch(goal: str, child: str, *, conclusion=None) -> str:
+    """A decomposition SKETCH the gate routes to NEEDS_REVIEW via a denylist-prose hit ('elliptic curve')
+    — soft-gate-passing-but-non-elementary. Cites `child` as a lemma and concludes `goal` (or
+    `conclusion` for an off-goal variant). With no reviewer it is sent to the independent verifier."""
+    concl = goal if conclusion is None else conclusion
+    return json.dumps({"problem": "p", "claim": concl, "steps": [
+        {"id": "L0", "claim": child, "justification": "lemma", "depends_on": []},
+        {"id": "d", "claim": "reduce to an elliptic curve over Q", "justification": "algebra",
+         "depends_on": ["L0"]},
+        {"id": "c", "claim": concl, "justification": "conclusion", "depends_on": ["d"]}]})
+
+
+# ---- the helper directly: the flag relaxes ONLY the elementarity dimension --------------------
+
+def test_refute_for_enforcement_enforce_true_is_byte_identical():
+    """enforce_elementarity=True (default): _refute_for_enforcement returns the SAME verdict the raw
+    refute_elementary produces — a denylist-prose / undischarged-elastic ledger is still REFUTED."""
+    from agent.orchestrator.elementary_verifier import refute_elementary
+    d = _driver(DictProver({}))                          # enforce_elementarity defaults True
+    assert d.enforce_elementarity is True
+    src = non_elementary_ledger("G")                     # a denylist-prose ('class group') ledger
+    raw = refute_elementary(src, TOOLKIT, goal="G")
+    gated = d._refute_for_enforcement(src, "G")
+    assert raw.refuted is True and gated.refuted is True  # byte-identical: still refuted
+    assert [r.code for r in gated.refutations] == [r.code for r in raw.refutations]
+
+
+def test_refute_for_enforcement_enforce_false_admits_elementarity_only():
+    """enforce_elementarity=False: a purely-elementarity refutation (denylist_prose) is DROPPED -> not
+    refuted; but a NON-GOAL-BOUND ledger is STILL refuted (goal_binding kept) and a VACUOUS inspection
+    STILL fails loud. The flag relaxes the elementarity dimension and NOTHING else."""
+    d = _driver(DictProver({}), enforce_elementarity=False)
+    assert d.enforce_elementarity is False
+    # (a) denylist-prose, goal-bound -> ADMITTED (the elementarity dimension is dropped).
+    elem = d._refute_for_enforcement(non_elementary_ledger("G"), "G")
+    assert elem.refuted is False
+    # (b) undischarged-elastic, goal-bound -> ADMITTED (also a pure elementarity refutation).
+    elastic = d._refute_for_enforcement(relabeled_undischarged_descent("G"), "G")
+    assert elastic.refuted is False
+    # (c) NON-GOAL-BOUND -> STILL REFUTED (goal_binding is soundness, never relaxed).
+    off_goal = d._refute_for_enforcement(non_elementary_ledger("G"), "DIFFERENT")
+    assert off_goal.refuted is True
+    assert all(r.code == "goal_binding" for r in off_goal.refutations)
+    # (d) VACUOUS -> STILL fails loud (anti-vacuity holds regardless of the flag).
+    with pytest.raises(_VacuousErr):
+        d._refute_for_enforcement("not a ledger at all", "G")
+
+
+# ---- end-to-end: enforce=False admits a non-elementary-but-goal-bound challenger as the PROVEN ledger ----
+
+def test_enforce_false_admits_non_elementary_challenger_as_proven_ledger():
+    """enforce_elementarity=False: a non-elementary (denylist-prose) but goal-bound AutoReason challenger
+    the judges PREFER — which the DEFAULT _authoritative_elementary gate REJECTS (incumbent held, see
+    test_non_elementary_challenger_is_rejected_by_admissibility_gate) — is now ADMITTED and DISPLACES the
+    incumbent: the node is PROVEN carrying the non-elementary ledger (the FAILED_ELEMENTARY -> soft PROVEN
+    downgrade, applied at the admissibility chokepoint)."""
+    from agent.orchestrator.dag import goal_hash
+    incumbent = valid_ledger("G")
+    challenger = non_elementary_ledger("G")              # denylist 'class group', goal-bound
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  enforce_elementarity=False).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN
+    assert g.proof == challenger, "with elementarity OFF the non-elementary challenger is admitted"
+
+
+def test_enforce_true_default_rejects_the_same_non_elementary_challenger():
+    """CONTROL (byte-identical default): the SAME non-elementary challenger is REJECTED with enforcement
+    ON (the default) — the incumbent holds. Proves the admission above is the flag's doing, not an
+    incidental pass (a controlled A/B on the single flag)."""
+    from agent.orchestrator.dag import goal_hash
+    incumbent = valid_ledger("G")
+    challenger = non_elementary_ledger("G")
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")   # default: enforce True
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof == incumbent, "enforcement ON rejects the non-elementary challenger"
+    assert g.proof != challenger
+
+
+def test_enforce_false_still_rejects_off_goal_challenger():
+    """enforce_elementarity=False relaxes ONLY elementarity: an OFF-GOAL challenger (proves a DIFFERENT
+    statement) is STILL inadmissible — _authoritative_elementary keeps the goal_binding refutation
+    (soundness) regardless of the flag, so the incumbent holds and the goal stays bound to its own proof."""
+    from agent.orchestrator.dag import goal_hash
+    incumbent = valid_ledger("G")
+    off_goal = mismatched_ledger("G", proved="H")        # concludes H, not the requested goal G
+    refiner = _refiner_with(off_goal, off_goal, {incumbent: 1.0, off_goal: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  enforce_elementarity=False).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.proof == incumbent, "a non-goal-bound challenger must be rejected even with elementarity off"
+    assert g.proof != off_goal
+
+
+def test_enforce_false_direct_needs_review_non_elementary_downgrades_to_proven():
+    """enforce_elementarity=False on the DIRECT path: a NEEDS_REVIEW direct proof whose prose is
+    denylisted (which the DEFAULT downgrades to FAILED_ELEMENTARY via _verify_or_downgrade) now PASSES the
+    verifier. With NO producer it is not directly promoted (an un-refuted NEEDS_REVIEW still needs review),
+    but it is classified needs_review_no_reviewer rather than FAILED_ELEMENTARY — the elementarity
+    refutation no longer fires."""
+    from agent.orchestrator.dag import goal_hash
+    bad = json.dumps({"problem": "p", "claim": "G", "steps": [
+        {"id": "s1", "claim": "use the class group of K", "justification": "descent", "depends_on": [],
+         "obligations": {"descent": {"measure": "x", "strictly_decreases": True,
+                                     "stays_in_domain": True}}},
+        {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]}]})
+    assert _gate_evaluate(bad, TOOLKIT).verdict is Verdict.NEEDS_REVIEW
+    res = _driver(DictProver({"G": bad}), enforce_elementarity=False).run("G")   # no decomposer
+    assert not res.proven
+    g = res.dag.get(goal_hash("G"))
+    # The elementarity refutation did NOT fire: not FAILED_ELEMENTARY (the verifier passed it).
+    assert g.state is not NodeState.FAILED_ELEMENTARY
+    assert g.reason == ReasonCode.needs_review_no_reviewer.value
+    assert res.trace.by_kind("verifier_passed")          # the verifier inspected + could not refute
+    assert res.trace.by_kind("verifier_refuted") == []   # ... because elementarity was admitted
+
+
+def test_enforce_default_is_true_byte_identical_construction():
+    """The ctor default is enforce_elementarity=True, so a no-arg-change DagDriver runs the EXACT
+    pre-feature path: the flag is True and the helper is byte-identical to raw refute_elementary."""
+    from agent.orchestrator.elementary_verifier import refute_elementary
+    d = DagDriver(DictProver({}), toolkit=TOOLKIT, budget=Budget(), trace=RunTrace("t"))
+    assert d.enforce_elementarity is True
+    # The whole pre-feature dag_driver suite (above) runs with this default -> byte-identical behavior.
+    src = relabeled_undischarged_descent("G")
+    assert d._refute_for_enforcement(src, "G").refuted == refute_elementary(src, TOOLKIT, goal="G").refuted

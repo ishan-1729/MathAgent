@@ -25,7 +25,7 @@ from agent.orchestrator.dag import ProofDAG, goal_hash, proof_context_hash, Cycl
 from agent.orchestrator.dilworth import dilworth_width, upward_rank, CyclicPosetError
 from agent.orchestrator.driver import Prover, Judge
 from agent.orchestrator.elementary_verifier import (
-    refute_elementary, VacuousVerificationError,
+    refute_elementary, VacuousVerificationError, VerifierResult,
 )
 from agent.orchestrator.h0_consistency import check_children_consistency
 from agent.orchestrator.node_fsm import Action, NodeEvent, ReasonCode, node_transition
@@ -148,6 +148,7 @@ class DagDriver:
         sketch_verifier: Optional[Callable[[str, str, list[str]], object]] = None,
         lean_strict: bool = False,
         lean_server: Optional[object] = None,
+        enforce_elementarity: bool = True,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -239,6 +240,41 @@ class DagDriver:
         # default) changes NOTHING: with no per-node verifier configured there is no per-node compile, and
         # the default offline path is byte-identical.
         self.lean_server = lean_server
+        # ELEMENTARITY-ENFORCEMENT switch (W5; the builder maps elementarity='none' -> False). When True
+        # (the DEFAULT) every refute_elementary chokepoint runs the EXACT pre-feature logic — a
+        # denylist-prose / undischarged-elastic / goal-binding refutation all REJECT and a refuted
+        # NEEDS_REVIEW proof becomes FAILED_ELEMENTARY (the BYTE-IDENTICAL pre-flag path). When False the
+        # chokepoints ADMIT the ELEMENTARITY DIMENSION ONLY: a refutation whose code is purely
+        # elementarity (denylist_prose / undischarged_elastic) is dropped, so such a node is NOT marked
+        # FAILED_ELEMENTARY but proceeds to soft PROVEN (the contract's "FAILED_ELEMENTARY downgrades to
+        # soft PROVEN"). SOUNDNESS IS UNAFFECTED: the GOAL-BINDING refutation (code 'goal_binding') is
+        # ALWAYS kept (a non-goal-bound proof is still rejected), a VACUOUS inspection STILL fails loud
+        # (VacuousVerificationError propagates unchanged), and acyclicity / obligation-discharge / H0 /
+        # conclusion-binding live outside these chokepoints and are never relaxed. The flag only ever
+        # flips the elementarity dimension; it never touches goal<->claim soundness.
+        self.enforce_elementarity = bool(enforce_elementarity)
+
+    def _refute_for_enforcement(self, source, goal: Optional[str]):
+        """Run the independent adversarial verifier, applying the ELEMENTARITY-ENFORCEMENT switch.
+
+        Always calls :func:`refute_elementary`, so a VACUOUS inspection still raises
+        :class:`VacuousVerificationError` (fail-loud anti-vacuity is preserved regardless of the flag —
+        the caller treats a vacuous inspection as a refutation either way).
+
+        When ``self.enforce_elementarity`` is True (the DEFAULT) the verdict is returned UNCHANGED — the
+        BYTE-IDENTICAL pre-flag path. When False, refutations whose code is purely the elementarity
+        dimension (``denylist_prose`` / ``undischarged_elastic``) are FILTERED OUT while the
+        soundness-bearing ``goal_binding`` refutation is KEPT: a non-goal-bound proof is STILL refuted
+        (rejected) but a goal-bound-yet-non-elementary one is admitted (no longer refuted)."""
+        verdict = refute_elementary(source, self.toolkit, goal=goal)
+        if self.enforce_elementarity:
+            return verdict
+        # ADMIT the elementarity dimension only: drop denylist_prose / undischarged_elastic refutations;
+        # keep goal_binding (soundness) so a non-goal-bound proof is still rejected.
+        kept = [r for r in verdict.refutations if r.code == "goal_binding"]
+        return VerifierResult(refuted=bool(kept), refutations=kept,
+                              inspected_steps=verdict.inspected_steps,
+                              rules_evaluated=verdict.rules_evaluated)
 
     def run(self, goal: str) -> DagResult:
         proven = self._prove(goal, ancestors=set(), depth=0)
@@ -617,9 +653,13 @@ class DagDriver:
              verifier never refutes (fail open). The Lean audit is only consulted at all when a verifier
              is wired in; with no verifier this clause is inert (deterministic refutation only).
 
-        Returns True iff NOTHING authoritatively refuted the challenger's elementarity."""
+        Returns True iff NOTHING authoritatively refuted the challenger's elementarity.
+
+        Honors the ELEMENTARITY-ENFORCEMENT switch: with enforcement OFF, a purely-elementarity
+        refutation (denylist_prose / undischarged_elastic) no longer blocks admission (only a
+        goal-binding refutation or a vacuous inspection does)."""
         try:
-            verdict = refute_elementary(ledger, self.toolkit, goal=goal)
+            verdict = self._refute_for_enforcement(ledger, goal)
         except VacuousVerificationError:
             return False
         except Exception:
@@ -657,7 +697,7 @@ class DagDriver:
         refutation (FAILED_ELEMENTARY), never as a pass."""
         source = res.report.ledger if (res.report and res.report.ledger is not None) else res.ledger
         try:
-            verdict = refute_elementary(source, self.toolkit, goal=goal)
+            verdict = self._refute_for_enforcement(source, goal)
         except VacuousVerificationError as e:
             # Fail loud: the verifier had nothing to inspect -> do NOT promote. Mark FAILED_ELEMENTARY.
             self.dag.mark_failed(goal, elementary=True,
@@ -895,7 +935,7 @@ class DagDriver:
         # un-refuted-but-still-unreviewed sketch is rejected as needing a reviewer.
         if sketch_report.verdict is Verdict.NEEDS_REVIEW and self.reviewer is None:
             try:
-                vr = refute_elementary(sketch_report.ledger or sketch, self.toolkit, goal=goal)
+                vr = self._refute_for_enforcement(sketch_report.ledger or sketch, goal)
             except VacuousVerificationError:
                 return (False, ["decomposition sketch verification was vacuous"],
                         ReasonCode.elementary_violation.value)

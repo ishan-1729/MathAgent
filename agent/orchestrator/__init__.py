@@ -25,6 +25,9 @@ from agent.orchestrator.dag_driver import (
     ScriptedDecomposer,
     ScriptedReviewer,
 )
+from agent.orchestrator.run_profile import RunProfile
+from agent.orchestrator.supervisor import validate_profile
+from agent.orchestrator.builder import build_driver, build_and_run
 
 __all__ = [
     "NodeState",
@@ -58,4 +61,8 @@ __all__ = [
     "Reviewer",
     "ScriptedDecomposer",
     "ScriptedReviewer",
+    "RunProfile",
+    "validate_profile",
+    "build_driver",
+    "build_and_run",
 ]
