@@ -110,9 +110,16 @@ def main() -> int:
     ap.add_argument("--max-replan", type=int, default=2, metavar="D",
                     help="global re-plan budget (max_replan_depth)")
     ap.add_argument("--evolve", type=int, default=0, metavar="K",
-                    help="run the OpenEvolve proof-sketch search for K iterations to seed a best "
-                         "candidate ledger before proving (needs mathagent[evolve]); graceful no-op "
-                         "if openevolve is not installed")
+                    help="FIRST-CLASS evolutionary proving: run the breadth-led OpenEvolve proof-sketch "
+                         "search for K iterations to explore a goal-bound, obligation-discharged "
+                         "CHAMPION ledger; a goal-bound PASSED champion short-circuits the prover and "
+                         "is handed to the DAG/Lean (needs mathagent[evolve]); graceful no-op if "
+                         "openevolve is not installed")
+    ap.add_argument("--evolve-witness", type=int, default=0, metavar="K",
+                    help="NUMERIC-GROUNDING evolution: evolve a witness/construction SPEC (residue "
+                         "cover / descent measure / solution set) for K iterations, scored ONLY by the "
+                         "exact-integer checker (numeric.py, no eval/exec). Reports the best confirmed "
+                         "construction (needs mathagent[evolve]); graceful no-op if not installed")
     ap.add_argument("--evolve-fallback", type=int, default=0, metavar="K",
                     help="(dag) wire the OpenEvolve backend as a FALLBACK decomposer that fires ONLY "
                          "on stuck nodes (K evolve iterations per fire); commits an evolved blueprint "
@@ -133,40 +140,81 @@ def main() -> int:
     print(f"# Proving (model={args.model}, effort={args.effort}, mode={'direct' if args.direct else 'dag'}):")
     print(f"  {args.goal}\n")
 
-    # Optional: OpenEvolve proof-sketch search. When --evolve K is set we run the MAP-Elites
-    # population search (gate = fitness oracle) for K iterations to produce a best candidate ledger.
-    # If openevolve is not installed this is a graceful no-op with a clear message. The evolved
-    # candidate is reported; if it gates clean AND its claim+conclusion bind to the goal it is fed in
-    # as the winning ledger (short-circuiting the prover for that goal).
+    # Build the retriever EARLY (before --evolve) so the evolutionary search can retrieval-seed its
+    # islands with elementary Mathlib exemplars matching the goal. None unless --retrieval/--neural.
+    retriever = None
+    if args.retrieval or args.neural:
+        from agent.tools.retrieval import LoogleRetriever
+        from agent.tools.semantic_retrieval import SemanticRetriever, HybridRetriever
+        rs = [LoogleRetriever()]                  # Loogle: exact names from compile errors
+        if args.neural:                           # neural bi-encoder: semantic (closes abbrev gap)
+            from agent.tools.neural_retrieval import (NeuralRetriever, SentenceTransformerEmbedder,
+                                                      CrossEncoderReranker)
+            rer = CrossEncoderReranker() if args.rerank else None
+            neu = NeuralRetriever(SentenceTransformerEmbedder(), reranker=rer)
+            if neu.available():
+                rs.append(neu)
+            else:
+                print("# (--neural requested but sentence-transformers/Mathlib unavailable; skipping)")
+        sem = SemanticRetriever()
+        if sem.available():
+            rs.append(sem)                        # BM25: relevance from the claim's meaning words
+        retriever = HybridRetriever(rs) if len(rs) > 1 else rs[0]
+
+    # FIRST-CLASS evolutionary proving. When --evolve K is set we run the breadth-led OpenEvolve
+    # exploration loop (Sonnet samples MANY diverse candidate ledgers per generation; MAP-Elites + the
+    # island database evolve them; the HARD-gated, goal-bound, obligation-debt-graded fitness SELECTS
+    # across generations) for K iterations to produce a CHAMPION ledger. If openevolve is not installed
+    # this is a graceful no-op with a clear message. The champion is ACCEPTED — and handed to the DAG +
+    # Lean for verification — iff it is a GOAL-BOUND ledger that cleared the PASSED band; we do NOT
+    # require the unreachable fitness == 1.0 (the HARD-gated band caps a genuine PASSED ledger well below
+    # 1.0, so an == 1.0 gate would discard every real champion and degrade --evolve to a no-op).
     evolved_ledger = None
     if args.evolve:
-        from agent.tools.openevolve_bridge import OpenEvolveBackend, evolve_sketches
+        from agent.tools.openevolve_bridge import OpenEvolveBackend, evolve_prove, PASSED_FLOOR
         if not OpenEvolveBackend.available():
             print("# (--evolve requested but openevolve not installed; "
                   "pip install mathagent[evolve] — skipping evolutionary search)\n")
         else:
             print(f"# evolving proof-sketch ledgers ({args.evolve} iterations, "
                   "Sonnet-breadth + Opus-depth ensemble)...")
-            best_text, best_fitness, _metrics = evolve_sketches(
-                args.goal, toolkit, iterations=args.evolve)
-            print(f"# evolve: best gate fitness = {best_fitness:.2f}")
-            # Only accept the evolved ledger as authoritative for THIS goal if it gates clean (1.0)
-            # AND both its top-level claim and terminal conclusion bind to the requested goal.
-            if best_fitness >= 1.0:
-                try:
-                    led = parse_ledger(best_text)
-                    gh = goal_hash(args.goal)
-                    concl = next((s for s in led.steps if s.justification == "conclusion"), None)
-                    if goal_hash(led.claim) == gh and concl is not None and goal_hash(concl.claim) == gh:
-                        evolved_ledger = best_text
-                        print("# evolve: candidate gates clean and proves the goal\n")
-                    else:
-                        print("# evolve: candidate gates clean but does not bind to the goal; "
-                              "using it only as a seed for the prover\n")
-                except LedgerError:
-                    print("# evolve: best candidate did not re-parse; ignoring\n")
+            champ = evolve_prove(args.goal, toolkit, iterations=args.evolve, retriever=retriever)
+            print(f"# evolve: best gate fitness = {champ.fitness:.2f} "
+                  f"(goal_bound={champ.goal_bound}, passed={champ.passed}, "
+                  f"PASSED_FLOOR={PASSED_FLOOR})")
+            # Accept the champion as the winning ledger for THIS goal iff it is goal-bound AND cleared
+            # the PASSED band (champ.accepted). It then short-circuits the prover and is handed to the
+            # DAG + Lean for verification just like any other proven ledger.
+            if champ.accepted:
+                evolved_ledger = champ.ledger
+                print("# evolve: champion is goal-bound + PASSED — accepting as the winning ledger\n")
+            elif champ.goal_bound:
+                print("# evolve: best champion binds to the goal but is below the PASSED band; "
+                      "using it only as a seed for the prover\n")
             else:
-                print("# evolve: no clean candidate; falling through to the prover\n")
+                print("# evolve: no goal-bound champion; falling through to the prover\n")
+
+    # NUMERIC-GROUNDING witness evolution (opt-in). Evolve a witness/construction SPEC scored ONLY by
+    # the exact-integer checker (numeric.py) — a non-gameable signal: non-elementary objects are
+    # literally unrepresentable in the integer-only AST. This grounds a CONSTRUCTION (e.g. a complete
+    # residue cover) rather than the claim; it reports the best confirmed spec and never short-circuits
+    # the prover. Wires the previously-unreachable evolve_witnesses entrypoint.
+    if args.evolve_witness:
+        from agent.tools.openevolve_bridge import OpenEvolveBackend, evolve_witnesses, score_witness_spec
+        if not OpenEvolveBackend.available():
+            print("# (--evolve-witness requested but openevolve not installed; "
+                  "pip install mathagent[evolve] — skipping witness search)\n")
+        else:
+            print(f"# evolving numeric witness/construction specs ({args.evolve_witness} iterations)...")
+            best_spec, wfit, _wm = evolve_witnesses(args.goal, iterations=args.evolve_witness)
+            confirmed = score_witness_spec(best_spec)["combined_score"] >= 1.0
+            print(f"# witness: best exact-integer fitness = {wfit:.2f} "
+                  f"(confirmed={confirmed})")
+            if confirmed:
+                print("# witness: construction CONFIRMED by the exact-integer checker\n"
+                      "--- witness spec ---\n" + best_spec + "\n")
+            else:
+                print("# witness: no confirmed construction evolved\n")
 
     # A clean evolved ledger that proves the goal short-circuits the prover entirely.
     if evolved_ledger is not None:
@@ -197,24 +245,7 @@ def main() -> int:
         faith = CodexFaithfulnessChecker(cfg)
     elif certifying:
         print("# (--no-faithfulness: Layer-4 audit only; result will NOT be authoritative)")
-    retriever = None
-    if args.retrieval or args.neural:
-        from agent.tools.retrieval import LoogleRetriever
-        from agent.tools.semantic_retrieval import SemanticRetriever, HybridRetriever
-        rs = [LoogleRetriever()]                  # Loogle: exact names from compile errors
-        if args.neural:                           # neural bi-encoder: semantic (closes abbrev gap)
-            from agent.tools.neural_retrieval import (NeuralRetriever, SentenceTransformerEmbedder,
-                                                      CrossEncoderReranker)
-            rer = CrossEncoderReranker() if args.rerank else None
-            neu = NeuralRetriever(SentenceTransformerEmbedder(), reranker=rer)
-            if neu.available():
-                rs.append(neu)
-            else:
-                print("# (--neural requested but sentence-transformers/Mathlib unavailable; skipping)")
-        sem = SemanticRetriever()
-        if sem.available():
-            rs.append(sem)                        # BM25: relevance from the claim's meaning words
-        retriever = HybridRetriever(rs) if len(rs) > 1 else rs[0]
+    # (retriever was built above, before the --evolve block, so evolve can retrieval-seed its islands.)
 
     cert_authoritative = None   # set in certifying modes once a Layer-4 certification actually runs
     if args.direct:

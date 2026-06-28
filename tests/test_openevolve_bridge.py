@@ -391,6 +391,81 @@ def test_evolve_config_uses_strategy_feature_axes(toolkit):
     assert config.database.feature_dimensions == ["strategy_class", "modulus_band", "subgoal_depth"]
 
 
+# ---- the LANGUAGE crash fix + breadth-exploration knobs ----------------------------------------
+
+def test_evolve_config_sets_language_to_avoid_crash(toolkit):
+    """``config.language`` MUST be a non-None string so the full-rewrite parser never crashes.
+
+    OpenEvolve leaves ``language=None`` by default; a worker path that reaches
+    ``parse_full_rewrite(resp, config.language)`` with ``language is None`` raises
+    ``TypeError: can only concatenate str (not "NoneType")`` (it does ``"```" + language``). Pinning a
+    concrete string makes the breadth/depth mutations actually land instead of being dropped on a crash.
+    """
+    pytest.importorskip("openevolve")
+    from openevolve.utils.code_utils import parse_full_rewrite
+
+    config = build_evolve_config(breadth_weight=0.8, depth_weight=0.2)
+    assert isinstance(config.language, str) and config.language  # non-None, non-empty
+    # The exact crash the fix prevents: with language=None this raises; with our string it does not.
+    with pytest.raises(TypeError):
+        parse_full_rewrite('{"claim": "x"}', None)
+    # With the configured language a fence-less full-rewrite reply is returned verbatim (no crash).
+    assert parse_full_rewrite('{"claim": "x"}', config.language) == '{"claim": "x"}'
+
+
+def test_evolve_config_tilts_database_toward_exploration(toolkit):
+    """The database is tilted toward EXPLORATION so breadth fans out over the strategy grid (GOAL 1/3)."""
+    pytest.importorskip("openevolve")
+    config = build_evolve_config(iterations=20)
+    db = config.database
+    # Exploration is favored over re-exploiting a single elite, and islands cross-pollinate within a run.
+    assert db.exploration_ratio > db.exploitation_ratio
+    assert db.migration_interval >= 1 and db.migration_interval <= 20
+
+
+# ---- evolve_prove: the FIRST-CLASS proving entrypoint (acceptance bar = goal-bound PASSED, not 1.0) --
+
+def test_evolve_champion_accepts_goal_bound_passed_not_unreachable_one():
+    """``EvolveChampion.accepted`` is goal-bound AND PASSED — NOT the unreachable fitness == 1.0.
+
+    The HARD-gated band caps a genuine PASSED ledger well below 1.0, so an ``== 1.0`` acceptance bar
+    (the old ``--evolve`` behaviour) discards every real champion and degrades evolve to a no-op. We pin
+    the acceptance semantics directly, without running evolution.
+    """
+    from agent.tools.openevolve_bridge import EvolveChampion
+
+    # A goal-bound PASSED champion at fitness 0.815 (< 1.0) is ACCEPTED.
+    good = EvolveChampion(ledger="{}", fitness=0.815, metrics={}, goal_bound=True, passed=True)
+    assert good.accepted is True
+    # Goal-bound but below the PASSED band -> not accepted (seed-only).
+    weak = EvolveChampion(ledger="{}", fitness=0.4, metrics={}, goal_bound=True, passed=False)
+    assert weak.accepted is False
+    # PASSED but off-goal -> not accepted (the HARD binding gate is load-bearing).
+    off = EvolveChampion(ledger="{}", fitness=0.72, metrics={}, goal_bound=False, passed=True)
+    assert off.accepted is False
+
+
+def test_evolve_prove_unavailable_when_openevolve_missing(monkeypatch, toolkit):
+    # evolve_prove must raise the install hint (not ImportError) when the optional package is absent.
+    import importlib.util as ilu
+    monkeypatch.setattr(ilu, "find_spec", lambda name: None)
+    from agent.tools.openevolve_bridge import evolve_prove
+    with pytest.raises(RuntimeError, match="pip install mathagent\\[evolve\\]"):
+        evolve_prove("g", toolkit, iterations=1)
+
+
+def test_evolve_prove_returns_accepted_champion_for_goal_bound_passed(toolkit):
+    """The live entrypoint: a goal-bound PASSED champion is returned with ``accepted is True``."""
+    pytest.importorskip("openevolve", reason="pip install mathagent[evolve] to run the live bridge")
+    from agent.tools.openevolve_bridge import evolve_prove
+
+    goal = "A demo theorem."
+    champ = evolve_prove(goal, toolkit, llm=StubEvolveLLM([_goal_bound_good_ledger_text(goal)]),
+                         iterations=3, seed_sketches=[_needs_review_ledger_text()])
+    assert PASSED_FLOOR <= champ.fitness <= 1.0
+    assert champ.goal_bound and champ.passed and champ.accepted
+
+
 # ---- live (opt-in): the NUMERIC witness-evolution mode runs and is scored ONLY by numeric.py --------
 
 def test_live_witness_evolution_runs_and_grounds_construction():

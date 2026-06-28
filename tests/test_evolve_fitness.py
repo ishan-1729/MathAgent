@@ -914,3 +914,54 @@ def test_more_discharged_never_lowers_score_and_more_debt_never_raises_it():
     v = "passed_deterministic"
     assert _graded_score(v, 0, 2, 3) >= _graded_score(v, 0, 1, 3) >= _graded_score(v, 0, 0, 3)
     assert _graded_score(v, 0, 1, 3) >= _graded_score(v, 1, 1, 3) >= _graded_score(v, 2, 1, 3)
+
+
+# --------------------------------------------------------------------------------------------------
+# The SELECTION GRADIENT the evolutionary loop climbs. The breadth-led search optimises this fitness;
+# for the loop to steer toward ELEMENTARY, obligation-grounded proofs the oracle must rank a discharge
+# strictly above a trivial PASSED, which is strictly above NEEDS_REVIEW, which is strictly above an
+# off-goal / vacuous HARD zero. (This is the ordering the test_evolve_loop.py live tests rely on.)
+# --------------------------------------------------------------------------------------------------
+def _trivial_goal_bound_passed() -> dict:
+    """Goal-bound PASSED with NO discharged obligation — clears the band but carries no content anchor."""
+    return {
+        "problem": "ljunggren",
+        "claim": GOAL,
+        "steps": [
+            {"id": "h", "claim": "x^2 + 1 = 2 y^4.", "justification": "given", "depends_on": []},
+            {"id": "c", "claim": GOAL, "justification": "conclusion", "depends_on": ["h"]},
+        ],
+    }
+
+
+def test_selection_gradient_ranks_discharge_above_trivial_above_review_above_zero(tk):
+    """The strict fitness ordering the loop climbs: discharge > trivial PASSED > review > off-goal 0.
+
+    This is the elementarity-aware selection pressure: an obligation-DISCHARGING ledger out-ranks an
+    equally-PASSED but content-free one, which out-ranks a NEEDS_REVIEW relabel-the-hard-theorem trap,
+    which out-ranks an off-goal HARD zero. A breadth search optimising this fitness is therefore steered
+    toward discharging real obligations — the antidote to grabbing a non-elementary shortcut.
+    """
+    discharge = _score(_honest_obligation_ledger(), tk)        # PASSED + discharge
+    trivial = _score(_trivial_goal_bound_passed(), tk)         # PASSED, no discharge
+    review = _score(_ljunggren_relabel_trap(), tk)             # capped to NEEDS_REVIEW band
+    off_goal = _score(_claim_weakened_offgoal(), tk)           # HARD zero (off-goal)
+    vacuous = _score(_vacuous_restatement(), tk)               # HARD zero (vacuous)
+
+    assert off_goal == 0.0 and vacuous == 0.0
+    assert NEEDS_REVIEW_FLOOR <= review < PASSED_FLOOR         # the relabel trap is review-only
+    assert PASSED_FLOOR <= trivial                             # trivial PASSED clears the band
+    assert review < trivial < discharge <= 1.0                 # strict, monotone selection gradient
+
+
+def test_witness_mode_scored_only_by_exact_integer_checker():
+    """The witness/construction mode (the newly-wired entrypoint) is grounded ONLY by numeric.py.
+
+    A complete residue cover is CONFIRMED (1.0); an incomplete one is NOT (0.0). The score comes from
+    the exact-integer checker — never the soft ledger gate — so a non-elementary object cannot be
+    represented, let alone confirmed. (Pins the contract --evolve-witness now exposes to users.)
+    """
+    complete = json.dumps({"kind": "residue_cover", "modulus": 3, "residues": [0, 1, 2]})
+    partial = json.dumps({"kind": "residue_cover", "modulus": 3, "residues": [0, 1]})
+    assert score_witness_spec(complete)["combined_score"] == 1.0
+    assert score_witness_spec(partial)["combined_score"] == 0.0

@@ -1560,6 +1560,17 @@ def build_evolve_config(
     config = Config()
     config.max_iterations = iterations
     config.diff_based_evolution = diff_based
+    # ARTIFACT LANGUAGE (avoid a crash). Our evolved artifact is a JSON ledger, NOT a programming
+    # language. OpenEvolve leaves ``config.language`` as ``None`` by default and only lazily fills it
+    # (via ``extract_code_language(initial_program)``) inside ``Controller.__init__``. Any worker code
+    # path that reaches ``parse_full_rewrite(resp, config.language)`` with ``language is None`` crashes
+    # with ``TypeError: can only concatenate str (not "NoneType")`` (it does ``"```" + language``). On
+    # a JSON ledger ``extract_code_language`` returns ``"unknown"`` anyway, which carries no useful
+    # fenced-block semantics — so we pin it to ``"text"`` deterministically: the full-rewrite parser
+    # then treats the LLM's whole reply as the new ledger text, and the diff parser's fenced blocks are
+    # matched as plain text. This makes the breadth/depth mutations ACTUALLY land instead of being
+    # silently dropped on a parse crash. (Set BEFORE the controller's lazy init so ours wins.)
+    config.language = "text"
     config.llm.models = models
     config.llm.evaluator_models = list(config.llm.models)  # post_init gotcha: set explicitly
     config.database.num_islands = max(1, num_islands)
@@ -1567,6 +1578,14 @@ def build_evolve_config(
         feature_dimensions or ["strategy_class", "modulus_band", "subgoal_depth"]
     )
     config.database.feature_bins = feature_bins
+    # BREADTH EXPLORATION (AlphaEvolve's core power). The breadth (Sonnet) model proposes MANY diverse
+    # candidate ledgers per generation; MAP-Elites + the island database keep them diverse and the
+    # deterministic fitness oracle SELECTS across generations. Tilt the database toward EXPLORATION so
+    # the search actually fans out over the strategy grid rather than hill-climbing one elite: a higher
+    # exploration ratio + a non-trivial migration cadence make breadth do the heavy lifting (GOAL 1/3).
+    config.database.exploration_ratio = 0.6   # favor sampling diverse cells over re-exploiting one elite
+    config.database.exploitation_ratio = 0.3
+    config.database.migration_interval = max(1, iterations // 4)  # cross-pollinate islands within a run
     config.evaluator.cascade_evaluation = False  # no evaluate_stage1/2/3 defined
     config.evaluator.parallel_evaluations = 1    # in-process evaluator, but never executes the ledger
     return config
@@ -1665,6 +1684,81 @@ def evolve_sketches(
     lines = [ln for ln in best_text.splitlines() if not ln.lstrip().startswith("#")]
     best_text = ("\n".join(lines).strip()) or best_text
     return best_text, float(result.best_score), dict(result.metrics or {})
+
+
+@dataclass
+class EvolveChampion:
+    """The outcome of a FIRST-CLASS evolutionary proving run (:func:`evolve_prove`).
+
+    ``ledger`` is the best evolved proof-sketch ledger TEXT; ``fitness`` its HARD-gated, goal-bound,
+    obligation-debt-graded score in [0, 1]; ``metrics`` the full per-candidate metrics dict.
+    ``goal_bound`` is True iff BOTH the top-level claim AND terminal conclusion bind to the goal by
+    deterministic ``goal_hash`` equality, and ``passed`` iff the champion cleared the deterministic gate
+    into the PASSED band (``fitness >= PASSED_FLOOR``). ``accepted`` is the single first-class decision:
+    a champion is accepted (ready to hand to the DAG + Lean) iff it is a goal-bound PASSED ledger — NOT
+    the unreachable ``fitness == 1.0`` (the HARD-gated band caps a genuine PASSED ledger well below 1.0,
+    so a == 1.0 gate would discard every real champion and degrade evolve to a no-op)."""
+    ledger: str
+    fitness: float
+    metrics: dict
+    goal_bound: bool
+    passed: bool
+
+    @property
+    def accepted(self) -> bool:
+        """True iff this is a goal-bound champion that cleared the PASSED band (hand it to DAG + Lean)."""
+        return self.goal_bound and self.passed
+
+
+def evolve_prove(
+    goal: str,
+    toolkit,
+    *,
+    iterations: int = 20,
+    llm=None,
+    claude_cfg: Optional[ClaudeConfig] = None,
+    breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
+    depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
+    rank_signal: Optional[RankSignal] = None,
+    seed_sketches: Optional[list[str]] = None,
+    retriever=None,
+    num_islands: int = 2,
+) -> EvolveChampion:
+    """FIRST-CLASS evolutionary proving: explore for a goal-bound, obligation-discharged champion ledger.
+
+    This is the clear entrypoint a user invokes (``scripts/prove.py --evolve K`` wires straight to it):
+    it runs the breadth-led OpenEvolve exploration loop (Sonnet samples MANY diverse candidate ledgers
+    per generation; MAP-Elites + the island database evolve them; the HARD-gated, goal-bound,
+    obligation-debt-graded fitness SELECTS across generations) and returns the best champion together
+    with the SINGLE acceptance decision.
+
+    The acceptance bar is a goal-bound PASSED ledger (``fitness >= PASSED_FLOOR`` AND it binds to the
+    goal), NOT the unreachable ``fitness == 1.0``: the HARD-gated band caps a genuine PASSED ledger at
+    ~0.72-0.99, so an ``== 1.0`` gate (the old ``--evolve`` behaviour) discards EVERY real champion and
+    silently degrades evolve to a fallback-only no-op. An accepted champion is goal-bound and PASSED, so
+    it is ready to hand to the DAG + Lean for authoritative verification.
+
+    Returns an :class:`EvolveChampion`. Raises ``RuntimeError`` (the install hint) iff openevolve is
+    missing — callers should gate on :func:`available` first.
+    """
+    best_text, fitness, metrics = evolve_sketches(
+        goal, toolkit, llm=llm, claude_cfg=claude_cfg,
+        breadth_weight=breadth_weight, depth_weight=depth_weight, rank_signal=rank_signal,
+        iterations=iterations, seed_sketches=seed_sketches, retriever=retriever,
+        num_islands=num_islands,
+    )
+    # Re-derive goal-binding DETERMINISTICALLY from the champion text (do NOT trust the float alone):
+    # the HARD fitness already zeroes an off-goal candidate, but we want an explicit, audit-friendly
+    # binding bit independent of the band arithmetic.
+    goal_bound = False
+    try:
+        led = parse_ledger(best_text)
+        goal_bound = binds_to_goal(led, goal) and not is_vacuous(led)
+    except (LedgerError, Exception):
+        goal_bound = False
+    passed = fitness >= PASSED_FLOOR
+    return EvolveChampion(ledger=best_text, fitness=float(fitness), metrics=dict(metrics),
+                          goal_bound=bool(goal_bound), passed=bool(passed))
 
 
 def evolve_witnesses(
@@ -1767,6 +1861,8 @@ class OpenEvolveBackend:
 __all__ = [
     "available",
     "evolve_sketches",
+    "evolve_prove",
+    "EvolveChampion",
     "evolve_witnesses",
     "build_evolve_config",
     "make_gate_evaluator",
