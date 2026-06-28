@@ -18,6 +18,27 @@
 
 ---
 
+> **Implementation-status note (added 2026-06-28 — read before the recommendations below).** Several
+> items in this study were subsequently *ported* but are **aspirational / decorative in the current
+> tree, not load-bearing wins** — state this honestly when citing them:
+> - **Dilworth width (§3.2, §4 🥈) and Mirsky `upward_rank` (§4 🥉).** Ported faithfully
+>   (`agent/orchestrator/dilworth.py`), but they cap a **safe-parallel fan-out that does not exist yet**:
+>   there is **no concurrent executor** — AND-node children are proven **serially**. For the common
+>   *flat* AND-decomposition the children are precedence-independent, so **width == child_count** and the
+>   cap rarely binds; `upward_rank` is **computed but decorative** (only a 3rd tie-break sort key behind
+>   `_critical_path_depths`, and 0 for flat plans, in an ordering that is in any case outcome-irrelevant).
+>   They are *correct theorems doing no real throughput work yet* — kept for a future concurrent executor.
+> - **H⁰ child-consistency (§4 🥉 "Sheaf / H⁰ interface check").** What is actually wired is a **surface
+>   signature-compatibility gate** — a narrow, computable regex/family shadow of an H⁰ 0-cocycle check
+>   (a hardcoded ~6-family exclusivity table, firing only on `given`/`assumption`/`lemma` steps, often
+>   inspecting 0 overlaps). It is **not** a full sheaf / global-section computation; do not read the
+>   category-theory label as implemented cohomology.
+> - **Category theory (§3.4, §6).** SMC `∘`/`⊗`, Applicative/Monad tiering, and functors are **labels /
+>   reasoning aids only — there is no such code in MathAgent.** Faithful to Forge's own "reason-with, not
+>   implemented" disclaimer; decorative as "category theory in the codebase."
+
+---
+
 ## 1. Executive summary — what to take and what to leave
 
 **Take (the orchestration "shadows"):**
@@ -241,7 +262,12 @@ buildable node → escalate) from `producible_build` — MathAgent should likewi
   composition is unsound even though each child passed locally → `REJECTED`/route-to-review, never
   promote. *Implement it as a concrete signature-compatibility gate — the category-theory label is
   optional; the operational check is what matters.* (Also the right merge-safety model if the worktree
-  fan-out ever produces parallel proof fragments.)
+  fan-out ever produces parallel proof fragments.) **As built (honest scope):** what landed is exactly
+  this *surface signature-compatibility gate* — a narrow, computable shadow of the H⁰ 0-cocycle check
+  (a hardcoded ~6-family exclusivity table over `given`/`assumption`/`lemma` step signatures), **not** a
+  sheaf / global-section computation. It catches literal family clashes (e.g. even/odd) and frequently
+  inspects 0 overlaps; read the "sheaf/H⁰" wording as a *label* for that lexical check, not implemented
+  cohomology.
 - **Workflow-net / Petri-net soundness** as the *formal name* for "everything terminates": no reachable
   state where a node sits `IN_PROGRESS` with no enabled transition (the bug was exactly a missing
   transition), and every run reaches a terminal state because Budget strictly decreases and
@@ -303,10 +329,10 @@ buildable node → escalate) from `producible_build` — MathAgent should likewi
 | Restarting → **Suspending** scheduler | the `res.exhausted → mark_failed` bug | **direct fix** |
 | `classify_blocker` (`producible_build` vs `starved`) | flat `FAILED_*` / `EXHAUSTED` | **enrich** (action-oriented kinds) |
 | Total `match (state,event)` + proptests | `NodeState` enum + inline branches | **refactor into a total table** |
-| Dilworth width / `concurrency_cap` | guessed `min(16, cores-2)` fan-out | **adopt** (proof DAG + workflows) |
-| Mirsky / `upward_rank` (`(max,+)`) | none (DFS order) | **adopt** for branch priority |
-| Applicative/Monad tiering | none | **adopt** (which sub-proofs parallelise) |
-| H⁰ merge check | none | **adopt** (AND-node child consistency) |
+| Dilworth width / `concurrency_cap` | guessed `min(16, cores-2)` fan-out | **ported but aspirational** — no concurrent executor exists (children proved serially); flat AND ⇒ width==child_count, cap rarely binds |
+| Mirsky / `upward_rank` (`(max,+)`) | none (DFS order) | **ported but decorative** — only a 3rd tie-break sort key; 0 for flat plans; ordering is outcome-irrelevant |
+| Applicative/Monad tiering | none | **label only** (reasoning aid; no SMC/monad code) |
+| H⁰ merge check | none | **adopted as a surface signature-compat gate** — a narrow computable shadow of H⁰, **not** a sheaf/global-section computation |
 | Untrusted-worker + adversarial verifier + downgrade | fail-closed gate + faithfulness panel | **harden** (per deep-audit) |
 | Commit-time acyclicity guard | `would_create_cycle` | convergent (MathAgent ≥ Forge) |
 | Charting product / UI FSMs / codegen | — | **not relevant** |

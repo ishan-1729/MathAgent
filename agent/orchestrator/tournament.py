@@ -11,16 +11,27 @@ Each pass:
   3. **Synthesizer** merges the incumbent and B (blind to which is which) → candidate AB.
   4. An **admissibility gate** (e.g. the elementary gate) drops any challenger that fails it, so a
      non-elementary "improvement" can never even enter the tournament.
-  5. A **judge panel** (pairwise `Comparator`s) compares the surviving candidates; outcomes feed
-     `population.EloPopulation` → **Bradley-Terry** latent strengths (stable batch ranking) and
-     **PUCT** seed selection for the next pass (exploit strong + explore under-visited).
-  6. A challenger displaces the incumbent only if it beats it **head-to-head by `margin`** judge votes;
-     ties go to the incumbent ("do nothing"). The loop stops when the incumbent survives `k_stop`
-     consecutive passes (convergence) or the budget is exhausted.
+  5. A **judge panel** (pairwise `Comparator`s) compares the surviving candidates round-robin. The
+     DISPLACEMENT decision is a PAIRWISE head-to-head tally: each candidate's NET vote count against
+     the incumbent (a +1 for each judge that prefers it to the incumbent, -1 for each that prefers the
+     incumbent), NOT a Borda count over the whole field.
+  6. A challenger displaces the incumbent only if it beats it **head-to-head by `margin`** net judge
+     votes; ties go to the incumbent ("do nothing"). The loop stops when the incumbent survives
+     `k_stop` consecutive passes (convergence) or the budget is exhausted.
 
-This is the **synthesis-drift / elementary-incumbent guard**, and — because the admitted output is the
-incumbent that survived every pass — it is *monotone*: refinement can only keep or improve, never
-regress. Deterministic given the stubs + seed, so fully testable offline.
+The Bradley-Terry latent-strength fit (`set_ratings_from_bradley_terry`) and PUCT seed selection
+(`select_puct`) used between passes are imported from the population SEARCH machinery
+(`population.EloPopulation`); they only ORDER which surviving challenger to consider first and which
+seed to revise next. They are NOT part of AutoReason's training-free critique-revise core — the
+AutoReason paper disclaims voting / game-theoretic ranking machinery — so the DISPLACEMENT itself is
+decided purely by the pairwise net-vote + margin rule above, never by a BT score.
+
+This is the **synthesis-drift / elementary-incumbent guard**. The admitted output is the incumbent that
+survived every pass, so refinement does not regress RELATIVE TO THE JUDGE PANEL + admissibility gate —
+a challenger has to clear both to win. This is NOT an absolute no-regression guarantee: the panel may be
+a single soft LLM judge, which could still prefer a worse (but admissible) rewrite; "monotone" holds
+only with respect to that panel's preferences and the gate, not in any ground-truth sense. Deterministic
+given the stubs + seed, so fully testable offline.
 """
 from __future__ import annotations
 
@@ -65,7 +76,12 @@ class RefineResult:
 
 
 class RevisionController:
-    """Run the incumbent tournament to refine a single proof artifact without ever regressing it."""
+    """Run the incumbent tournament to refine a single proof artifact.
+
+    No-regression is RELATIVE: the admitted output is the incumbent that survived every pass, so it
+    never regresses with respect to the judge PANEL + the admissibility gate (a challenger must clear
+    both to displace it). It is NOT an absolute guarantee — with a single soft judge the panel could
+    prefer a worse-but-admissible rewrite."""
 
     def __init__(
         self,
@@ -154,12 +170,16 @@ class RevisionController:
                 seed_cand = pop.select_puct(self.c_explore) or inc
                 continue
 
-            # Judge panel → win matrix (for BT + PUCT) + per-pass head-to-head vs the incumbent.
+            # Judge panel → per-pass PAIRWISE net head-to-head votes vs the incumbent (the displacement
+            # signal) plus the win matrix the population machinery uses for its own BT/PUCT bookkeeping.
             pool = [inc] + new_cands
             net, judged_fully = self._judge_round(pop, pool, inc)
-            pop.set_ratings_from_bradley_terry()      # BT latent strengths → ratings
+            pop.set_ratings_from_bradley_terry()      # population-search BT ratings (used ONLY to order
+                                                      # the iteration below; never the displacement test)
 
-            # Displacement: the BT-strongest challenger that beats the incumbent head-to-head by margin.
+            # Displacement is decided by the PAIRWISE net-vote margin, NOT by the BT rating. The BT order
+            # only breaks ties on WHICH qualifying challenger to promote first; a candidate is admitted
+            # iff its net head-to-head vote vs the incumbent clears `margin`.
             displaced = False
             for c in sorted(new_cands, key=lambda c: c.rating, reverse=True):
                 if net.get(c.id, 0) >= self.margin:

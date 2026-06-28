@@ -228,3 +228,77 @@ def test_valid_polynomials_still_parse_after_hardening():
                                   {"x": (-50, 50), "y": (-10, 10)}) == [{"x": 0, "y": 1}]
     nonneg = numeric.find_points_where_nonneg("(x - 1) - (x)", ["x"], {"x": (0, 5)})
     assert nonneg == []  # x-1 < x everywhere -> never >= 0
+
+
+# --- Latent NameError fix: SpecCheck.error: Optional[str] must resolve (`Optional` imported) ---
+
+def test_optional_annotation_resolves_on_speccheck():
+    # SpecCheck.error is annotated Optional[str]; under PEP 563 string annotations the missing
+    # `from typing import Optional` was a latent NameError surfacing only when the annotation is
+    # resolved. get_type_hints forces resolution -> must NOT raise NameError.
+    import typing
+    hints = typing.get_type_hints(numeric.SpecCheck)
+    assert hints["error"] == typing.Optional[str]
+
+
+def test_optional_is_importable_from_numeric_namespace():
+    # Direct evidence that `Optional` is now bound in the module namespace.
+    assert numeric.Optional is not None
+    # And a SpecCheck carrying an error still constructs/behaves (the malformed-spec HARD-failure path).
+    sc = numeric.SpecCheck(False, "descent", error="boom")
+    assert sc.error == "boom" and bool(sc) is False
+
+
+# --- evaluate_integer_constant / concrete_inequality_holds (the bounding content checker primitives) ---
+
+def test_evaluate_integer_constant_exact():
+    assert numeric.evaluate_integer_constant("2 + 3 * 4") == 14
+    assert numeric.evaluate_integer_constant("-(2**3)") == -8
+
+
+def test_evaluate_integer_constant_symbolic_raises_symbolic():
+    # A free variable -> SymbolicExpression (a NumericError subclass), distinct from "malformed".
+    with pytest.raises(numeric.SymbolicExpression):
+        numeric.evaluate_integer_constant("n + 1")
+
+
+@pytest.mark.parametrize("bad", [
+    '__import__("os").getpid()', "x.__class__", "x[0]", "x / 2", "x + 1.5",
+])
+def test_evaluate_integer_constant_malformed_raises_numeric_not_symbolic(bad, monkeypatch):
+    # A non-polynomial / injection side is MALFORMED (NumericError) and must NOT be mistaken for a
+    # benign symbolic side; it must never execute.
+    import os
+
+    called = {"hit": False}
+    monkeypatch.setattr(os, "getpid", lambda: called.__setitem__("hit", True) or 1)
+    with pytest.raises(NumericError) as ei:
+        numeric.evaluate_integer_constant(bad)
+    assert not isinstance(ei.value, numeric.SymbolicExpression)
+    assert called["hit"] is False
+
+
+def test_split_inequality_forms():
+    assert numeric.split_inequality("n < n+1") == ("n", "n+1", "<", True)
+    assert numeric.split_inequality("2 <= 3") == ("2", "3", "<=", False)
+    assert numeric.split_inequality("a >= b") == ("a", "b", ">=", False)
+
+
+@pytest.mark.parametrize("bad", ["n n", "a < b < c", "a == b", "< 3", "3 <"])
+def test_split_inequality_malformed_raises(bad):
+    with pytest.raises(NumericError):
+        numeric.split_inequality(bad)
+
+
+def test_concrete_inequality_holds_decides_and_defers():
+    assert numeric.concrete_inequality_holds("2", "3", "<") is True
+    assert numeric.concrete_inequality_holds("5", "3", "<") is False
+    assert numeric.concrete_inequality_holds("5", "5", "<=") is True
+    assert numeric.concrete_inequality_holds("5", "5", "<") is False
+    # Symbolic side -> None (not numerically decidable here), never a false True/False.
+    assert numeric.concrete_inequality_holds("n", "n+1", "<") is None
+
+
+def test_concrete_inequality_malformed_side_raises():
+    with pytest.raises(NumericError):
+        numeric.concrete_inequality_holds("x / 2", "3", "<")

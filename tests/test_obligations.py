@@ -1,4 +1,4 @@
-"""Tests for obligation content checks (case-cover, descent, split-coprimality)."""
+"""Tests for obligation content checks (case-cover, descent, bounding, split-coprimality)."""
 from agent.gates.ledger import parse_ledger
 from agent.gates.obligations import check_obligations
 from agent.gates.report import Severity
@@ -161,3 +161,158 @@ def test_descent_numeric_spotcheck_still_passes_after_hardening(toolkit):
         {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
     ])
     assert not _codes(check_obligations(led, toolkit))
+
+
+# ----------------------------------------------------------------------------------------------------
+# (B) ENFORCE descent strict-decrease by default + route an unverifiable descent to NEEDS_REVIEW.
+# ----------------------------------------------------------------------------------------------------
+
+def _descent_step(descent_ob, sid="s1"):
+    return {"id": sid, "claim": "descend", "justification": "descent", "depends_on": [],
+            "obligations": {"descent": descent_ob}}
+
+
+def test_descent_without_measure_is_review_not_passed(toolkit):
+    # A descent that only SELF-ASSERTS the booleans (no measure_expr/next_expr) must NOT silently pass:
+    # it is routed to NEEDS_REVIEW via a REVIEW finding (an unverified descent is flagged, not admitted
+    # as deterministically proven). Pre-change this emitted NO finding at all (silent pass).
+    led = _ledger([
+        _descent_step({"measure": "x", "strictly_decreases": True, "stays_in_domain": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    findings = check_obligations(led, toolkit)
+    assert "descent_unverified_measure" in _codes(findings, Severity.REVIEW)
+    # It is a soft REVIEW, never a hard REJECT (a self-asserted-true descent is not itself wrong).
+    assert not _codes(findings, Severity.REJECT)
+
+
+def test_descent_non_decreasing_measure_fails_by_default(toolkit):
+    # next = x (NOT < measure = x) -> the strict-decrease check runs BY DEFAULT and REJECTS. Pre-change
+    # the equality 'measure_expr'/'next_expr' were supplied so this path already rejected; we keep it
+    # green to pin "runs by default, no opt-in flag required".
+    led = _ledger([
+        _descent_step({
+            "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+            "measure_expr": "x", "next_expr": "x", "variables": ["x"],
+            "sample_bounds": {"x": [0, 5]}}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "descent_no_decrease" in _codes(check_obligations(led, toolkit))
+
+
+def test_descent_expr_without_box_is_rejected_not_silently_passed(toolkit):
+    # A descent that supplies measure_expr/next_expr but OMITS the sample_bounds box it needs is a
+    # malformed checkable obligation -> deterministic REJECT (descent_expr_error). Pre-change this was a
+    # SILENT PASS (the numeric check only ran when all four fields were present).
+    led = _ledger([
+        _descent_step({
+            "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+            "measure_expr": "x", "next_expr": "x - 1", "variables": ["x"]}),  # no sample_bounds
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "descent_expr_error" in _codes(check_obligations(led, toolkit))
+
+
+def test_descent_half_specified_measure_is_rejected(toolkit):
+    # Only next_expr (no measure_expr): a half-specified measure cannot be checked -> REJECT, not a
+    # silent pass nor a crash.
+    led = _ledger([
+        _descent_step({
+            "measure": "x", "strictly_decreases": True, "stays_in_domain": True,
+            "next_expr": "x - 1", "variables": ["x"], "sample_bounds": {"x": [0, 5]}}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "descent_expr_error" in _codes(check_obligations(led, toolkit))
+
+
+# ----------------------------------------------------------------------------------------------------
+# (B) bounding obligation now has a REAL content checker.
+# ----------------------------------------------------------------------------------------------------
+
+def _bounding_step(bounding_ob, sid="s1"):
+    return {"id": sid, "claim": "bound it", "justification": "bounding", "depends_on": [],
+            "obligations": {"bounding": bounding_ob}}
+
+
+def test_bounding_symbolic_valid_passes_content_check(toolkit):
+    # A well-formed symbolic strict bound ('n < n+1', strict=True) has no concrete value to refute, so
+    # the deterministic content checker raises NO finding (it stays a REVIEW-routed elastic step
+    # upstream, but check_obligations itself must not REJECT a genuinely-elementary bound).
+    led = _ledger([
+        _bounding_step({"inequality": "n < n+1", "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert not _codes(check_obligations(led, toolkit))
+
+
+def test_bounding_concrete_violated_rejects(toolkit):
+    # A CONCRETE bound that is numerically FALSE ('5 < 3') must FAIL (verified via the no-eval
+    # evaluator). Pre-change 'bounding' had NO content checker, so this passed on presence alone.
+    led = _ledger([
+        _bounding_step({"inequality": "5 < 3", "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "bounding_violated" in _codes(check_obligations(led, toolkit))
+
+
+def test_bounding_concrete_true_passes(toolkit):
+    # A concrete TRUE bound ('2 < 3') passes the content check.
+    led = _ledger([
+        _bounding_step({"inequality": "2 < 3", "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert not _codes(check_obligations(led, toolkit))
+
+
+def test_bounding_strictness_mismatch_rejects(toolkit):
+    # Declaring strict=True on a non-strict operator ('2 <= 3') is an inconsistent obligation -> FAIL.
+    led = _ledger([
+        _bounding_step({"inequality": "2 <= 3", "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "bounding_strictness_mismatch" in _codes(check_obligations(led, toolkit))
+
+
+def test_bounding_malformed_inequality_rejects(toolkit):
+    # No comparison operator at all -> malformed, must FAIL (not pass on presence).
+    led = _ledger([
+        _bounding_step({"inequality": "n plus one", "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "bounding_malformed" in _codes(check_obligations(led, toolkit))
+
+
+def test_bounding_malicious_side_rejects_and_does_not_execute(toolkit, monkeypatch):
+    # A prover-controlled inequality side carrying a Python injection must become a deterministic
+    # REJECT (bounding_malformed) and must NOT execute during parsing.
+    import os
+
+    called = {"hit": False}
+    monkeypatch.setattr(os, "getpid", lambda: called.__setitem__("hit", True) or 1)
+    led = _ledger([
+        _bounding_step({"inequality": '__import__("os").getpid() < 3', "strict": True}),
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    assert "bounding_malformed" in _codes(check_obligations(led, toolkit))
+    assert called["hit"] is False
+
+
+def test_bounding_caret_exponent_is_not_over_rejected():
+    """Regression: a valid bound written with caret exponents ('2^n < 3^n') must NOT be hard-rejected
+    as malformed. Caret is exponentiation in elementary NT; before the _to_pow normalization '^' parsed
+    as BitXor -> a disallowed node -> a spurious bounding_malformed REJECT, shrinking elementary reach."""
+    from agent.gates.obligations import _check_bounding
+    for ineq in ("2^n < 3^n", "x^2 + y^2 < z^2", "2^n < 2^(n+1)", "3^2 < 4^2"):
+        findings = _check_bounding("s1", {"bounding": {"inequality": ineq, "strict": True}})
+        assert findings == [], f"valid caret bound {ineq!r} was over-rejected: {[f.code for f in findings]}"
+
+
+def test_bounding_caret_still_catches_violated_and_malicious():
+    """The caret normalization must not loosen the genuine checks: a concretely-FALSE caret bound is
+    still REJECTed (bounding_violated), and a malicious side is still REJECTed (bounding_malformed) and
+    NEVER executed (no eval)."""
+    from agent.gates.obligations import _check_bounding
+    violated = _check_bounding("s1", {"bounding": {"inequality": "5^2 < 3^2", "strict": True}})
+    assert any(f.code == "bounding_violated" for f in violated)
+    malicious = _check_bounding("s1", {"bounding": {"inequality": '__import__("os") < 3', "strict": True}})
+    assert any(f.code == "bounding_malformed" for f in malicious)

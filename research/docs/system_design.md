@@ -40,12 +40,16 @@ Within family (a) the system has a definite shape:
 - **Spine = LEAP.** Informal blueprint → AND-OR proof DAG → compiler-feedback revision → memoized
   lemma reuse, with a pre-commit decomposition reviewer.
 - **Grafted from AlphaProof_Nexus.** The Ralph loop, the deep-hash goal cache, the **population/Elo
-  candidate search** (Elo + Bradley-Terry + PUCT over K candidate decompositions, §8), and — most
-  important — **SafeVerify → our Layer-4 axiom/dependency audit**.
+  candidate *ranker*** (Elo + Bradley-Terry + PUCT over K candidate decompositions, §8 — a one-shot
+  rank-K-then-pick within a single decompose call, **not** an evolutionary population with mutation/
+  crossover or a persisted DB), and — most important — **SafeVerify → our Layer-4 axiom/dependency
+  audit**.
 - **Substituted.** AlphaProof_Nexus uses an RL-trained prover (AlphaProof) as the per-subgoal tool —
   the one piece nobody can reproduce. **We swap in Codex GPT-5.5-xHigh.**
-- **Grafted from Autoreason.** The incumbent revision tournament (do-nothing first-class, blind judge
-  panel, k=2 stop, margin gate) as the revision controller / synthesis-drift guard.
+- **Grafted from Autoreason.** The incumbent revision tournament (do-nothing first-class, k=2 stop,
+  margin gate; the judge "panel" defaults to `n_judges=1`) as the revision controller / synthesis-drift
+  guard. *(The BT/PUCT seeding inside it is grafted from `population.py`, not from AutoReason — the paper
+  disclaims that machinery; and the per-pass aggregation is pairwise-net, not the paper's Borda. See §8.5.)*
 - **Grafted from AlphaEvolve — *two specific, narrow lessons*, not the population machinery.** (The
   Elo/Bradley-Terry/PUCT population above is AlphaProof_Nexus-style; do **not** attribute it to
   AlphaEvolve.) From AlphaEvolve we take: (1) the **cheap-first evaluation cascade** (run cheap
@@ -259,14 +263,14 @@ stub are interchangeable; the whole harness is deterministically testable with s
 | **Layer-4 audit** | `gates/lean_audit.py`, `lean_bridge.py`, `lean_server.py`, `lean/Audit.lean` | `audit_report(DependencyReport)→LeanAuditResult` | Nexus SafeVerify, AXLE |
 | **Codex roles** | `tools/codex_prover.py` | Prover / Decomposer / Reviewer / Comparator + tournament Critic / Author / Synthesizer / Judge | AlphaProof tool; LEAP; Autoreason |
 | **Numeric grounding** | `tools/numeric.py` | exact-integer witness / residue-cover / descent checks | Axplorer, MathCode |
-| **Retrieval** | `tools/retrieval.py` (Loogle), `semantic_retrieval.py` (BM25), `neural_retrieval.py` (bge-small) → `HybridRetriever` | `retrieve(claim,error)→[lemma]` | LeanSearch/Loogle, LeanExplore |
+| **Retrieval** | `tools/retrieval.py` (Loogle), `semantic_retrieval.py` (BM25), `neural_retrieval.py` (bge-small, *inert by default*) → `HybridRetriever` | `retrieve(claim,error)→[lemma]`. **Default path is lexical: Loogle + BM25.** The neural bi-encoder/reranker need the `mathagent[neural]` extra (not installed/shipped); without it the pipeline silently uses a non-semantic `HashingEmbedder` and the real engine never runs. | LeanSearch/Loogle, LeanExplore |
 | **Formalizer** | `tools/formalizer.py` | `formalize(prior,errors,lemmas)→Lean` | LEAP/Aristotle informal→formal |
 | **Drivers** | `orchestrator/driver.py` (flat), `dag_driver.py` (AND-OR) | plan→prove→gate→repair; direct→decompose→review→recurse | LEAP |
 | **Proof DAG** | `orchestrator/dag.py` | AND-OR DAG, **semantic** deep-hash memo, acyclicity | LEAP, Nexus deep-hash |
 | **Ralph loop** | `orchestrator/ralph.py` | per-goal episodes + lessons-learned | AlphaProof_Nexus |
 | **Population** | `orchestrator/population.py` | Elo tournament, `fit_bradley_terry`, `select_puct` | AlphaProof_Nexus |
 | **Evolutionary backend** *(optional)* | `tools/openevolve_bridge.py` | evolve proof-sketch **ledgers** (MAP-Elites), gate-scored fitness, no-exec; `Decomposer` for `DagDriver` | OpenEvolve (AlphaEvolve OSS) |
-| **Revision tournament** | `orchestrator/tournament.py` | Autoreason incumbent tournament (do-nothing wins ties, PUCT+BT, admissibility guard) | Autoreason |
+| **Revision tournament** | `orchestrator/tournament.py` | Autoreason incumbent tournament (do-nothing wins ties; margin-gated displacement + a *structural* admissibility gate). **BT/PUCT are grafted from `population.py`, not AutoReason** (the paper disclaims them) and are near-decorative to displacement; aggregation is **pairwise-net, not Borda**. | Autoreason (Critic/do-nothing/margin); BT/PUCT from `population.py` |
 | **Faithfulness** | `orchestrator/faithfulness.py` | adversarial multi-lens, default-unfaithful | AXLE / Goedel |
 | **Terminal gate** | `orchestrator/formalize_bridge.py` | formalize→compile→audit→faithfulness → `authoritative` | PLAN §5 Layer 4 |
 | **Liveness** | `orchestrator/state.py` | NodeState + Budget (calls / repairs / replans) | PLAN §4.3 |
@@ -381,17 +385,33 @@ candidates alive, rate them from *cheap* comparisons, and spend *expensive* atte
 **search-efficiency only** — none of it changes whether a proof is accepted; that is the gate's job.
 (`DagDriver._prove_via_population`.)
 
+> **Not "evolutionary," to be precise.** This is a **one-shot rank-K-then-pick** ranker *within a single
+> `decompose` call*: there is **no mutation, no crossover, and no persisted cross-episode population
+> database**. The K-candidate pool is ranked and one is expanded, then discarded when the call returns —
+> nothing carries across episodes. Calling it "evolutionary population search" overstates it; the only
+> path in the project that genuinely *mutates* a population is the optional OpenEvolve backend (§8.6).
+
 ### 8.5 The Autoreason tournament reuses the same two estimators
 
 The revision controller (`tournament.py`) is a *different* mechanism — **revision control**, not
-decomposition ranking — but it reuses the same two estimators. Given a *working* proof, each pass runs a
-Codex Critic (failure analysis only) → Author (revise) → Synthesizer (blind merge) → a Codex judge panel;
-**Bradley-Terry** turns the panel's pairwise votes into strengths and **PUCT** picks which surviving
-candidate seeds the next pass. A challenger displaces the incumbent only if it beats it head-to-head by a
-`margin` **and** passes the elementary admissibility gate; "do nothing" wins ties; stop after **k=2**
-consecutive incumbent wins. Its job is the **synthesis-drift / elementary-incumbent guard** — a
-"better-sounding but non-elementary" revision can never displace a correct elementary proof — so refinement
-is **monotone** (never regresses).
+decomposition ranking. Given a *working* proof, each pass runs a Codex Critic (failure analysis only) →
+Author (revise) → Synthesizer (blind merge) → a Codex judge panel; a challenger displaces the incumbent
+only if it beats it head-to-head by a `margin` **and** passes the (structural) admissibility gate;
+"do nothing" wins ties; stop after **k=2** consecutive incumbent wins.
+
+> **Honest attribution & scope.** Two corrections to earlier framing:
+> - **Bradley-Terry and PUCT are *not* from AutoReason.** The AutoReason paper explicitly *disclaims*
+>   voting/game-theoretic machinery; BT/PUCT are grafted here from `population.py`. They are largely
+>   **non-load-bearing** to the displacement decision — that is decided solely by `net >= margin`; BT
+>   only breaks ties among qualifiers and PUCT only picks the next seed.
+> - **The aggregator is pairwise-net, not Borda.** The paper specifies Borda over {A, AB, B}; this
+>   implementation tallies **net head-to-head votes vs the incumbent** plus a margin. Morally similar,
+>   genuinely different aggregator (the margin rule is itself paper-sanctioned).
+> - **Do *not* claim "monotone / never regresses" unconditionally.** The guard holds only with respect
+>   to a (possibly single, default `n_judges=1`) LLM judge panel + the *soft* admissibility gate — which
+>   by its own docstring does not certify elementarity. The AutoReason paper is candid that its filter is
+>   "bounded by the judges' biases" and shows quality-degrading displacement; the right claim here is
+>   "displacement is *resisted* by a margin + judge panel," not an unconditional no-regression guarantee.
 
 Both mechanisms are Codex-wired (`CodexComparator`, `make_codex_refiner`); neither is what blocks a first
 result. They pay off once there is a search worth prioritizing and an incumbent worth defending.
@@ -554,16 +574,22 @@ Retrieval is a **hybrid of three legs**, each strong where the others are weak:
   terms up-weighted by inverse document frequency, repeats saturating; `k1=1.5, b=0.75`) over an inverted
   index of declaration names + signatures (name tokens boosted ×3), restricted to a curated elementary
   slice of Mathlib (`Data/Nat`, `Data/Int`, `Data/ZMod`).
-- **Neural bi-encoder** (`neural_retrieval.py`) — *meaning, not words.* `bge-small-en-v1.5` embeds
-  `name+signature+doc` and the query *independently* and ranks by cosine similarity (the LeanExplore
-  recipe), closing the abbreviation gap (`gcd` ↔ "greatest common divisor"). An optional **cross-encoder**
-  (`ms-marco-MiniLM`) can re-score the top-N pool by feeding each (query, lemma) pair *jointly* through a
-  transformer — slower, but sharper than the bi-encoder because the two texts can attend to each other.
+- **Neural bi-encoder** (`neural_retrieval.py`) — *meaning, not words — but INERT by default.*
+  When the optional `mathagent[neural]` extra is installed, `bge-small-en-v1.5` embeds each
+  declaration's `name+signature` (only those two fields are extracted — there is **no `doc` field**;
+  an earlier "name+signature+doc" claim was an over-statement) and the query *independently* and ranks
+  by cosine similarity (the LeanExplore recipe), closing the abbreviation gap (`gcd` ↔ "greatest common
+  divisor"). An optional **cross-encoder** (`ms-marco-MiniLM`) can re-score the top-N pool by feeding
+  each (query, lemma) pair *jointly* through a transformer. **However:** the repo does **not** install
+  or ship `mathagent[neural]`, so in practice neither the bi-encoder nor the reranker runs — the code
+  falls back to a `HashingEmbedder` (md5 token-hashing, which the module itself labels "Not a real
+  semantic model"), and every test exercises that lexical/hashing path, never a real neural model.
 
 The three are fused by **interleave-and-dedupe** (`HybridRetriever`): round-robin each source's best hits,
-drop duplicate declaration names, and **degrade gracefully** — if the neural dependencies are absent the
-pipeline silently falls back to Loogle + BM25. (Interleaving sidesteps having to calibrate three
-incomparable score scales.)
+drop duplicate declaration names, and **degrade gracefully**. Because the neural dependencies are absent
+by default, the **shipped/default retrieval path is lexical: Loogle + BM25** (the neural leg degrades to
+the non-semantic hashing fallback). (Interleaving sidesteps having to calibrate three incomparable score
+scales.)
 
 ### 10.1 The faithfulness wall — proving the *right* theorem
 

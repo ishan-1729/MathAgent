@@ -5,6 +5,22 @@ A *faithful, dependency-free stdlib port* of Forge's `scripts/orchestrator/sched
 `compute_upward_ranks` (`scripts/tv-feature-graph.py`). It exists to give the AND-node fan-out a
 *principled* parallel width instead of a guessed cap.
 
+.. note::
+
+    **ASPIRATIONAL / NOT A LOAD-BEARING THROUGHPUT WIN (be honest).** The width this module
+    computes caps a *safe-parallel fan-out that does not exist yet*: there is **no concurrent
+    executor** in the harness — `dag_driver._prove_and_children` proves an AND-node's children
+    **serially** (no asyncio / threads / processes anywhere). So the cap never speeds anything up
+    today; it only bounds an as-yet-unbuilt parallel scheduler. Worse, for the common case of a
+    *flat* AND-decomposition the committed children are precedence-independent, so **width ==
+    child_count** and the Dilworth cap is the trivial answer — it rarely binds against the
+    `min(width, budget, fanout_cap)` it feeds. `upward_rank` is computed but **decorative**: it is
+    used only as a *third* tie-break sort key (behind `_critical_path_depths` + leverage), and for a
+    flat plan every rank is 0, so it does not change ordering — which is in any case
+    outcome-irrelevant (results are order-independent by the DAG's commit invariant). Treat both as
+    *correct theorems doing no real work yet*, kept for when a concurrent executor lands, not as a
+    realized parallel-throughput mechanism.
+
 The two order-theory facts this module computes:
 
   * **Dilworth's theorem** — the largest *antichain* (the most nodes that are mutually

@@ -13,6 +13,19 @@ cheap pairwise LLM-judge comparisons, then resamples promising ones. This module
 
 All deterministic given the comparator and pairing order (default: round-robin), so it is fully
 testable offline with a scripted/keyed comparator; the live `Comparator` is Codex-backed.
+
+.. note::
+
+    **NOT evolutionary search — it is a one-shot ranker (be honest about the label).** Despite the
+    "population" name and the AlphaEvolve attribution above, this module does **not** evolve a
+    population: there is **no mutation, no crossover, and no persisted cross-episode population DB**.
+    Within a *single* `decompose` call it ranks a fixed pool of K candidate sketches via cheap
+    pairwise comparisons (Elo / Bradley-Terry) and picks one to expand (PUCT). That is **rank-K-then-
+    pick**, not generational evolution — the pool is never mutated and is discarded when the call
+    returns; nothing carries across episodes. (The one path in the project that genuinely *mutates*
+    a population is the optional OpenEvolve backend in `tools/openevolve_bridge.py`, which is a
+    separate component.) BT/PUCT here only reorder candidates the deterministic gate already
+    admitted; they never change *whether* a proof is accepted (that is Layer 4's job).
 """
 from __future__ import annotations
 

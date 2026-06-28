@@ -68,7 +68,68 @@ def report_status(*, proven: bool, has_candidate: bool = False,
     return ReportStatus.REJECTED
 
 
-def main() -> int:
+def build_lean_node_gates(args, toolkit, cfg, server, retriever=None):
+    """Build the PER-NODE Lean verifiers for the DAG driver from the parsed CLI args.
+
+    Returns ``(node_verifier, sketch_verifier)``:
+      * ``(None, None)`` when ``--lean-per-node`` is NOT set — the BYTE-IDENTICAL default: the DAG
+        driver gets no per-node Lean authority and runs the offline path it ran before this feature.
+      * ``(make_node_gate(...), make_sketch_gate(...))`` when ``--lean-per-node`` IS set — a per-LEAF
+        gate (every directly-proven leaf is Lean-verified) AND a per-AND-node composition gate (every
+        decomposition sketch is Lean-checked), so a leaf reaching ``elementary_verified`` is promoted to
+        the first-class LEAN_VERIFIED state. The same warm ``server`` is threaded into BOTH gates so
+        every per-node compile reuses one Mathlib environment instead of reloading it per node.
+
+    The formalizer is CodexFormalizer by default, or ClaudeFormalizer when ``--formalizer-model=claude``.
+    Both gates defer per-leaf/composition faithfulness to the root terminal gate (see make_node_gate /
+    make_sketch_gate), so this only wires the elementary-audit authority per node."""
+    if not getattr(args, "lean_per_node", False):
+        return None, None
+    from agent.tools.formalizer import CodexFormalizer, ClaudeFormalizer
+    from agent.orchestrator.formalize_bridge import make_node_gate, make_sketch_gate
+    if args.formalizer_model == "claude":
+        from agent.tools.claude_cli import ClaudeConfig
+        formalizer = ClaudeFormalizer(toolkit, ClaudeConfig(model="opus", timeout_s=args.timeout))
+    else:
+        formalizer = CodexFormalizer(toolkit, cfg)
+    node_verifier = make_node_gate(formalizer, toolkit, server=server, retriever=retriever,
+                                   repair_iters=args.repair, timeout_s=args.timeout)
+    sketch_verifier = make_sketch_gate(formalizer, toolkit, server=server, retriever=retriever,
+                                       repair_iters=args.repair, timeout_s=args.timeout)
+    return node_verifier, sketch_verifier
+
+
+def build_dag_driver(args, *, prover, toolkit, cfg, budget, trace, server,
+                     terminal_gate, comparator, refiner, evolve_fallback):
+    """Construct the DAG-mode :class:`DagDriver` from the parsed CLI args + already-built dependencies.
+
+    This is the SINGLE argparse->DagDriver construction site, factored out so the wiring is testable end
+    to end. It builds the per-node Lean verifiers from ``--lean-per-node`` (via ``build_lean_node_gates``)
+    and threads them — together with ``lean_strict`` (``--lean-strict``) and the warm ``lean_server`` —
+    into the driver. WITHOUT ``--lean-per-node`` the driver is constructed with
+    ``node_verifier=None``/``sketch_verifier=None``/``lean_strict=False``/``lean_server=None`` exactly as
+    before (byte-identical)."""
+    node_verifier, sketch_verifier = build_lean_node_gates(
+        args, toolkit, cfg, server, retriever=getattr(args, "_retriever", None))
+    return DagDriver(
+        prover,
+        decomposer=CodexDecomposer(toolkit, cfg),
+        reviewer=CodexReviewer(toolkit, cfg),
+        toolkit=toolkit, budget=budget, trace=trace,
+        max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
+        ralph_episodes=args.episodes, terminal_gate=terminal_gate,
+        comparator=comparator, population_k=args.population, refiner=refiner,
+        evolve_fallback=evolve_fallback,
+        node_verifier=node_verifier, sketch_verifier=sketch_verifier,
+        lean_strict=bool(args.lean_strict),
+        lean_server=(server if getattr(args, "lean_per_node", False) else None),
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The REAL CLI parser (the single source of the flag definitions). Factored out of ``main`` so the
+    flag wiring (e.g. ``--lean-per-node`` -> DagDriver) can be driven through the ACTUAL argparse path in
+    tests, not a hand-rolled stub."""
     ap = argparse.ArgumentParser(description="Prove a number-theory goal with the Codex-backed harness.")
     ap.add_argument("goal", help="the goal/theorem statement to prove")
     ap.add_argument("--model", default="gpt-5.5")
@@ -92,6 +153,17 @@ def main() -> int:
                          "then NOT be authoritative — audited only)")
     ap.add_argument("--server", action="store_true",
                     help="use the persistent Lean server (loads Mathlib once) for audits")
+    ap.add_argument("--lean-per-node", action="store_true",
+                    help="(dag) Lean-verify EVERY leaf and AND-composition per node (formalize -> "
+                         "compile -> Layer-4 audit on a warm Lean server) so LEAN_VERIFIED becomes "
+                         "reachable; implies --server. Errors out if Lean is unavailable.")
+    ap.add_argument("--lean-strict", action="store_true",
+                    help="(dag) implies --lean-per-node and fails CLOSED on inability to formalize: a "
+                         "leaf/sketch that cannot be compiled is NOT accepted as proven (no unverified "
+                         "PROVEN is ever minted)")
+    ap.add_argument("--formalizer-model", default="codex", choices=["codex", "claude"],
+                    help="which model formalizes per-node proofs to Lean under --lean-per-node "
+                         "(codex=CodexFormalizer default; claude=ClaudeFormalizer/Opus)")
     ap.add_argument("--repair", type=int, default=0, metavar="N",
                     help="autoformalization Lean-error repair iterations (feed compile errors back)")
     ap.add_argument("--retrieval", action="store_true",
@@ -125,7 +197,22 @@ def main() -> int:
                          "on stuck nodes (K evolve iterations per fire); commits an evolved blueprint "
                          "only if it is goal-bound + obligation-discharged (needs mathagent[evolve]); "
                          "graceful no-op if openevolve is not installed")
-    args = ap.parse_args()
+    return ap
+
+
+def normalize_lean_flags(args) -> None:
+    """In-place flag normalization (shared by main + tests): ``--lean-strict`` implies
+    ``--lean-per-node`` which implies ``--server`` (one warm Lean env reused by every per-node compile),
+    so the rest of the pipeline reads a single source of truth."""
+    if args.lean_strict:
+        args.lean_per_node = True
+    if args.lean_per_node:
+        args.server = True
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+    normalize_lean_flags(args)
 
     if not CodexProver.available():
         print("ERROR: codex CLI not found on PATH.", file=sys.stderr)
@@ -232,6 +319,13 @@ def main() -> int:
         if LeanServer.available():
             print("# starting persistent Lean server (loads Mathlib once)...")
             server = LeanServer().start()
+        elif args.lean_per_node:
+            # --lean-per-node REQUIRES a Lean toolchain: every leaf/AND-composition is Lean-verified,
+            # so a missing REPL is a hard error (not a graceful fall-back to per-call lean). Print a
+            # clear message and exit cleanly — never crash.
+            print("ERROR: --lean-per-node requires the Lean server (Mathlib REPL), but it is not "
+                  "built. Run `lake build repl` in the Mathlib project, then retry.", file=sys.stderr)
+            return 2
         else:
             print("# (--server requested but Lean REPL not built; using per-call lean)")
     # Faithfulness FAILS CLOSED: a Layer-4 result can only be "authoritative" if a faithfulness panel
@@ -299,15 +393,17 @@ def main() -> int:
             else:
                 print("# (--evolve-fallback requested but openevolve not installed; "
                       "pip install mathagent[evolve] — fallback disabled)")
-        driver = DagDriver(
-            prover,
-            decomposer=CodexDecomposer(toolkit, cfg),
-            reviewer=CodexReviewer(toolkit, cfg),
-            toolkit=toolkit, budget=budget, trace=trace,
-            max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
-            ralph_episodes=args.episodes, terminal_gate=terminal_gate,
-            comparator=comparator, population_k=args.population, refiner=refiner,
-            evolve_fallback=evolve_fallback,
+        # Single argparse->DagDriver construction site (factored into build_dag_driver so the wiring is
+        # testable). It builds the per-node Lean verifiers from --lean-per-node and threads lean_strict +
+        # the warm Lean server in; without --lean-per-node the driver is byte-identical to before.
+        args._retriever = retriever
+        if args.lean_per_node:
+            print(f"# --lean-per-node: Lean-verifying every leaf + AND-composition "
+                  f"(formalizer={args.formalizer_model}, strict={bool(args.lean_strict)})")
+        driver = build_dag_driver(
+            args, prover=prover, toolkit=toolkit, cfg=cfg, budget=budget, trace=trace,
+            server=server, terminal_gate=terminal_gate, comparator=comparator,
+            refiner=refiner, evolve_fallback=evolve_fallback,
         )
         res = driver.run(args.goal)
         ok = res.proven
@@ -315,6 +411,14 @@ def main() -> int:
         print(f"dag: {res.dag.stats()}")
         import json as _json
         print("\n--- proof tree ---\n" + _json.dumps(res.proof_tree(), indent=2))
+        # Report per-node Lean states: PROVEN (soft) vs the first-class LEAN_VERIFIED hard-success state.
+        if args.lean_per_node:
+            from agent.orchestrator.state import NodeState as _NodeState
+            lean_nodes = sum(1 for n in res.dag.nodes.values()
+                             if n.state is _NodeState.LEAN_VERIFIED)
+            soft_nodes = sum(1 for n in res.dag.nodes.values()
+                             if n.state is _NodeState.PROVEN)
+            print(f"node states: proven={soft_nodes} lean_verified={lean_nodes}")
         if res.terminal is not None:
             print("\nterminal Layer-4 gate:", res.terminal.summary())
             print("authoritative_elementary:", res.authoritative_elementary)

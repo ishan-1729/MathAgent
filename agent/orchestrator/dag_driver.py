@@ -146,6 +146,7 @@ class DagDriver:
         evolve_fallback: Optional[Decomposer] = None,
         node_verifier: Optional[Callable[[str, str], object]] = None,
         sketch_verifier: Optional[Callable[[str, str, list[str]], object]] = None,
+        lean_strict: bool = False,
         lean_server: Optional[object] = None,
     ):
         self.prover = prover
@@ -164,9 +165,12 @@ class DagDriver:
         self.comparator = comparator
         self.population_k = population_k
         self.population_rounds = population_rounds
-        # Autoreason incumbent-tournament revision controller (agent/orchestrator/tournament.py).
-        # When set, a directly-proven node's ledger is refined without ever regressing it: a challenger
-        # must beat the incumbent on a blind judge panel AND stay elementary to displace it.
+        # Autoreason incumbent-tournament revision controller (agent/orchestrator/tournament.py). When
+        # set, a directly-proven node's ledger is refined: a challenger must beat the incumbent on the
+        # blind judge panel AND clear the AUTHORITATIVE elementary admissibility gate (deterministic
+        # refutation + the Lean audit when a node_verifier is configured) to displace it. No-regression
+        # is RELATIVE to that panel + gate, not absolute — a single soft judge could still prefer a
+        # worse-but-admissible rewrite; see tournament.RevisionController and self._admissibility_gate.
         self.refiner = refiner
         # Terminal authoritative gate (PLAN.md §5 Layer 4): (root_goal, proof_text) -> result with an
         # `.authoritative` attribute. Runs once after the root is proven (formalize -> Lean audit ->
@@ -217,6 +221,16 @@ class DagDriver:
         # parent-composition rule. When None (the default) _try_decomposition runs the BYTE-IDENTICAL
         # pre-P4 path — nothing calls the verifier or touches sketch_lean_verified.
         self.sketch_verifier = sketch_verifier
+        # OPT-IN LEAN-STRICT mode (closes the gap-#1 fail-OPEN on inability to formalize). When False
+        # (the DEFAULT) a per-node leaf/sketch whose formalization could-not-COMPILE is accepted as soft
+        # PROVEN (the informal gate already passed it) — the BYTE-IDENTICAL fail-OPEN behavior of the
+        # pre-flag code. When True, that same non-compiling formalization is NOT accepted as proven: it
+        # fails CLOSED, routing the leaf to a non-proven outcome (FAILED_GAP, reason formalization_failed)
+        # and the AND-node sketch to a REJECT of the candidate, exactly like a compiled-but-rejected
+        # outcome — EXCEPT it is a "could not formalize" gap, not an elementarity refutation. lean_strict
+        # ONLY ever changes the (iii) could-not-compile arm; it leaves PASS / REJECT / UNAVAILABLE and the
+        # whole verifier-None default path untouched. prove.py passes lean_strict=True under --lean-strict.
+        self.lean_strict = bool(lean_strict)
         # SHARED WARM Lean server (P3): ONE persistent LeanServer (Mathlib + #audit loaded once) held by
         # the driver so EVERY per-node compile (the leaf node_verifier AND the AND-node sketch_verifier)
         # reuses the SAME warm base environment instead of reloading Mathlib (~40-60s) per node. The gates
@@ -536,9 +550,11 @@ class DagDriver:
         return ok
 
     def _refine(self, goal: str, ledger: str) -> str:
-        """Optionally refine a proven champion via the AutoReason incumbent tournament. Monotone: the
-        returned ledger is never worse than the input (a challenger must beat it on a blind panel AND
-        stay elementary to displace it).
+        """Optionally refine a proven champion via the AutoReason incumbent tournament. No-regression
+        RELATIVE TO THE ADMISSIBILITY GATE: a challenger must beat the incumbent on the blind judge
+        panel AND clear the AUTHORITATIVE elementary admissibility gate to displace it (see
+        `_admissibility_gate`). It is monotone only relative to that panel + gate, not in any absolute
+        sense — a possibly-single soft judge could still prefer a worse-but-elementary rewrite.
 
         EXPLORE/EXPLOIT separation (P3 / brief §9 #6): this is the *exploit* stage that runs AFTER the
         *explore* stage (OpenEvolve/search produced the champion). The refined output is registered with
@@ -547,7 +563,12 @@ class DagDriver:
         if self.refiner is None or not self.budget.can_call():
             return ledger
         try:
-            result = self.refiner.refine(goal, ledger, is_admissible=self._is_admissible)
+            # GOAL-BOUND AUTHORITATIVE admissibility: a challenger must clear the authoritative
+            # elementary check (deterministic refutation + the Lean audit when configured) for THIS
+            # goal, not merely the soft gate. Bind the goal into the gate closure here so the refiner
+            # (which calls is_admissible(ledger) with only the ledger) routes every challenger through it.
+            result = self.refiner.refine(goal, ledger,
+                                         is_admissible=self._admissibility_gate(goal))
         except Exception:
             return ledger
         if result.changed:
@@ -568,13 +589,63 @@ class DagDriver:
             return
         explore_exploit_barrier().mark_refined(refined)
 
-    def _is_admissible(self, ledger: str) -> bool:
-        """A candidate proof is admissible iff it passes the deterministic + soft gate (not rejected).
-        Used by the refiner so a non-elementary 'improvement' can never displace an elementary proof."""
+    def _soft_gate_admits(self, ledger: str) -> bool:
+        """Necessary (NOT sufficient) admissibility: the deterministic + soft gate does not REJECT.
+
+        By its own docstring (`agent/gates/gate.py`) passing this gate does NOT certify "elementary" —
+        it only rules out structural / obligation / denylist-prose REJECTs. It is a necessary first
+        filter; the authoritative elementarity decision is made by `_authoritative_elementary` below."""
         try:
             return not evaluate(ledger, self.toolkit).rejected
         except Exception:
             return False
+
+    def _authoritative_elementary(self, goal: str, ledger: str) -> bool:
+        """The AUTHORITATIVE elementarity decision for an AutoReason challenger (not the soft gate).
+
+        Routes the challenger through the same authoritative checks the prover/decomposer paths use:
+
+          1. The DETERMINISTIC adversarial verifier `elementary_verifier.refute_elementary` (goal-bound):
+             a challenger it REFUTES (denylist-prose, undischarged elastic, goal-binding violation) is
+             NOT elementary and is rejected. A vacuous inspection (empty/unparseable) FAILS LOUD -> not
+             admissible (never a silent pass).
+          2. When a per-node Lean verifier is configured (`self.node_verifier is not None`), the Lean
+             audit: a challenger that COMPILES but the Lean audit REJECTS (`lean_compiled_but_rejected`:
+             sorry / denylist / non-whitelist axiom) REFUTES elementarity -> rejected. A non-compiling
+             or UNAVAILABLE Lean result does NOT block admission (Lean is used only to REFUTE here, never
+             to REQUIRE — mirroring the leaf path's fail-OPEN-on-inability-to-formalize), and a crashing
+             verifier never refutes (fail open). The Lean audit is only consulted at all when a verifier
+             is wired in; with no verifier this clause is inert (deterministic refutation only).
+
+        Returns True iff NOTHING authoritatively refuted the challenger's elementarity."""
+        try:
+            verdict = refute_elementary(ledger, self.toolkit, goal=goal)
+        except VacuousVerificationError:
+            return False
+        except Exception:
+            return False
+        if verdict.refuted:
+            return False
+        # Optional Lean authority: only REFUTE (a compiled-but-rejected challenger), never REQUIRE.
+        if self.node_verifier is not None:
+            try:
+                lv = self.node_verifier(goal, ledger)
+            except Exception:
+                return True   # a crashing verifier never refutes a deterministically-clean challenger
+            if bool(getattr(lv, "lean_compiled_but_rejected", False)):
+                return False
+        return True
+
+    def _admissibility_gate(self, goal: str) -> Callable[[str], bool]:
+        """Build the goal-bound admissibility predicate the AutoReason refiner uses to ADMIT challengers.
+
+        A challenger is admissible iff it passes the soft gate (necessary first filter) AND clears the
+        AUTHORITATIVE elementary check (`_authoritative_elementary`). So a non-elementary challenger that
+        the SOFT GATE ALONE would have admitted is REJECTED here and can never displace the incumbent —
+        'stay elementary to displace' becomes ENFORCED, not asserted."""
+        def _ok(ledger: str) -> bool:
+            return self._soft_gate_admits(ledger) and self._authoritative_elementary(goal, ledger)
+        return _ok
 
     def _verify_or_downgrade(self, goal: str, res: RalphResult) -> bool:
         """Route a NEEDS_REVIEW direct proof through the INDEPENDENT adversarial verifier
@@ -692,7 +763,17 @@ class DagDriver:
                             reason=ReasonCode.elementary_violation.value)
             return False
 
-        # (iii) COULD-NOT-COMPILE (no Lean / compile error) -> FAIL OPEN: soft PROVEN, re-attemptable.
+        # (iii) COULD-NOT-COMPILE (no Lean / compile error). DEFAULT: FAIL OPEN -> soft PROVEN,
+        # re-attemptable (the informal gate already passed it). This is the gap-#1 fail-open the
+        # lean_strict flag closes.
+        if self.lean_strict:
+            # FAIL CLOSED: a leaf we could not Lean-check is NOT accepted as proven. Route it to a
+            # non-proven FAILED_GAP (reason formalization_failed) — distinct from an elementarity
+            # refutation (ii). Re-attemptable on a later run; never mints an unverified PROVEN.
+            self.dag.mark_failed(goal, reason=ReasonCode.formalization_failed.value)
+            self.trace.emit("node_lean", goal=goal[:80], outcome="lean_could_not_formalize_strict",
+                            lean_verified=False, reason=ReasonCode.formalization_failed.value)
+            return False
         self.dag.mark_proven_direct(goal, ledger)
         self.trace.emit("node_lean", goal=goal[:80], outcome="lean_could_not_formalize",
                         lean_verified=False)

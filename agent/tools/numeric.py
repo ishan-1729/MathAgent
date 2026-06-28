@@ -22,7 +22,7 @@ from __future__ import annotations
 import ast
 import itertools
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Optional
 
 import sympy
 
@@ -117,6 +117,18 @@ def _build_from_ast(node: ast.AST, syms: dict[str, sympy.Symbol]) -> sympy.Expr:
     raise NumericError(f"disallowed syntax in expression: {type(node).__name__}")
 
 
+def _to_pow(text: str) -> str:
+    """Normalize caret exponentiation ('2^n') to Python power ('2**n') before the no-eval parse.
+
+    In elementary number-theory obligation expressions (bounding inequalities, descent measures) '^'
+    ALWAYS means exponentiation, never bitwise XOR. Without this, ``ast.parse`` reads '^' as
+    ``ast.BitXor`` -> a disallowed node -> a spurious 'malformed' REJECT of a perfectly valid bound
+    like '2^n < 3^n'. Mirrors the caret handling in agent/tools/answer_check.py. Purely textual; it
+    does not make anything executable (the restricted AST still rejects calls/attributes/subscripts).
+    """
+    return text.replace("^", "**")
+
+
 def _safe_parse(text: str, syms: dict[str, sympy.Symbol]) -> sympy.Expr:
     """Parse a single sub-expression with NO eval/__builtins__/sympify reachable.
 
@@ -128,7 +140,8 @@ def _safe_parse(text: str, syms: dict[str, sympy.Symbol]) -> sympy.Expr:
     """
     # ast.parse('eval') rejects leading/trailing whitespace (and the '=' split path hands us sides
     # like ' y**3'); strip it so well-formed expressions with surrounding spaces still parse.
-    stripped = text.strip()
+    # Caret-as-exponent ('2^n' -> '2**n') so a valid bound is not mis-parsed as BitXor (see _to_pow).
+    stripped = _to_pow(text.strip())
     if not stripped:
         raise NumericError("could not parse expression: empty sub-expression")
     try:
@@ -329,6 +342,139 @@ def verify_descent_decreases(
         counterexamples=bad,
         box={v: tuple(bounds[v]) for v in variables},
     )
+
+
+# Comparison operators a concrete-integer bound may use, longest-token-first so '<=' is matched
+# before '<'. '==' / '!=' are deliberately excluded: a "bound" is an order relation, and an equality
+# is not a bounding obligation. The boolean it evaluates to is the STRICT vs non-strict relation.
+_CONCRETE_OPS: tuple[tuple[str, bool], ...] = (
+    ("<=", False),
+    (">=", False),
+    ("<", True),
+    (">", True),
+)
+
+
+class SymbolicExpression(NumericError):
+    """Raised when an expression is well-formed but NOT a closed integer constant (it has a free
+    variable). It is a NumericError subclass so existing ``except NumericError`` paths still catch it,
+    but lets a caller distinguish "symbolic, can't decide numerically" from "malformed"."""
+
+
+def _name_ids(node: ast.AST) -> set[str]:
+    """Collect every ``ast.Name`` id in a parsed expression WITHOUT building or executing any value.
+
+    Only ``node.id`` strings are read off the structural tree (no eval/exec), so this is safe to run
+    on untrusted input purely to learn which identifiers appear before deciding concrete vs symbolic.
+    """
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def evaluate_integer_constant(expression: str) -> int:
+    """Evaluate a CLOSED integer expression (no free symbols) to its exact int via the no-eval AST.
+
+    The expression is parsed by the same restricted integer-polynomial grammar as everything else here
+    (``_safe_parse`` — never eval/exec/sympify), then required to be variable-free so it collapses to a
+    single integer. A symbolic expression (any free symbol) raises ``SymbolicExpression``; a non-integer
+    leaf or any disallowed construct raises ``NumericError``. Nothing in the string is ever executed.
+    Used to numerically confirm a *concrete* bounding inequality without trusting prose.
+    """
+    stripped = _to_pow((expression or "").strip())   # caret-as-exponent: '2^n' -> '2**n' (see _to_pow)
+    if not stripped:
+        raise NumericError("could not parse expression: empty sub-expression")
+    try:
+        tree = ast.parse(stripped, mode="eval")
+    except SyntaxError as e:
+        raise NumericError(f"could not parse expression {expression!r}: {e}") from e
+    # Declare exactly the bare names that appear, so each is treated as a (free) symbol rather than an
+    # "undeclared symbol" hard error. We build the expression FIRST (so the restricted AST walker still
+    # rejects calls / attributes / subscripts / division as malformed BEFORE we ever decide "symbolic"),
+    # and only a structurally-valid expression with a REMAINING free symbol is "symbolic, not concrete".
+    syms = {name: sympy.Symbol(name, integer=True) for name in _name_ids(tree)}
+    expr = _build_from_ast(tree, syms)
+    if expr.free_symbols:
+        raise SymbolicExpression(
+            f"expression is not a closed integer constant (free symbols "
+            f"{sorted(map(str, expr.free_symbols))})"
+        )
+    for node in sympy.preorder_traversal(expr):
+        if node.is_number:
+            if not node.is_Integer:
+                raise NumericError(f"non-integer numeric leaf not allowed: {node}")
+            continue
+        if isinstance(node, sympy.Pow):
+            _base, exp = node.as_base_exp()
+            if not (exp.is_Integer and 0 <= int(exp) <= MAX_POW_EXPONENT):
+                raise NumericError(
+                    f"only non-negative integer powers up to {MAX_POW_EXPONENT} are allowed; got {node}"
+                )
+            continue
+        if not isinstance(node, _ALLOWED_NODES):
+            raise NumericError(f"disallowed operation in expression: {type(node).__name__} ({node})")
+    value = sympy.Integer(expr)
+    if not value.is_Integer:
+        raise NumericError(f"expression did not evaluate to an integer: {expr}")
+    return int(value)
+
+
+def split_inequality(text: str) -> tuple[str, str, str, bool]:
+    """Split a single-relation inequality string into (lhs, rhs, op, strict).
+
+    Returns the left side, the right side, the comparison operator token ('<','>','<=','>='), and
+    whether the relation is STRICT ('<'/'>' -> True, '<='/'>=' -> False). Exactly one comparison
+    operator must be present (chained comparisons such as ``a < b < c`` and equalities are rejected).
+    Raises ``NumericError`` on a malformed relation; this only SPLITS the surface form (it does not
+    evaluate either side).
+    """
+    if not isinstance(text, str):
+        raise NumericError(f"inequality must be a string; got {type(text).__name__}")
+    matches = [op for op, _strict in _CONCRETE_OPS if op in text]
+    # '<' / '>' are substrings of '<=' / '>=', so collapse those before counting distinct relations.
+    distinct = set(matches)
+    if "<=" in distinct:
+        distinct.discard("<")
+    if ">=" in distinct:
+        distinct.discard(">")
+    if len(distinct) != 1:
+        raise NumericError(
+            f"inequality must contain exactly one comparison operator (<,>,<=,>=); got {text!r}"
+        )
+    op = next(iter(distinct))
+    strict = dict(_CONCRETE_OPS)[op]
+    parts = text.split(op)
+    if len(parts) != 2:
+        raise NumericError(f"chained/ambiguous comparison not allowed: {text!r}")
+    lhs, rhs = parts[0].strip(), parts[1].strip()
+    if not lhs or not rhs:
+        raise NumericError(f"inequality has an empty side: {text!r}")
+    return lhs, rhs, op, strict
+
+
+def concrete_inequality_holds(lhs: str, rhs: str, op: str) -> Optional[bool]:
+    """If both sides are CLOSED integer constants, return whether ``lhs op rhs`` holds; else None.
+
+    A return of ``None`` means the bound is symbolic (at least one side has a free variable) and so
+    cannot be numerically decided here — the caller must treat that as "shape-valid, not numerically
+    refutable", NOT as a pass of a concrete check. Any *malformed* side (unparseable / non-integer /
+    disallowed construct) propagates as a ``NumericError``. No eval, ever.
+    """
+    try:
+        lv = evaluate_integer_constant(lhs)
+        rv = evaluate_integer_constant(rhs)
+    except SymbolicExpression:
+        # At least one side is symbolic (has a free variable) -> not numerically decidable here.
+        return None
+    # Any OTHER NumericError (unparseable / non-integer leaf / disallowed construct) is a genuinely
+    # malformed side and propagates to the caller as a hard failure.
+    if op == "<":
+        return lv < rv
+    if op == ">":
+        return lv > rv
+    if op == "<=":
+        return lv <= rv
+    if op == ">=":
+        return lv >= rv
+    raise NumericError(f"unsupported comparison operator: {op!r}")
 
 
 # --------------------------------------------------------------------------------------------------

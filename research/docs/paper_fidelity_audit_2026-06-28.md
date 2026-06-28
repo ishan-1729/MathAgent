@@ -207,3 +207,58 @@ analog requested here — is built but wired by nothing. Closing that is the dif
 descent grounding, a `bounding` content check, routing the admissibility gate through Layer 4,
 making the real neural engine the default, and either implementing parallel child proving or
 demoting the Dilworth/Mirsky labels).
+
+---
+
+## Fixes applied 2026-06-28
+
+Tracking what has actually changed since this audit was written. Two kinds of work: a real engine
+fix (OpenEvolve, plus in-progress per-node-Lean wiring + obligation/AutoReason fixes), and a
+truth-in-labelling pass that corrects the over-claims this report flagged **without touching any
+engine behaviour** (docs + two code docstrings only).
+
+**Engine / behaviour changes (separate workstreams):**
+
+- **OpenEvolve is fixed and now first-class** (table #43, and the "OpenEvolve outcome" section above):
+  `--evolve` no longer degenerates to a `>= 1.0`-gated no-op fallback; `evolve_prove` accepts a
+  goal-bound PASSED champion (`>= PASSED_FLOOR`) and short-circuits the prover, the `config.language`
+  crash is pinned, and `evolve_witnesses` is wired as opt-in `--evolve-witness K` (exact-integer scored,
+  no exec/eval). Default path remains byte-identical (every branch gated on a default-false/zero flag);
+  an accepted champion still only reports `SOFT_PROVEN` and must pass Layer 4 for
+  `authoritative_elementary`.
+- **In progress (not yet closed):** per-node-Lean (`LEAN_VERIFIED`) production wiring + a CLI flag
+  (table #6 — still inert as of this note); the opt-in leaf-Lean *fail-open* hard-fail (#5); the
+  `bounding` content checker (#21) and mandatory/REVIEW-routed descent grounding (#22, #29); routing the
+  AutoReason admissibility gate through an elementary auditor (#15); the latent un-imported `Optional`
+  (#29).
+
+**Truth-in-labelling pass (docs + docstrings only — NO behaviour change):** the following over-claims
+flagged above were corrected honestly in `agent/PLAN.md`, `research/docs/system_design.md`,
+`research/docs/forge_relevance_study.md`, and the docstrings of `agent/orchestrator/dilworth.py` and
+`agent/orchestrator/population.py`:
+
+- **Dilworth width / Mirsky `upward_rank` (#32, #33)** — relabelled **aspirational / decorative**: they
+  cap a safe-parallel fan-out that *does not exist yet* (no concurrent executor; children proved
+  serially), for flat AND-decompositions width == child_count so the cap rarely binds, and `upward_rank`
+  is a decorative 3rd sort key (0 for flat plans).
+- **H⁰ child-consistency (#34)** — relabelled a **surface signature-compatibility gate** (a narrow
+  computable regex/family shadow of an H⁰ 0-cocycle check), explicitly **not** a full sheaf/global-section
+  computation.
+- **Population search (#3)** — corrected from "evolutionary population search" to a **one-shot
+  rank-K-then-pick** ranker within a single decompose call (no persisted cross-episode DB, no
+  mutation/crossover).
+- **AutoReason BT/PUCT + aggregation + "never regress" (#12, #14, #16)** — stated that BT/PUCT are **not**
+  from AutoReason (the paper disclaims that machinery) and are near-decorative; the aggregator is
+  **pairwise-net, not Borda**; and the unconditional **"monotone / never regresses"** claim is dropped in
+  favour of "displacement is *resisted* by a margin + judge panel" (the paper is candid the filter is
+  bounded by judge bias). *(The `tournament.py` docstrings themselves are corrected in a separate
+  workstream; this pass fixes the PLAN.md / system_design.md prose.)*
+- **Mathlib retrieval (#39, #40)** — corrected to state the neural bi-encoder + cross-encoder reranker are
+  **inert unless the `mathagent[neural]` extra is installed** (which the repo does not install), the
+  default path is **lexical (Loogle + BM25)** with a non-semantic `HashingEmbedder` fallback, and the
+  **`+doc`** embedding claim is dropped (only `name+signature` is extracted).
+- **Category theory (#35)** — stated plainly that **SMC / monoidal / Applicative / Monad / functor are
+  labels only** (no such code).
+
+The full offline suite stays green after the labelling pass (docstring/prose changes only): **887
+passed, 11 skipped**.

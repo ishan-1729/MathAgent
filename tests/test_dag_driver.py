@@ -258,6 +258,81 @@ def test_refiner_never_regresses_a_direct_proof():
     assert node.proof == a               # incumbent held (do-nothing wins)
 
 
+# ---- AutoReason admissibility ENFORCES elementarity via the AUTHORITATIVE gate (not the soft gate) ----
+
+def non_elementary_ledger(goal: str) -> str:
+    """A structurally-valid ledger that the SOFT gate ADMITS (verdict NEEDS_REVIEW, NOT rejected) but
+    the AUTHORITATIVE elementary verifier REFUTES: a step names the denylisted method 'class group'.
+    The soft gate alone (evaluate().rejected) would admit this as an AutoReason challenger."""
+    return json.dumps({"problem": "p", "claim": goal, "steps": [
+        {"id": "s1", "claim": "use the class group structure", "justification": "given",
+         "depends_on": []},
+        {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]}]})
+
+
+def _refiner_with(author_ledger, synth_ledger, score_map):
+    """A refiner whose author + synthesizer both emit `author_ledger`/`synth_ledger` and whose single
+    judge scores by `score_map` (so a non-elementary challenger can be made judge-preferred)."""
+    judge = KeyComparator(lambda c: score_map.get(c.content, 0.0))
+    return RevisionController(ScriptedCritic([["x"]]), ScriptedAuthor([author_ledger]),
+                             ScriptedSynthesizer([synth_ledger]), [judge], seed=0)
+
+
+def test_soft_gate_alone_would_admit_the_non_elementary_challenger():
+    """Pin the PREMISE of the enforcement test: the non-elementary challenger passes the SOFT gate
+    (the OLD _is_admissible). If this ever changes, the enforcement test below would pass vacuously."""
+    from agent.gates.gate import evaluate
+    chall = non_elementary_ledger("G")
+    rep = evaluate(chall, TOOLKIT)
+    assert not rep.rejected              # the soft gate ADMITS it (NEEDS_REVIEW, not REJECTED)
+
+
+def test_non_elementary_challenger_is_rejected_by_admissibility_gate():
+    """A non-elementary challenger the judges LOVE and the SOFT gate would ADMIT must NOT displace the
+    elementary incumbent: the AUTHORITATIVE admissibility gate (refute_elementary) refutes it first.
+
+    Against the pre-change code (admissibility == soft gate only) the challenger WOULD displace the
+    incumbent (soft gate admits it + the judge prefers it), so this assertion fails pre-change."""
+    incumbent = valid_ledger("G")
+    challenger = non_elementary_ledger("G")
+    # The judge ADORES the non-elementary challenger (score 100 vs 1) — only admissibility stops it.
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+    assert res.proven
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert node.proof == incumbent       # incumbent held: the non-elementary challenger was inadmissible
+    assert node.proof != challenger
+
+
+def test_elementary_challenger_still_displaces_via_authoritative_gate():
+    """Control: an ELEMENTARY judge-preferred challenger still displaces (the authoritative gate admits
+    it) — proving the new gate rejects only NON-elementary challengers, not every challenger."""
+    incumbent, challenger = valid_ledger("G"), valid_ledger2("G")
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 5.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert node.proof == challenger      # an admissible (elementary) challenger still wins
+
+
+def test_admissibility_gate_uses_lean_audit_to_refute_when_node_verifier_configured():
+    """When a per-node Lean verifier is configured, the admissibility gate also routes a challenger
+    through the Lean audit: a challenger that COMPILES but the audit REJECTS (lean_compiled_but_rejected)
+    is inadmissible and cannot displace the incumbent, even though it clears the deterministic checks.
+
+    Pre-change, admissibility never consulted the Lean audit, so the Lean-rejected challenger (soft-gate
+    clean) would displace the incumbent — this fails against pre-change code."""
+    incumbent, challenger = valid_ledger("G"), valid_ledger2("G")
+    # A node_verifier that Lean-REJECTS the challenger (compiled but audit rejected) and PASSES anything
+    # else. The challenger clears refute_elementary (it is deterministically clean) but Lean refutes it.
+    def lean_verifier(goal, ledger):
+        return _verdict_reject() if ledger == challenger else _verdict_pass()
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  node_verifier=lean_verifier).run("G")
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert node.proof == incumbent       # Lean-rejected challenger was inadmissible -> incumbent held
+
+
 # ---- max_replan_depth bounds re-decomposition globally ----
 
 def test_max_replan_depth_caps_replans():
@@ -1276,6 +1351,67 @@ def test_node_verifier_noncompile_fails_open_soft_proven():
     assert g.lean_verified is False                       # Lean did NOT confirm it -> re-attemptable
     ev = res.trace.by_kind("node_lean")
     assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
+
+
+# ---- lean_strict: a non-compiling leaf FAILS CLOSED (not-proven) instead of fail-OPEN soft PROVEN ----
+
+def test_lean_strict_default_false_is_fail_open_byte_identical():
+    """Pin the DEFAULT (lean_strict not passed): a could-not-compile leaf is still soft PROVEN with the
+    same 'lean_could_not_formalize' outcome — the byte-identical fail-OPEN behavior, unchanged."""
+    from agent.orchestrator.dag import goal_hash
+    driver = _driver(DictProver({"G": valid_ledger("G")}),
+                     node_verifier=ScriptedLeafVerifier(_verdict_noncompile()))
+    assert driver.lean_strict is False                    # default
+    res = driver.run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.lean_verified is False
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
+
+
+def test_lean_strict_true_non_compiling_leaf_is_not_proven():
+    """lean_strict=True: the SAME non-compiling leaf the default fail-OPENs to soft PROVEN is now NOT
+    proven — it fails CLOSED to FAILED_GAP (reason formalization_failed). Fails against pre-change code
+    (which had no lean_strict and always fail-OPENed a non-compiling leaf to PROVEN)."""
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_noncompile())
+    res = _driver(DictProver({"G": valid_ledger("G")}),
+                  node_verifier=v, lean_strict=True).run("G")
+    assert not res.proven                                 # FAIL CLOSED: never minted an unverified PROVEN
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.FAILED_GAP               # not-proven (distinct from FAILED_ELEMENTARY)
+    assert g.lean_verified is False
+    assert g.reason == ReasonCode.formalization_failed.value
+    ev = res.trace.by_kind("node_lean")
+    assert ev and ev[0].data["outcome"] == "lean_could_not_formalize_strict"
+    # No spurious soft prove_node(direct) was emitted for the strictly-rejected leaf.
+    assert res.trace.by_kind("prove_node") == []
+
+
+def test_lean_strict_true_still_proves_a_compiling_audited_leaf():
+    """lean_strict ONLY closes the could-not-compile arm: a leaf that COMPILES and audits elementary is
+    still LEAN_VERIFIED under lean_strict=True (PASS arm untouched)."""
+    from agent.orchestrator.dag import goal_hash
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _driver(DictProver({"G": valid_ledger("G")}),
+                  node_verifier=v, lean_strict=True).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.LEAN_VERIFIED and g.lean_verified is True
+
+
+def test_lean_strict_true_with_no_node_verifier_is_byte_identical_default():
+    """lean_strict=True with node_verifier=None changes NOTHING: with no per-node verifier there is no
+    per-node compile to fail closed on, so the default offline path is byte-identical (soft PROVEN, no
+    node_lean event)."""
+    from agent.orchestrator.dag import goal_hash
+    res = _driver(DictProver({"G": valid_ledger("G")}), lean_strict=True).run("G")
+    assert res.proven
+    g = res.dag.get(goal_hash("G"))
+    assert g.state is NodeState.PROVEN and g.lean_verified is False
+    assert res.trace.by_kind("node_lean") == []          # the per-node arm never fired
+    assert res.trace.by_kind("prove_node")               # ordinary direct-prove trace still fires
 
 
 # ---- (iv) UNAVAILABLE -> EXHAUSTED (retryable, never poisons the memo) ----
