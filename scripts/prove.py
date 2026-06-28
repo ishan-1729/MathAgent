@@ -376,18 +376,28 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # The legacy (no --profile) path builds Codex components directly, so it hard-requires the Codex CLI.
-    # The --profile path resolves providers through the registry and lets the supervisor (inside
-    # build_driver) check provider availability per the profile's roles, so it need not require Codex.
-    if not getattr(args, "profile", None) and not CodexProver.available():
-        print("ERROR: codex CLI not found on PATH.", file=sys.stderr)
+    # SUPERVISOR = the SOLE pre-flight chokepoint. Compute the effective RunProfile and validate it
+    # FAIL-CLOSED before ANY construction or model/Lean call, so EVERY CLI path (direct / legacy DAG /
+    # --profile / evolve) is supervised. The supervisor's per-profile provider guards replace the old
+    # blanket 'codex CLI required' check, so a Claude profile no longer depends on Codex being present.
+    from agent.orchestrator.supervisor import validate_profile, SupervisorError
+    from agent.orchestrator.registry import resolve, Deps
+    from agent.orchestrator.run_profile import Role
+    profile = effective_profile(args)
+    try:
+        validate_profile(profile)
+    except SupervisorError as e:
+        print(f"ERROR: profile rejected by supervisor: {e}", file=sys.stderr)
         return 2
 
     toolkit = load_toolkit()
     cfg = CodexConfig(model=args.model, reasoning_effort=args.effort, timeout_s=args.timeout)
     budget = Budget(max_llm_calls=args.budget, max_replan_depth=args.max_replan)
     trace = RunTrace("codex-prove")
-    prover = CodexProver(toolkit, cfg)
+    # The prover is resolved FROM the supervised profile via the registry (Claude by default; Codex only
+    # when the profile pins it), so the direct / legacy paths run the SAME provider the supervisor just
+    # validated instead of a hardwired CodexProver. For the legacy codex profile this is byte-identical.
+    prover = resolve(Role.prover, profile.roles.prover, Deps(toolkit=toolkit))
 
     print(f"# Proving (model={args.model}, effort={args.effort}, mode={'direct' if args.direct else 'dag'}):")
     print(f"  {args.goal}\n")

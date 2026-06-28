@@ -270,3 +270,24 @@ def test_build_driver_from_a_loaded_scripted_profile(tmp_path):
     assert driver.enforce_elementarity is True
     assert driver.decomposer is not None and driver.reviewer is not None
     assert driver.terminal_gate is None and driver.node_verifier is None
+
+
+def test_supervisor_is_sole_chokepoint_in_main(tmp_path, monkeypatch):
+    """POINT 3: main() validates the EFFECTIVE profile via the supervisor BEFORE constructing any
+    prover/driver, for EVERY path. An incoherent profile (elementarity=none but lean.per_node=true,
+    supervisor guard S4) makes main() return 2 fail-closed, and no role is ever resolved/constructed —
+    proving the supervisor is the sole pre-flight chokepoint, not the per-branch construction code."""
+    import sys
+    import scripts.prove as prove
+    import agent.orchestrator.registry as reg
+    bad = tmp_path / "incoherent.yaml"
+    bad.write_text("elementarity: none\nlean:\n  per_node: true\n", encoding="utf-8")
+    called = {"resolve": False}
+    def boom(*a, **k):
+        called["resolve"] = True
+        raise AssertionError("resolve() ran before the supervisor validated the profile (chokepoint bypassed)")
+    monkeypatch.setattr(reg, "resolve", boom)             # main() imports resolve lazily from this module
+    monkeypatch.setattr(sys, "argv", ["prove", "some goal", "--profile", str(bad)])
+    rc = prove.main()
+    assert rc == 2, "incoherent profile must be rejected fail-closed (return 2)"
+    assert called["resolve"] is False, "no prover/role may be constructed before the supervisor validates"
