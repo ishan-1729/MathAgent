@@ -402,6 +402,13 @@ class DagDriver:
             return True
 
         if action is Action.MARK_FAILED_GAP and event is NodeEvent.GoalClaimMismatch:
+            # DEFENSE IN DEPTH (should be UNREACHABLE in normal operation): RalphLoop now pre-filters
+            # goal-binding as a PER-EPISODE acceptance criterion (agent/orchestrator/ralph.py, reusing
+            # the duplicated `_proves_goal`), so a res.success=True ledger is already goal-bound and
+            # `_direct_event` will not emit GoalClaimMismatch. This arm is kept as a backstop for
+            # defense in depth: if it ever fires, Ralph's pre-filter regressed (a bug), not a
+            # legitimate mismatch — the fix is a retry/decomposition via Ralph feedback, not this
+            # terminal FAILED_GAP.
             self.trace.emit("goal_claim_mismatch", goal=goal[:80], proof_kind="direct",
                             reason=ReasonCode.gap_found.value)
             self.dag.mark_failed(goal, reason=ReasonCode.gap_found.value)

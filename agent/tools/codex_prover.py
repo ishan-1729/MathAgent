@@ -150,6 +150,10 @@ class CodexProver:
             f"Allowed `justification` keys (use ONLY these): {_toolkit_keys(self.toolkit)}\n\n"
             f"PROVE THIS GOAL:\n{goal}\n"
             f"{_feedback_block(feedback)}\n"
+            "GOAL-BINDING (required): the ledger's top-level `claim` AND the terminal `conclusion` "
+            "step's `claim` must restate the requested goal STRING VERBATIM — copy the goal exactly as "
+            "written above, with no paraphrase, no re-notation, no added or dropped qualifiers. A "
+            "ledger whose claim/conclusion is a reworded equivalent of the goal is REJECTED.\n"
             "Output ONLY one fenced ```json block containing the step-ledger. No prose before or after. "
             "Do not read or modify any files."
         )

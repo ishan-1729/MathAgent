@@ -15,12 +15,48 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from agent.gates.gate import GateReport, Verdict, evaluate
+from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.toolkit import Toolkit, load_toolkit
+from agent.orchestrator.dag import goal_hash
 from agent.orchestrator.driver import Prover, Judge
 from agent.orchestrator.state import Budget
 from agent.orchestrator.trace import RunTrace
 
 _MAX_LESSONS = 12
+
+
+def _proves_goal(ledger: str, goal: str) -> bool:
+    """Does `ledger` actually conclude `goal`? Soundness binding (goal<->claim).
+
+    DUPLICATE of :func:`agent.orchestrator.dag_driver._proves_goal` (kept in lockstep). It lives here
+    too because ``dag_driver`` imports ``ralph`` (importing back would be a cycle); the logic is small
+    and must stay identical to the driver's backstop. BOTH the ledger's top-level ``claim`` AND its
+    terminal ``conclusion`` step must deep-hash-equal the requested goal — checking the claim alone is
+    insufficient because the gate cannot tell a genuinely-wrong conclusion from a placeholder
+    restatement without knowing the requested goal. Returns False if it won't parse, has no single
+    conclusion, or either the claim or the conclusion proves something else."""
+    try:
+        led = parse_ledger(ledger)
+    except LedgerError:
+        return False
+    if goal_hash(led.claim) != goal_hash(goal):
+        return False
+    conclusions = [s for s in led.steps if s.justification == "conclusion"]
+    if len(conclusions) != 1:
+        return False
+    return goal_hash(conclusions[0].claim) == goal_hash(goal)
+
+
+def _binding_feedback(goal: str) -> str:
+    """The lessons-learned note fed into the next episode when a gate-passing ledger fails goal-binding.
+
+    Tells the prover the structural gate passed but the claim/conclusion did not RESTATE the requested
+    goal verbatim, and to set both the top-level claim and the conclusion step's claim to EXACTLY the
+    goal string. This is the feedback-repair for the nondeterministic paraphrase the goal-binding
+    check rejects."""
+    return ("Your ledger passed the structural gate but its claim/conclusion does not restate the "
+            "requested goal verbatim. Set both the top-level `claim` and the conclusion step's "
+            f"`claim` to exactly: {goal}")
 
 
 @dataclass
@@ -93,6 +129,20 @@ class RalphLoop:
             if report.verdict is Verdict.NEEDS_REVIEW and not self.judges:
                 self.trace.emit("review_unhandled", reviews=[f.code for f in report.reviews()])
                 return RalphResult(False, text, report, episodes, lessons, exhausted=True)
+
+            # PER-EPISODE GOAL-BINDING (liveness fix): a ledger that passes the structural gate but
+            # whose claim/conclusion does not restate the requested goal VERBATIM is a FAILED episode,
+            # not a success. The nondeterministic paraphrase this catches is exactly what feedback
+            # repair exists for: record the verbatim-restatement lesson and continue to the next
+            # episode instead of returning a success the DagDriver would then reject as a
+            # GoalClaimMismatch and terminate on (with retry budget unspent). If NO episode ever binds,
+            # the loop returns success=False -> DirectRejected -> decomposition fallback. This reuses
+            # the driver's `_proves_goal` binding (duplicated above; kept in lockstep).
+            if not _proves_goal(text, goal):
+                self.trace.emit("ralph_goal_unbound", goal=goal[:80], episode=episodes,
+                                verdict=report.verdict.value)
+                lessons = ([_binding_feedback(goal)] + lessons)[:_MAX_LESSONS]
+                continue
 
             # Deterministically admitted -> optional Layer-2 adversarial review.
             judge_notes: list[str] = []

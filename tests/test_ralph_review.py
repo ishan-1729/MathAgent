@@ -17,27 +17,28 @@ TOOLKIT = load_toolkit()
 def _descent_ledger():
     """A structurally-valid ledger whose elastic `descent` justification routes to Layer-2 review.
 
-    The conclusion step's claim equals the ledger's stated goal so the deterministic gate admits it
-    (NEEDS_REVIEW), rather than rejecting on goal/claim mismatch.
+    The claim and conclusion restate the run() goal ("p") verbatim so the ledger is GOAL-BOUND —
+    Ralph's per-episode binding check would otherwise fail the episode before review semantics
+    are exercised (the point of these tests).
     """
     return json.dumps({
-        "problem": "p", "claim": "done",
+        "problem": "p", "claim": "p",
         "steps": [
             {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
              "obligations": {"descent": {"measure": "x", "strictly_decreases": True,
                                          "stays_in_domain": True}}},
-            {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     })
 
 
 def _passing_ledger():
-    """A ledger that passes the deterministic gate cleanly (PASSED_DETERMINISTIC, no review flags)."""
+    """A goal-bound ledger that passes the deterministic gate cleanly (PASSED_DETERMINISTIC)."""
     return json.dumps({
-        "problem": "p", "claim": "done",
+        "problem": "p", "claim": "p",
         "steps": [
             {"id": "s1", "claim": "x", "justification": "given", "depends_on": []},
-            {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     })
 

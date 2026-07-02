@@ -407,7 +407,17 @@ def main() -> int:
     # validated instead of a hardwired CodexProver. For the legacy codex profile this is byte-identical.
     prover = resolve(Role.prover, profile.roles.prover, Deps(toolkit=toolkit))
 
-    print(f"# Proving (model={args.model}, effort={args.effort}, mode={'direct' if args.direct else 'dag'}):")
+    # Header: with --profile the PROVER is driven by the profile's role spec (provider/model), NOT the
+    # CLI defaults (gpt-5.5/xhigh), so print the profile's prover provider+model to avoid a misleading
+    # 'model=gpt-5.5' banner on a Claude-default profile run. Without --profile the CLI cfg drives it.
+    mode = "direct" if args.direct else "dag"
+    if getattr(args, "profile", None):
+        pspec = profile.roles.prover
+        pmodel = pspec.model or "(default)"
+        peffort = pspec.effort or args.effort
+        print(f"# Proving (prover={pspec.provider.value}/{pmodel}, effort={peffort}, mode={mode}):")
+    else:
+        print(f"# Proving (model={args.model}, effort={args.effort}, mode={mode}):")
     print(f"  {args.goal}\n")
 
     # Build the retriever EARLY (before --evolve) so the evolutionary search can retrieval-seed its
@@ -533,6 +543,9 @@ def main() -> int:
         # DIFFERENT statement than the one requested. Bind BOTH the top-level claim AND the terminal
         # conclusion step to args.goal (mirroring DagDriver), so a ledger whose claim==goal but whose
         # conclusion proves a fresh unrelated statement is not reported PROVEN for this goal.
+        # NOTE: RalphLoop now enforces goal-binding as a PER-EPISODE acceptance criterion (a res.success
+        # ledger is already goal-bound), so this post-hoc check is a REDUNDANT backstop — kept for
+        # defense in depth (it should no longer be the only guard).
         if ok and res.ledger:
             try:
                 led = parse_ledger(res.ledger)

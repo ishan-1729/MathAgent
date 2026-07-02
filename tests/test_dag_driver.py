@@ -420,25 +420,33 @@ def claim_matches_goal_but_concludes_other(goal: str, concluded: str) -> str:
 
 def test_direct_proof_of_wrong_goal_is_rejected():
     # The prover returns a perfectly valid ledger -- but it proves "H", not the requested "G".
+    # SOUNDNESS INTENT (preserved): a wrong-goal ledger is NEVER reported PROVEN for "G".
+    # MECHANISM CHANGE: RalphLoop now catches the goal-binding failure PER-EPISODE (emitting
+    # `ralph_goal_unbound`) so the loop returns success=False rather than a success the driver's
+    # backstop then terminates on. With no decomposer this routes to a decomposer_absent FAILED_GAP;
+    # the `goal_claim_mismatch` backstop arm stays UNREACHABLE (it only fires on a Ralph regression).
     prover = DictProver({"G": mismatched_ledger("G", proved="H")})
     res = _driver(prover).run("G")
     assert not res.proven
-    assert res.trace.by_kind("goal_claim_mismatch")
+    assert res.trace.by_kind("ralph_goal_unbound")            # per-episode binding caught it
+    assert not res.trace.by_kind("goal_claim_mismatch")       # backstop stayed unreachable
 
 
 def test_direct_proof_claim_matches_goal_but_concludes_other_is_rejected():
     # Residual L5 trigger: claim == goal "G" (so a claim-only check passes), but the terminal
-    # conclusion proves a fresh statement "H". The gate admits it, yet the DagDriver must reject it
+    # conclusion proves a fresh statement "H". The gate admits it, yet the harness must reject it
     # because the proof concludes a DIFFERENT statement than the requested goal.
     attack = claim_matches_goal_but_concludes_other("G", concluded="H")
     # Sanity: the deterministic gate (lenient, goal-agnostic) DOES admit this ledger ...
     from agent.gates.gate import evaluate
     assert not evaluate(attack, TOOLKIT).rejected
-    # ... but the driver's terminal-conclusion goal-binding rejects it for goal "G".
+    # ... but RalphLoop's per-episode terminal-conclusion goal-binding rejects it for goal "G"
+    # (success=False), so it is never proven; with no decomposer it ends not-proven.
     prover = DictProver({"G": attack})
     res = _driver(prover).run("G")
     assert not res.proven
-    assert res.trace.by_kind("goal_claim_mismatch")
+    assert res.trace.by_kind("ralph_goal_unbound")
+    assert not res.trace.by_kind("goal_claim_mismatch")
 
 
 def test_proves_goal_requires_terminal_conclusion_to_match():
@@ -453,6 +461,57 @@ def test_proves_goal_requires_terminal_conclusion_to_match():
         {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]}]})
     assert not _proves_goal(mislabeled, "G")
     assert not _proves_goal("not a ledger at all", "G")                  # unparseable -> False
+
+
+class ParaphraseRootProver:
+    """Returns a gate-passing but PARAPHRASED (non-goal-bound) ledger for the root goal on every
+    episode, but a properly goal-bound ledger for the decomposition's children. Models the live bug:
+    the root direct attempt never binds, so RalphLoop returns success=False and the driver must fall
+    through to DECOMPOSITION rather than terminating on a goal_claim_mismatch."""
+
+    def __init__(self, root: str, children: list[str]):
+        self._root = root
+        self._children = set(children)
+        self.calls = 0
+
+    def prove(self, goal: str, feedback=None) -> str:
+        self.calls += 1
+        if goal == self._root:
+            return mismatched_ledger(self._root, proved="paraphrase of " + self._root)
+        if goal in self._children:
+            return valid_ledger(goal)
+        return BAD
+
+
+def test_direct_paraphrase_falls_through_to_decomposition():
+    """LIVENESS FIX (the live smoke bug): a root whose direct attempt ALWAYS paraphrases (gate passes,
+    goal-binding fails) must NOT be marked FAILED_GAP from a goal_claim_mismatch. Instead RalphLoop
+    returns success=False -> DirectRejected -> the driver ATTEMPTS decomposition. Here the scripted
+    decomposer's blueprint proves via a bindable child, so the parent proves via children."""
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    prover = ParaphraseRootProver("G", ["A"])
+    driver = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                     ralph_episodes=2)
+    res = driver.run("G")
+    assert res.proven                                        # proved via decomposition, not terminal
+    # Decomposition WAS attempted (the trace records the decompose call) ...
+    assert res.trace.by_kind("decompose")
+    # ... and the terminal goal_claim_mismatch backstop did NOT fire (Ralph pre-filtered binding).
+    assert not res.trace.by_kind("goal_claim_mismatch")
+    # The per-episode binding filter caught the paraphrase on the direct attempt.
+    assert res.trace.by_kind("ralph_goal_unbound")
+    assert res.dag.get(res.dag.get_or_create("G").key).proof_kind == "decomposition"
+
+
+def test_direct_paraphrase_no_decomposer_ends_not_proven():
+    """With no decomposer, an always-paraphrasing root ends NOT PROVEN (decomposer_absent), never a
+    spurious success — soundness intent preserved (nothing binds -> not proven)."""
+    prover = DictProver({"G": mismatched_ledger("G", proved="H")})
+    res = _driver(prover, ralph_episodes=3).run("G")
+    assert not res.proven
+    assert res.trace.by_kind("ralph_goal_unbound")
+    assert res.trace.by_kind("decomposer_absent")
+    assert not res.trace.by_kind("goal_claim_mismatch")
 
 
 def test_decomposition_concluding_wrong_goal_is_rejected():

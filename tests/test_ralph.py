@@ -107,7 +107,7 @@ def test_raising_prover_exhausts_cleanly_when_all_episodes_fail():
 def test_loop_recovers_after_a_transient_prover_crash():
     """A first-episode crash followed by a clean ledger still SUCCEEDS — a transient failure is not
     terminal. The recorded lesson is fed forward; the second episode proves the goal."""
-    prover = RaiseThenProve(_passing_ledger())
+    prover = RaiseThenProve(_passing_ledger("p"))     # goal-bound to "p" so the retry episode binds
     trace = RunTrace("t")
     res = RalphLoop(prover, toolkit=TOOLKIT, trace=trace, max_episodes=3).run("p")
     assert res.success is True
@@ -149,6 +149,95 @@ class OkProver:
         return self._ledger
 
 
+# ---- Per-episode goal-binding (liveness fix): a gate-passing but paraphrased ledger is a FAILED
+#      episode carrying verbatim-restatement feedback; if nothing ever binds, success=False. ----
+
+def _paraphrased_ledger(paraphrase: str) -> str:
+    """A gate-passing ledger whose claim/conclusion is `paraphrase` (NOT the requested goal string).
+    Structurally valid and internally consistent, so the deterministic gate ADMITS it — only the
+    per-episode goal-binding should reject it for the real goal."""
+    return json.dumps({
+        "problem": "p", "claim": paraphrase,
+        "steps": [
+            {"id": "s1", "claim": "x", "justification": "given", "depends_on": []},
+            {"id": "s2", "claim": paraphrase, "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    })
+
+
+class ParaphraseThenBind:
+    """Episode 1 returns a gate-passing but PARAPHRASED ledger (fails goal-binding); episode 2 returns
+    a verbatim goal-bound ledger. Records the feedback each episode was called with so a test can
+    assert the verbatim-restatement lesson was carried forward."""
+
+    def __init__(self, goal: str, paraphrase: str):
+        self._goal = goal
+        self._paraphrase = paraphrase
+        self.calls = 0
+        self.feedbacks: list = []
+
+    def prove(self, problem: str, feedback=None) -> str:
+        self.calls += 1
+        self.feedbacks.append(list(feedback) if feedback else None)
+        if self.calls == 1:
+            return _paraphrased_ledger(self._paraphrase)
+        return _passing_ledger(self._goal)
+
+
+class AlwaysParaphrase:
+    """Every episode returns a gate-passing but paraphrased (non-goal-bound) ledger -> nothing ever
+    binds, so the loop must return success=False after exhausting max_episodes."""
+
+    def __init__(self, paraphrase: str):
+        self._paraphrase = paraphrase
+        self.calls = 0
+
+    def prove(self, problem: str, feedback=None) -> str:
+        self.calls += 1
+        return _paraphrased_ledger(self._paraphrase)
+
+
+def test_paraphrase_then_bind_succeeds_with_carried_feedback():
+    """Episode 1 paraphrases (gate passes, goal-binding fails) -> FAILED episode with a verbatim
+    lesson; episode 2 restates the goal verbatim -> the loop SUCCEEDS in 2 episodes. This is exactly
+    the nondeterministic-paraphrase case feedback repair exists for (the live liveness bug)."""
+    goal = "For every integer n, n^2 is congruent to 0 or 1 modulo 4."
+    prover = ParaphraseThenBind(goal, paraphrase="n squared mod 4 is 0 or 1")
+    trace = RunTrace("t")
+    res = RalphLoop(prover, toolkit=TOOLKIT, trace=trace, max_episodes=3).run(goal)
+    assert res.success is True
+    assert res.episodes == 2
+    assert prover.calls == 2
+    # The unbound episode was surfaced on the trace, not silently swallowed.
+    assert len(trace.by_kind("ralph_goal_unbound")) == 1
+    # Episode 2 received the verbatim-restatement feedback captured from episode 1's binding failure.
+    ep2_feedback = prover.feedbacks[1]
+    assert ep2_feedback is not None
+    joined = " ".join(ep2_feedback)
+    assert "verbatim" in joined
+    assert goal in joined                         # the feedback names the exact goal string to use
+
+
+def test_always_paraphrase_never_binds_returns_failure():
+    """A prover that ALWAYS paraphrases (gate passes, binding never does) -> success=False after
+    max_episodes, so the DagDriver flows to DirectRejected -> decomposition (not a spurious success)."""
+    res = RalphLoop(AlwaysParaphrase("paraphrased claim"), toolkit=TOOLKIT,
+                    trace=RunTrace("t"), max_episodes=3).run("real goal")
+    assert res.success is False
+    assert res.exhausted is False                 # gate PASSED every episode; it is unbound, not starved
+    assert res.episodes == 3
+
+
+def test_goal_bound_ledger_still_succeeds():
+    """Soundness regression guard: a verbatim goal-bound gate-passing ledger is STILL accepted in one
+    episode (the per-episode binding filter does not reject a correctly-bound proof)."""
+    goal = "some goal G"
+    res = RalphLoop(OkProver(_passing_ledger(goal)), toolkit=TOOLKIT,
+                    trace=RunTrace("t"), max_episodes=2).run(goal)
+    assert res.success is True
+    assert res.episodes == 1
+
+
 def test_raising_judge_does_not_crash_run():
     """A live adversarial-judge call that RAISES must NOT crash run(): fail CLOSED (an un-runnable judge
     leaves the ledger not cleanly admitted) and surface the error on the trace. Pre-change,
@@ -156,7 +245,7 @@ def test_raising_judge_does_not_crash_run():
     DagDriver.run() and crash the whole run."""
     trace = RunTrace("t")
     judge = RaisingJudge()
-    res = RalphLoop(OkProver(_passing_ledger()), toolkit=TOOLKIT, trace=trace,
+    res = RalphLoop(OkProver(_passing_ledger("p")), toolkit=TOOLKIT, trace=trace,
                     judges=[judge], max_episodes=2).run("p")
     assert res.success is False                      # un-runnable judge -> not admitted (fail closed)
     assert judge.calls == 2                          # the judge was attempted each episode
