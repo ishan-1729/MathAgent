@@ -65,6 +65,46 @@ def test_unknown_axiom_rejected():
     assert "axiom_not_whitelisted" in _codes(res)
 
 
+# ---- native_decide / compiler-trust axiom denylist (explicit, intent-carrying ban) ----
+
+@pytest.mark.parametrize("ax", ["Lean.ofReduceBool", "ofReduceBool", "Lean.trustCompiler"])
+def test_native_decide_axiom_denylisted(ax):
+    """The per-computation native_decide / compiler-trust axioms are REJECTED via the explicit
+    denylist (distinct code `axiom_denylisted`), not merely via the whitelist."""
+    rep = DependencyReport("thm", axioms=[ax], constants=[ConstDep("Nat.add")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "axiom_denylisted" in _codes(res)
+
+
+def test_axiom_denylist_survives_whitelist_widening():
+    """A denylisted axiom stays rejected even if the whitelist is widened to include it — the
+    denylist is checked BEFORE the whitelist, so widening the floor cannot readmit native_decide."""
+    tk = Toolkit(
+        justifications={"conclusion": Justification("conclusion")},
+        lean_axiom_whitelist=["propext", "Classical.choice", "Quot.sound", "Lean.ofReduceBool"],
+        lean_axiom_denylist=["Lean.ofReduceBool"],
+    )
+    rep = DependencyReport("thm", axioms=["Lean.ofReduceBool"], constants=[ConstDep("Nat.add")])
+    res = audit_report(rep, tk)
+    assert not res.passed
+    assert "axiom_denylisted" in _codes(res)
+
+
+def test_missing_axiom_denylist_key_fails_closed_to_whitelist():
+    """A missing `lean_axiom_denylist` (empty list) must not open the floor: the whitelist still
+    guards, so an off-whitelist axiom is still rejected (as axiom_not_whitelisted)."""
+    tk = Toolkit(
+        justifications={"conclusion": Justification("conclusion")},
+        lean_axiom_whitelist=["propext", "Classical.choice", "Quot.sound"],
+        lean_axiom_denylist=[],
+    )
+    rep = DependencyReport("thm", axioms=["Lean.ofReduceBool"], constants=[ConstDep("Nat.add")])
+    res = audit_report(rep, tk)
+    assert not res.passed
+    assert "axiom_not_whitelisted" in _codes(res)
+
+
 # ---- content denylist over the closure ----
 
 def test_denylisted_dependency_rejected():

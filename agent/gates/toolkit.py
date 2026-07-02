@@ -42,6 +42,7 @@ class Toolkit:
     lean_infrastructure_allowlist: list[str] = field(default_factory=list)
     lean_elementary_by_fiat: list[str] = field(default_factory=list)
     lean_axiom_whitelist: list[str] = field(default_factory=list)
+    lean_axiom_denylist: list[str] = field(default_factory=list)
 
     # --- queries ---
     def allowed_keys(self) -> set[str]:
@@ -109,4 +110,6 @@ def load_toolkit(
         lean_infrastructure_allowlist=list(ddata.get("lean_infrastructure_allowlist") or []),
         lean_elementary_by_fiat=list(ddata.get("lean_elementary_by_fiat") or []),
         lean_axiom_whitelist=list(ddata.get("lean_axiom_whitelist") or ["propext", "Classical.choice", "Quot.sound"]),
+        # Fail-closed: a missing key is an empty denylist (the whitelist still guards).
+        lean_axiom_denylist=list(ddata.get("lean_axiom_denylist") or []),
     )

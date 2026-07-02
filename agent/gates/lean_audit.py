@@ -166,10 +166,17 @@ def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
         findings.append(Finding(LAYER_LEAN, Severity.REJECT, "theorem_mismatch",
                                 f"audit report is for {report.theorem!r}, expected {theorem_name!r}"))
 
-    # 1. Axiom integrity (catches sorry/admit/injected axioms).
+    # 1. Axiom integrity (catches sorry/admit/injected axioms). The named denylist is checked
+    #    BEFORE the whitelist: native_decide / compiler-trust axioms (Lean.ofReduceBool, ...) are a
+    #    deliberate, intent-carrying ban that must hold even if the whitelist were ever widened. The
+    #    whitelist stays as the backstop for everything else (notably sorryAx).
+    denylist = set(toolkit.lean_axiom_denylist)
     whitelist = set(toolkit.lean_axiom_whitelist)
     for ax in report.axioms:
-        if ax not in whitelist:
+        if ax in denylist:
+            findings.append(Finding(LAYER_LEAN, Severity.REJECT, "axiom_denylisted",
+                                    f"proof uses denylisted axiom {ax!r} (native_decide / compiler-trust)"))
+        elif ax not in whitelist:
             sev_code = "sorry_axiom" if ax in ("sorryAx", "Lean.sorryAx") else "axiom_not_whitelisted"
             findings.append(Finding(LAYER_LEAN, Severity.REJECT, sev_code,
                                     f"proof uses non-whitelisted axiom {ax!r}"))

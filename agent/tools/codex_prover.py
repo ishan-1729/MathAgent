@@ -71,6 +71,10 @@ def _run_codex(prompt: str, cfg: CodexConfig) -> str:
     launcher = cfg.launcher or find_codex()
     if not launcher:
         raise CodexError("codex CLI not found on PATH")
+    # An explicitly-configured launcher that does not exist must surface the TYPED error, not a raw
+    # FileNotFoundError from subprocess (bare names on PATH are already resolved by find_codex/which).
+    if not Path(launcher).exists() and shutil.which(launcher) is None:
+        raise CodexError(f"codex CLI launcher not found: {launcher!r}")
 
     out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex_out_")
     os.close(out_fd)

@@ -68,6 +68,11 @@ def _run_claude(prompt: str, cfg: ClaudeConfig) -> str:
     launcher = cfg.launcher or find_claude()
     if not launcher:
         raise ClaudeError("claude CLI not found on PATH")
+    # An explicitly-configured launcher that does not exist must surface the TYPED error, not a raw
+    # FileNotFoundError from subprocess. (A .cmd/.bat is run via cmd.exe so the guard below need not
+    # cover the bare-name-on-PATH case, which find_claude/shutil.which already resolve.)
+    if not Path(launcher).exists() and shutil.which(launcher) is None:
+        raise ClaudeError(f"claude CLI launcher not found: {launcher!r}")
 
     workdir = tempfile.mkdtemp(prefix="claude_cwd_")
     flags = [

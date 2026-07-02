@@ -161,6 +161,8 @@ def _ctx_tokens(toolkit: "Toolkit") -> list[str]:
         tokens.append(f"lean_fiat:{t}")
     for t in sorted(toolkit.lean_axiom_whitelist):
         tokens.append(f"axiom:{t}")
+    for t in sorted(toolkit.lean_axiom_denylist):
+        tokens.append(f"axiom_deny:{t}")
     return tokens
 
 
@@ -251,11 +253,17 @@ class ProofDAG:
     memo behaves exactly as before (goal-identity sharing only), so existing call sites are unchanged.
     """
 
-    def __init__(self, context: Optional[str] = None) -> None:
+    def __init__(self, context: Optional[str] = None, *, memo: bool = True) -> None:
         self.nodes: dict[str, OrNode] = {}
         self.cache_hits = 0
         self.context = context              # proof_context_hash for this run (None = context-agnostic)
         self.stale_invalidations = 0        # # of stale PROVEN certificates evicted on context mismatch
+        # MEMOIZATION toggle (ablation axis, StageProfile.memo). True (default) keeps the split-keyed
+        # goal cache: a proven subgoal short-circuits a later identical goal (a cache HIT). False makes
+        # every goal prove FRESH — get_or_create never counts a hit and the driver never reads a proven
+        # node as a shortcut, so a repeated subgoal is re-attempted. Node identity/sharing for the DAG
+        # structure is unchanged (still one node per goal_hash); only the proven-reuse READ is disabled.
+        self.memo = bool(memo)
 
     def _context_valid(self, node: OrNode) -> bool:
         """Is this node's PROVEN certificate valid under the DAG's current context? A None DAG-context
@@ -292,9 +300,10 @@ class ProofDAG:
         if node is None:
             node = OrNode(goal=goal, key=key)
             self.nodes[key] = node
-        elif node.proven:
+        elif node.proven and self.memo:
             # Split-keyed memo: only count a SHARE when the certificate is valid under this context;
-            # a stale PROVEN (context changed) is evicted to OPEN and re-attempted (a MISS).
+            # a stale PROVEN (context changed) is evicted to OPEN and re-attempted (a MISS). With memo
+            # OFF this reuse-counting is skipped entirely (every goal proves fresh — no cache hit).
             if self._evict_if_stale(node):
                 pass  # stale -> miss; node is now OPEN
             else:

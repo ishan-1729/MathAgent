@@ -171,3 +171,15 @@ lean_axiom_whitelist:
   - propext
   - Classical.choice
   - Quot.sound
+
+# native_decide / compiler-trust per-computation axioms: they expand the TCB beyond the kernel and are
+# banned regardless of the whitelist. `native_decide` (Lean 4.29+) emits `Lean.ofReduceBool` per
+# computation, trusting the compiler+`Nat`/`Bool` `@[extern]` implementations rather than the kernel.
+# These are checked BEFORE the whitelist as a named, intent-carrying ban (rejection code
+# `axiom_denylisted`); the whitelist stays as the backstop.
+lean_axiom_denylist:
+  - Lean.ofReduceBool
+  - ofReduceBool
+  - Lean.reduceBool
+  - Lean.reduceNat
+  - Lean.trustCompiler
