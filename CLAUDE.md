@@ -1,8 +1,7 @@
 # CLAUDE.md — MathAgent
 
-Operating guide for **Claude Fable 5** driving this repo. Complements `AGENTS.md` (durable
-project rules) and `README.md` (the layout map). Where they overlap, the project rules in
-`AGENTS.md` and the soundness invariants below win.
+**Single source of agent instructions for every tool** — Claude Code (Claude Fable 5) and Codex
+(GPT 5.5) alike. `AGENTS.md` is a pointer to this file. `README.md` is the layout map.
 
 MathAgent is a **training-free agentic harness** that proves elementary number-theory theorems
 *and* certifies the proof is elementary. A correct **non-elementary** proof is a **failure**, not a
@@ -133,7 +132,50 @@ non-elementary decls we haven't listed." Context makes the delegated result usab
 
 ---
 
-## 6. Fast reference
+## 6. Project rules & mathematical discipline
+
+Durable repo conventions (these applied to Codex sessions historically and now apply to every
+agent). Prefer concise Markdown with structured headings over long prose. Never expand a
+placeholder with an invented theorem.
+
+**Repo structure — preserve the role-based top-level grouping** (`README.md` is the map):
+
+- `agent/` — the system: `orchestrator/`, `roles/`, `gates/`, `tools/`, `instructions/`,
+  `workflows/`. The build plan is `agent/PLAN.md`; the elementary-constraint enforcement design
+  lives in `agent/gates/`.
+- `knowledge/` — `methods/`, `library/`, `examples/`.
+- `benchmarks/` — `problems/`, `evaluation/`.
+- `formal/` — Lean. `research/` — `papers/`, `docs/`. `scripts/`, `.agents/` — infra/skills.
+- Run `make check` after modifying repo structure or templates.
+
+**The elementarity discipline (what "elementary" bans):**
+
+- Treat final proof attempts as **elementary unless a problem-specific file says otherwise**. A
+  final attempt must avoid reliance on: unique factorization domains (UFDs), algebraic number
+  theory, class groups, elliptic curves, modular forms, Catalan/Mihailescu, Baker theory, and
+  heavy computational black boxes. This list is the informal complement to the authoritative
+  Layer-4 denylist (`agent/gates/denylist.yaml`).
+- You **may** study standard or non-elementary methods for inspiration — but any final proof must
+  be translated into permitted elementary language before it counts.
+- `research/papers/` is **systems literature** — brainstorming material for agent architectures,
+  Lean tooling, workflow configurations, and evaluation designs. It is **not** part of the default
+  mathematical context for benchmark proof attempts.
+
+**Proof placement:** Do not add full proofs to target problem folders unless explicitly requested.
+Solved demonstrations belong in `knowledge/examples/`.
+
+**Workflow design:** You may use `research/papers/` to design coherent workflow permutations
+(search, refinement, Lean feedback, proof-state tooling, evaluator loops). Record which papers or
+software systems inspired a workflow, but keep the resulting specification concise and testable.
+
+**Authoring a method** (`knowledge/methods/`): include trigger patterns, canonical
+transformations, examples, downstream moves, failure modes, and Lean-relevant lemmas.
+
+**Lean:** when editing Lean files, keep them minimal and compilable if Lean is available.
+
+---
+
+## 7. Fast reference
 
 - Tests / skeleton / demo: `make test` · `make check` · `make demo` (all offline).
 - CLI entry: `scripts/prove.py` (flags incl. `--profile`, `--lean-per-node`, `--lean-strict`).
