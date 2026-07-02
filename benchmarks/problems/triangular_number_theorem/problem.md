@@ -4,6 +4,7 @@ type: problem
 status: ready
 problem_class: additive number theory (sums of polygonal numbers)
 tier: T2
+statement: "Prove that every nonnegative integer n can be written as a sum of three triangular numbers: there exist nonnegative integers a, b, c with n = T_a + T_b + T_c, where T_k = k(k+1)/2."
 known_solution_available: true
 include_standard_proof: false
 ---

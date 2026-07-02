@@ -2,6 +2,7 @@
 name: X^2 + 1 = Y^3
 type: problem
 status: contaminated/example-adjacent
+statement: "Find all integer solutions of X^2 + 1 = Y^3, and show that the only integer solution is (X, Y) = (0, 1)."
 problem_class: Diophantine equation
 known_solution_available: true
 include_standard_proof: false

@@ -4,6 +4,7 @@ type: problem
 status: ready
 problem_class: Diophantine divisibility (extremal / finite descent)
 tier: T1
+statement: "Let a and b be positive integers such that ab + 1 divides a^2 + b^2. Prove that (a^2 + b^2) / (ab + 1) is a perfect square."
 known_solution_available: true
 include_standard_proof: false
 ---

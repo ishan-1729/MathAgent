@@ -4,6 +4,7 @@ type: problem
 status: ready
 problem_class: Diophantine equation (Mordell equation, specific k)
 tier: T2
+statement: "Prove that the Mordell equation y^2 = x^3 + 7 has no solutions in integers x, y. (Primary pinned case; the folder also lists further vetted k with elementary non-existence proofs.)"
 known_solution_available: true
 include_standard_proof: false
 ---

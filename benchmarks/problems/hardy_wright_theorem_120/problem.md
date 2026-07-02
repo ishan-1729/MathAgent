@@ -4,6 +4,7 @@ type: problem
 status: ready
 problem_class: Bernoulli-number congruence (von Staudt corollary)
 tier: calibration
+statement: "In Hardy & Wright's Bernoulli indexing (B_1 = 1/6, B_2 = 1/30, ..., so B_k = |B_{2k}| in modern even-index notation), prove that for every prime k of the form 3n + 1 the rational B_k - 1/6 is an integer, i.e. B_k = 1/6 (mod 1)."
 known_solution_available: true
 include_standard_proof: false
 ---

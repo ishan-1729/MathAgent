@@ -4,6 +4,7 @@ type: problem
 status: ready
 problem_class: Diophantine equation (quartic)
 tier: T3-hard
+statement: "Determine all solutions in positive integers X, Y of X^2 + 1 = 2 Y^4. Show the only positive-integer solutions are (X, Y) = (1, 1) and (X, Y) = (239, 13)."
 known_solution_available: true
 include_standard_proof: false
 ---

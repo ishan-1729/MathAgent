@@ -1,0 +1,322 @@
+"""Offline tests for scripts/run_problems.py (the benchmark problem-runner).
+
+No CLI/model/Lean is invoked. We pin:
+
+  * the loader parses all six authored folders: each READY folder yields a non-empty statement and the
+    right tier; the ljunggren/triangular folders carry a per-problem ``allowed_inputs_note``;
+  * the contaminated (x2_plus_1) folder loads but is NOT ready (skipped by the sweep);
+  * a fake-builder sweep runs fully offline and writes well-formed rows carrying a profile_hash;
+  * a blocked/malformed folder produces an error row (not a crash);
+  * the per-problem citable-inputs clause appears in the goal handed to the builder EXACTLY when the
+    problem declares per-problem inputs, and the row's ``injected_context`` flag matches.
+"""
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent.orchestrator.run_profile import (
+    ProviderKey,
+    RoleSpec,
+    RolesProfile,
+    RunProfile,
+    StageProfile,
+)
+
+# scripts/ is not a package; load run_problems.py by path (the same trick the module + test_ablate use).
+_REPO = Path(__file__).resolve().parents[1]
+_RP_PATH = _REPO / "scripts" / "run_problems.py"
+_spec = importlib.util.spec_from_file_location("run_problems_cli", _RP_PATH)
+rp = importlib.util.module_from_spec(_spec)
+sys.modules["run_problems_cli"] = rp
+_spec.loader.exec_module(rp)
+
+_PROBLEMS_DIR = _REPO / "benchmarks" / "problems"
+
+
+# --------------------------------------------------------------------------------------------------
+# Stub build_and_run result (no driver constructed): just enough surface for run_one.
+# --------------------------------------------------------------------------------------------------
+class _StubBudget:
+    def __init__(self, spent):
+        self.calls_spent = spent
+
+
+class _StubNode:
+    class _State:
+        name = "PROVEN"
+    state = _State()
+
+
+class _StubDag:
+    def __init__(self, n_nodes=1):
+        self.nodes = {f"n{i}": _StubNode() for i in range(n_nodes)}
+
+
+class _StubResult:
+    def __init__(self, proven=True, *, authoritative=False, terminal=None, spent=4, nodes=1):
+        self.proven = proven
+        self.authoritative_elementary = authoritative
+        self.terminal = terminal
+        self.budget = _StubBudget(spent)
+        self.dag = _StubDag(nodes)
+
+
+def _scripted_profile(name="rp-offline", **kw):
+    """A scripted-provider RunProfile: never touches a backend (used only for its identity/hash here)."""
+    S = RoleSpec(provider=ProviderKey.scripted)
+    kw.setdefault("roles", RolesProfile(prover=S, decomposer=S, reviewer=S, comparator=S, judge=S,
+                                        formalizer=S, faithfulness=S, refiner=S))
+    return RunProfile(name=name, **kw)
+
+
+# --------------------------------------------------------------------------------------------------
+# Loader: the six authored folders.
+# --------------------------------------------------------------------------------------------------
+_EXPECTED_TIER = {
+    "ljunggren_equation": "T3-hard",
+    "triangular_number_theorem": "T2",
+    "imo_1988_finite_descent": "T1",
+    "hardy_wright_theorem_120": "calibration",
+    "mordell_curves": "T2",
+}
+_READY_SLUGS = set(_EXPECTED_TIER)
+_WITH_NOTE = {"ljunggren_equation", "triangular_number_theorem"}
+
+
+def test_loader_parses_all_ready_folders_with_statement_and_tier():
+    for slug, tier in _EXPECTED_TIER.items():
+        prob = rp.load_problem(_PROBLEMS_DIR / slug)
+        assert prob.slug == slug
+        assert prob.is_ready, f"{slug} should be ready"
+        assert prob.statement and prob.statement.strip(), f"{slug} has an empty statement"
+        assert prob.tier == tier, f"{slug}: tier {prob.tier!r} != {tier!r}"
+
+
+def test_loader_contaminated_folder_is_runnable_and_labeled():
+    prob = rp.load_problem(_PROBLEMS_DIR / "x2_plus_1_eq_y3")
+    assert not prob.is_ready
+    assert prob.contaminated and prob.is_runnable
+    assert prob.statement and "X^2 + 1 = Y^3" in prob.statement
+    assert "contaminated" in prob.status.lower()
+
+
+def test_ljunggren_and_triangular_carry_allowed_inputs_note():
+    lj = rp.load_problem(_PROBLEMS_DIR / "ljunggren_equation")
+    tri = rp.load_problem(_PROBLEMS_DIR / "triangular_number_theorem")
+    assert lj.allowed_inputs_note and "quartic" in lj.allowed_inputs_note.lower()
+    assert tri.allowed_inputs_note and "three-squares" in tri.allowed_inputs_note.lower()
+
+
+def test_problems_without_per_problem_inputs_have_no_note():
+    for slug in ("imo_1988_finite_descent", "mordell_curves"):
+        prob = rp.load_problem(_PROBLEMS_DIR / slug)
+        assert prob.allowed_inputs_note is None, f"{slug} should have no per-problem note"
+
+
+def test_discover_skips_template_and_finds_all_authored():
+    discovered = {slug for slug, _p, _e in rp.discover_problems(_PROBLEMS_DIR)}
+    assert "TEMPLATE" not in discovered
+    assert _READY_SLUGS <= discovered
+    assert "x2_plus_1_eq_y3" in discovered
+
+
+# --------------------------------------------------------------------------------------------------
+# Context injection: the clause appears in the goal iff the problem declares per-problem inputs.
+# --------------------------------------------------------------------------------------------------
+def test_goal_for_injects_only_when_note_present():
+    lj = rp.load_problem(_PROBLEMS_DIR / "ljunggren_equation")
+    goal, injected = rp.goal_for(lj)
+    assert injected is True
+    assert "Per-problem citable inputs" in goal
+    assert lj.statement in goal
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    goal2, injected2 = rp.goal_for(imo)
+    assert injected2 is False
+    assert goal2 == imo.statement
+    assert "Per-problem citable inputs" not in goal2
+
+
+def test_builder_receives_injected_clause_exactly_for_declared_inputs(tmp_path):
+    """Capture the goal string handed to the (fake) builder: injected for ljunggren, bare for imo."""
+    seen: dict[str, str] = {}
+
+    def builder(profile, goal):
+        seen[profile.name] = goal
+        return _StubResult(proven=True)
+
+    lj = rp.load_problem(_PROBLEMS_DIR / "ljunggren_equation")
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    prof = _scripted_profile("cap")
+
+    row_lj = rp.run_one(lj, prof, builder=builder)
+    lj_goal = seen["cap"]
+    seen.clear()
+    row_imo = rp.run_one(imo, prof, builder=builder)
+    imo_goal = seen["cap"]
+
+    # The clause is present in the ljunggren goal (and the row flags it); absent for imo.
+    assert "Per-problem citable inputs" in lj_goal
+    assert lj.allowed_inputs_note.split(";")[0][:20] in lj_goal
+    assert "Per-problem citable inputs" not in imo_goal
+    assert row_lj["injected_context"] is True
+    assert row_imo["injected_context"] is False
+
+
+# --------------------------------------------------------------------------------------------------
+# Full offline sweep: well-formed rows with profile_hash; skip/error rows; no crash.
+# --------------------------------------------------------------------------------------------------
+def test_full_sweep_offline_writes_well_formed_rows(tmp_path):
+    def builder(profile, goal):
+        return _StubResult(proven=True, spent=5, nodes=2)
+
+    discovered = rp.discover_problems(_PROBLEMS_DIR)
+    prof = _scripted_profile("sweep")
+    out = tmp_path / "runs.jsonl"
+    rows = rp.run_sweep(discovered, [prof], out, builder=builder, verbose=False)
+
+    written = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(written) == len(rows)
+    for row in written:
+        assert set(row) == set(rp.ROW_FIELDS)
+
+    by_problem = {r["problem"]: r for r in written}
+    # Every ready problem produced a run row with the profile identity + proven verdict.
+    for slug in _READY_SLUGS:
+        r = by_problem[slug]
+        assert r["profile_hash"] == prof.profile_hash
+        assert r["profile_name"] == "sweep"
+        assert r["proven"] is True
+        assert r["reporting_status"] == "soft_proven"
+        assert r["calls_spent"] == 5
+        assert r["nodes"] == 2
+        assert r["error"] is None
+    # The ljunggren row flags the injected context; imo does not.
+    assert by_problem["ljunggren_equation"]["injected_context"] is True
+    assert by_problem["imo_1988_finite_descent"]["injected_context"] is False
+    # The contaminated folder RUNS (capability check) but every row is labeled contaminated=True.
+    x2 = by_problem["x2_plus_1_eq_y3"]
+    assert x2["error"] is None
+    assert x2["contaminated"] is True
+    assert x2["proven"] is True                      # scripted builder proves everything it runs
+    # Ready folders are labeled clean.
+    assert by_problem["imo_1988_finite_descent"]["contaminated"] is False
+
+
+def test_malformed_folder_produces_error_row_not_crash(tmp_path):
+    # A folder with a problem.md that has NO frontmatter -> a load error row.
+    pdir = tmp_path / "problems"
+    bad = pdir / "broken"
+    bad.mkdir(parents=True)
+    (bad / "problem.md").write_text("# no frontmatter here\n\njust prose.\n", encoding="utf-8")
+    # A well-formed ready folder alongside it, to prove the sweep continues past the bad one.
+    good = pdir / "good"
+    good.mkdir()
+    (good / "problem.md").write_text(
+        '---\nname: G\ntype: problem\nstatus: ready\ntier: T1\n'
+        'statement: "Prove 1 = 1."\n---\n# G\n', encoding="utf-8")
+
+    discovered = rp.discover_problems(pdir)
+    rows = rp.run_sweep(discovered, [_scripted_profile("m")], tmp_path / "o.jsonl",
+                        builder=lambda p, g: _StubResult(proven=True), verbose=False)
+    by_problem = {r["problem"]: r for r in rows}
+    assert "load error" in by_problem["broken"]["error"]
+    assert by_problem["broken"]["proven"] is False
+    # The good folder still ran.
+    assert by_problem["good"]["proven"] is True
+
+
+def test_bad_builder_run_is_error_row_and_sweep_continues(tmp_path):
+    def builder(profile, goal):
+        if profile.name == "boom":
+            raise RuntimeError("kaboom")
+        return _StubResult(proven=True)
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    bad = _scripted_profile("boom")
+    good = _scripted_profile("ok")
+    rows = rp.run_sweep([(imo.slug, imo, None)], [bad, good], tmp_path / "o.jsonl",
+                        builder=builder, verbose=False)
+    by_prof = {r["profile_name"]: r for r in rows}
+    assert by_prof["boom"]["error"] is not None and "kaboom" in by_prof["boom"]["error"]
+    assert by_prof["boom"]["proven"] is False
+    assert by_prof["ok"]["proven"] is True
+
+
+def test_reporting_status_authoritative_when_terminal_gate_certifies(tmp_path):
+    class _Terminal:
+        authoritative = True
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(imo, _scripted_profile("auth"),
+                     builder=lambda p, g: _StubResult(proven=True, authoritative=True,
+                                                      terminal=_Terminal()))
+    assert row["reporting_status"] == "authoritative_elementary"
+    assert row["authoritative_elementary"] is True
+
+
+# --------------------------------------------------------------------------------------------------
+# CSV output + reproducibility.
+# --------------------------------------------------------------------------------------------------
+def test_csv_output_has_header_and_rows(tmp_path):
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    out = tmp_path / "runs.csv"
+    rp.run_sweep([(imo.slug, imo, None)], [_scripted_profile("a"), _scripted_profile("b")], out,
+                 builder=lambda p, g: _StubResult(proven=True), verbose=False)
+    lines = [ln for ln in out.read_text().splitlines() if ln]
+    assert lines[0].split(",") == rp.ROW_FIELDS
+    assert len(lines) == 3  # header + 2 rows
+
+
+def test_rerun_is_diffable_except_wall(tmp_path):
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    prof = _scripted_profile("repro")
+    triple = [(imo.slug, imo, None)]
+    b = lambda p, g: _StubResult(proven=True, spent=7, nodes=1)
+    r1 = rp.run_sweep(triple, [prof], tmp_path / "1.jsonl", builder=b, verbose=False)[0]
+    r2 = rp.run_sweep(triple, [prof], tmp_path / "2.jsonl", builder=b, verbose=False)[0]
+    r1.pop("wall_s"); r2.pop("wall_s")
+    assert r1 == r2
+
+
+# --------------------------------------------------------------------------------------------------
+# CLI: main() end-to-end through the real builder on the scripted default profile written to a temp dir.
+# --------------------------------------------------------------------------------------------------
+def test_main_unknown_problem_slug_errors(tmp_path):
+    prof = _scripted_profile("x")
+    ppath = tmp_path / "p.yaml"
+    import yaml
+    ppath.write_text(yaml.safe_dump(prof.model_dump(mode="json")), encoding="utf-8")
+    rc = rp.main(["--problems-dir", str(_PROBLEMS_DIR), "--problem", "does_not_exist",
+                  "--profile", str(ppath), "--out", str(tmp_path / "o.jsonl"), "--quiet"])
+    assert rc == 2
+
+
+def test_main_selects_single_problem_and_writes_row(tmp_path, monkeypatch):
+    # Route the real builder through a stub so main() is fully offline.
+    import agent.orchestrator.builder as builder_mod
+    monkeypatch.setattr(builder_mod, "build_and_run",
+                        lambda profile, goal: _StubResult(proven=True), raising=True)
+    prof = _scripted_profile("cli")
+    ppath = tmp_path / "p.yaml"
+    import yaml
+    ppath.write_text(yaml.safe_dump(prof.model_dump(mode="json")), encoding="utf-8")
+    out = tmp_path / "o.jsonl"
+    rc = rp.main(["--problems-dir", str(_PROBLEMS_DIR), "--problem", "imo_1988_finite_descent",
+                  "--profile", str(ppath), "--out", str(out), "--quiet"])
+    assert rc == 0
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["problem"] == "imo_1988_finite_descent"
+    assert rows[0]["tier"] == "T1"
+    assert rows[0]["proven"] is True
+
+
+def test_timeout_flag_changes_profile_hash(tmp_path):
+    prof = _scripted_profile("t")
+    capped = rp._apply_timeout(prof, 42)
+    assert capped.profile_hash != prof.profile_hash
+    assert all(getattr(capped.roles, n).timeout_s == 42 for n in capped.roles.model_fields)
