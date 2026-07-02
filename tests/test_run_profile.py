@@ -75,14 +75,11 @@ def test_per_role_default_models():
         spec = getattr(roles, role.value)
         assert spec.provider is ProviderKey.claude
         assert spec.model == "opus"
-    for role in (Role.decomposer, Role.reviewer, Role.formalizer, Role.faithfulness):
+    for role in (Role.decomposer, Role.reviewer, Role.comparator, Role.judge,
+                 Role.formalizer, Role.faithfulness):
         spec = getattr(roles, role.value)
         assert spec.provider is ProviderKey.claude
         assert spec.model == "sonnet"
-    for role in (Role.comparator, Role.judge):
-        spec = getattr(roles, role.value)
-        assert spec.provider is ProviderKey.claude
-        assert spec.model == "haiku"
 
 
 def test_every_role_enum_has_a_field():

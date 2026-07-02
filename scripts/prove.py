@@ -233,7 +233,7 @@ def build_lean_node_gates(args, toolkit, cfg, server, retriever=None):
     return node_verifier, sketch_verifier
 
 
-def build_dag_driver(args, *, prover, toolkit, cfg, budget, trace, server,
+def build_dag_driver(args, *, profile, prover, toolkit, cfg, budget, trace, server,
                      terminal_gate, comparator, refiner, evolve_fallback):
     """Construct the DAG-mode :class:`DagDriver` from the parsed CLI args + already-built dependencies.
 
@@ -242,13 +242,21 @@ def build_dag_driver(args, *, prover, toolkit, cfg, budget, trace, server,
     and threads them — together with ``lean_strict`` (``--lean-strict``) and the warm ``lean_server`` —
     into the driver. WITHOUT ``--lean-per-node`` the driver is constructed with
     ``node_verifier=None``/``sketch_verifier=None``/``lean_strict=False``/``lean_server=None`` exactly as
-    before (byte-identical)."""
+    before (byte-identical).
+
+    The decomposer and reviewer are RESOLVED via the registry from the SAME effective ``profile`` the
+    supervisor validated (not hardwired), so the legacy path runs the provider the profile pins. For the
+    legacy Codex profile (``_codex_roles`` pins provider=codex for every role) the resolved components
+    are CodexDecomposer/CodexReviewer with the CLI's model/effort — byte-identical to the old hardwiring."""
+    from agent.orchestrator.registry import Deps, resolve
+    from agent.orchestrator.run_profile import Role
+    deps = Deps(toolkit=toolkit)
     node_verifier, sketch_verifier = build_lean_node_gates(
         args, toolkit, cfg, server, retriever=getattr(args, "_retriever", None))
     return DagDriver(
         prover,
-        decomposer=CodexDecomposer(toolkit, cfg),
-        reviewer=CodexReviewer(toolkit, cfg),
+        decomposer=resolve(Role.decomposer, profile.roles.decomposer, deps),
+        reviewer=resolve(Role.reviewer, profile.roles.reviewer, deps),
         toolkit=toolkit, budget=budget, trace=trace,
         max_depth=args.max_depth, max_decomp_attempts=args.max_decomp,
         ralph_episodes=args.episodes, terminal_gate=terminal_gate,
@@ -556,9 +564,15 @@ def main() -> int:
         else:
             terminal_gate = None
             if args.terminal_gate:
-                from agent.tools.formalizer import CodexFormalizer
                 from agent.orchestrator.formalize_bridge import make_terminal_gate
-                terminal_gate = make_terminal_gate(CodexFormalizer(toolkit, cfg), toolkit,
+                from agent.orchestrator.registry import Deps, resolve
+                from agent.orchestrator.run_profile import Role
+                # RESOLVE the terminal-gate formalizer via the registry from the SAME effective profile
+                # (so --formalizer-model=claude, which maps to the profile's formalizer RoleSpec in
+                # _codex_roles, is honored: it resolves ClaudeFormalizer). For the default legacy codex
+                # profile this resolves CodexFormalizer(toolkit, codex-cfg) — byte-identical to before.
+                formalizer = resolve(Role.formalizer, profile.roles.formalizer, Deps(toolkit=toolkit))
+                terminal_gate = make_terminal_gate(formalizer, toolkit,
                                                    faithfulness_checker=faith, server=server,
                                                    retriever=retriever, repair_iters=args.repair)
             # Codex-backed search/revision machinery (population Elo+BT+PUCT; Autoreason refiner).
@@ -586,8 +600,8 @@ def main() -> int:
                 print(f"# --lean-per-node: Lean-verifying every leaf + AND-composition "
                       f"(formalizer={args.formalizer_model}, strict={bool(args.lean_strict)})")
             driver = build_dag_driver(
-                args, prover=prover, toolkit=toolkit, cfg=cfg, budget=budget, trace=trace,
-                server=server, terminal_gate=terminal_gate, comparator=comparator,
+                args, profile=profile, prover=prover, toolkit=toolkit, cfg=cfg, budget=budget,
+                trace=trace, server=server, terminal_gate=terminal_gate, comparator=comparator,
                 refiner=refiner, evolve_fallback=evolve_fallback,
             )
         res = driver.run(args.goal)

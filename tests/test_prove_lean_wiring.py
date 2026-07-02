@@ -71,8 +71,11 @@ def _parse(argv):
 
 
 def _build(args, deps, server):
+    # The legacy (non--profile) path derives the effective RunProfile from the args (the same object the
+    # supervisor validates), then build_dag_driver resolves decomposer/reviewer from it via the registry.
+    profile = prove_cli.effective_profile(args)
     return prove_cli.build_dag_driver(
-        args, prover=deps["prover"], toolkit=deps["toolkit"], cfg=deps["cfg"],
+        args, profile=profile, prover=deps["prover"], toolkit=deps["toolkit"], cfg=deps["cfg"],
         budget=deps["budget"], trace=deps["trace"], server=server,
         terminal_gate=None, comparator=None, refiner=None, evolve_fallback=None,
     )
@@ -96,6 +99,23 @@ def test_build_lean_node_gates_returns_none_pair_without_flag(deps):
     args = _parse(["a goal"])
     nv, sv = prove_cli.build_lean_node_gates(args, deps["toolkit"], deps["cfg"], server=None)
     assert nv is None and sv is None
+
+
+# ---- item 1: the legacy (non--profile) DAG path RESOLVES decomposer/reviewer via the registry ------
+
+def test_legacy_path_resolves_codex_decomposer_and_reviewer(deps):
+    """With NO --profile, the effective profile is the legacy Codex profile (_codex_roles pins every
+    role to provider=codex), so build_dag_driver RESOLVES the decomposer/reviewer via the registry to
+    CodexDecomposer/CodexReviewer with the CLI model/effort — byte-identical to the old hardwiring."""
+    from agent.tools.codex_prover import CodexDecomposer, CodexReviewer
+    args = _parse(["a goal"])
+    assert args.profile is None
+    driver = _build(args, deps, server=None)
+    assert isinstance(driver.decomposer, CodexDecomposer)
+    assert isinstance(driver.reviewer, CodexReviewer)
+    # the resolved decomposer carries the CLI model/effort (the legacy Codex config).
+    assert driver.decomposer.cfg.model == args.model
+    assert driver.decomposer.cfg.reasoning_effort == args.effort
 
 
 # ---- WITH --lean-per-node: non-None node + sketch verifiers, warm server threaded in ---------------
@@ -172,6 +192,33 @@ def test_formalizer_model_claude_selects_claude(deps, monkeypatch):
     nv, sv = prove_cli.build_lean_node_gates(args, deps["toolkit"], deps["cfg"], server=_StubServer())
     assert nv is not None and sv is not None
     assert built.get("claude") is True
+
+
+# ---- item 1: the terminal-gate formalizer is RESOLVED via the registry from the effective profile --
+
+def test_terminal_gate_formalizer_default_resolves_codex(deps):
+    """With NO --profile the legacy Codex profile pins the formalizer to codex, so the terminal-gate
+    formalizer resolves (via the registry) to CodexFormalizer — byte-identical to the old hardwiring."""
+    from agent.orchestrator.registry import Deps, resolve
+    from agent.orchestrator.run_profile import Role
+    from agent.tools.formalizer import CodexFormalizer
+    args = _parse(["a goal", "--terminal-gate"])
+    profile = prove_cli.effective_profile(args)
+    formalizer = resolve(Role.formalizer, profile.roles.formalizer, Deps(toolkit=deps["toolkit"]))
+    assert isinstance(formalizer, CodexFormalizer)
+
+
+def test_terminal_gate_formalizer_claude_resolves_claude(deps):
+    """--formalizer-model claude maps (in _codex_roles) the formalizer RoleSpec to provider=claude, so
+    the terminal gate honors it via the registry: the resolved formalizer is a ClaudeFormalizer (Opus)."""
+    from agent.orchestrator.registry import Deps, resolve
+    from agent.orchestrator.run_profile import Role, ProviderKey
+    from agent.tools.formalizer import ClaudeFormalizer
+    args = _parse(["a goal", "--terminal-gate", "--formalizer-model", "claude"])
+    profile = prove_cli.effective_profile(args)
+    assert profile.roles.formalizer.provider is ProviderKey.claude
+    formalizer = resolve(Role.formalizer, profile.roles.formalizer, Deps(toolkit=deps["toolkit"]))
+    assert isinstance(formalizer, ClaudeFormalizer)
 
 
 # ---- the stub server's availability is what the wired gate actually probes ------------------------

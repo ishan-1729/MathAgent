@@ -26,6 +26,13 @@ Guards implemented (each maps to a contract item):
 * **S6** any role ``provider=codex`` => the Codex CLI is present.
 * **S7** any role ``provider=claude`` => the Claude CLI is present.
 * **S8** any role ``provider=scripted`` only for an explicitly test/offline profile.
+* **S9** ``lean.terminal`` must equal ``elementarity == authoritative`` (terminal is DERIVED from
+  elementarity by the builder's policy; a contradicting ``lean.terminal`` is rejected, not silently
+  ignored).
+* **S10** ``lean.per_node`` => ``lean.server`` (a per-node warm REPL is required; per-node without a
+  warm server is impractical, mirroring prove.py's ``normalize_lean_flags`` implication).
+* **S11** ``ensemble`` weights must be >= 0 with a positive sum, and both model names non-empty (a
+  degenerate all-zero / negative weighting or an empty model name is unusable).
 """
 from __future__ import annotations
 
@@ -174,6 +181,47 @@ def validate_profile(profile: RunProfile) -> None:
             "mode='direct' is incompatible with elementarity='authoritative' "
             "(the authoritative terminal/per-node Lean gates are DAG-wired). "
             "Use mode='dag', or lower elementarity to 'soft'/'none'."
+        )
+
+    # S9: lean.terminal is DERIVED from elementarity (the builder attaches the terminal Layer-4 gate
+    # iff elementarity=authoritative, via elementarity_policy.policy_for). A lean.terminal that
+    # CONTRADICTS that derivation is a decorative field silently disagreeing with real wiring, so we
+    # reject it fail-closed: lean.terminal MUST equal (elementarity == authoritative).
+    want_terminal = profile.elementarity is ElementarityLevel.authoritative
+    if profile.lean.terminal != want_terminal:
+        raise SupervisorError(
+            f"lean.terminal={profile.lean.terminal} contradicts elementarity="
+            f"'{profile.elementarity.value}': the terminal Layer-4 gate is DERIVED from elementarity "
+            f"and attaches iff elementarity='authoritative', so lean.terminal must be {want_terminal}. "
+            "Set lean.terminal accordingly, or change elementarity."
+        )
+
+    # S10: per-node Lean requires the persistent warm server (a per-node compile without a warm REPL
+    # reloads Mathlib per node — impractical). Mirrors prove.py's normalize_lean_flags implication
+    # (--lean-per-node implies --server) and its hard-error on a missing REPL under --lean-per-node.
+    if profile.lean.per_node and not profile.lean.server:
+        raise SupervisorError(
+            "lean.per_node=True requires lean.server=True (a warm persistent Lean REPL): per-node "
+            "verification compiles every leaf/AND-composition and reloading Mathlib per node is "
+            "impractical. Set lean.server=True, or disable lean.per_node."
+        )
+
+    # S11: the breadth/depth ensemble weighting must be usable — non-negative weights with a positive
+    # sum (so the normalized sampling mix is well-defined) and non-empty model names.
+    ens = profile.ensemble
+    if ens.breadth_weight < 0 or ens.depth_weight < 0:
+        raise SupervisorError(
+            f"ensemble weights must be non-negative (got breadth_weight={ens.breadth_weight}, "
+            f"depth_weight={ens.depth_weight}). Use non-negative weights."
+        )
+    if (ens.breadth_weight + ens.depth_weight) <= 0:
+        raise SupervisorError(
+            "ensemble weights sum to 0: at least one of breadth_weight/depth_weight must be positive "
+            "(an all-zero weighting has no well-defined sampling mix)."
+        )
+    if not ens.breadth_model.strip() or not ens.depth_model.strip():
+        raise SupervisorError(
+            "ensemble breadth_model and depth_model must be non-empty model names."
         )
 
     # ----- per-role provider availability (S6 codex, S7 claude, S8 scripted) - #

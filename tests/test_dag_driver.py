@@ -114,6 +114,41 @@ def test_shared_lemma_memoized():
     assert c_node.proven and c_node.proof_kind == "direct"
 
 
+def test_memo_off_reproves_shared_lemma_fresh():
+    """StageProfile.memo=False (threaded to DagDriver memo=False): the shared sub-lemma C is proved
+    FRESH on BOTH branches — zero cache_hit trace events, zero DAG cache_hits, and C's prover is
+    invoked twice (two prove attempts). Correctness is unchanged (the goal still proves)."""
+    prover = DictProver({"C": valid_ledger("C")})
+    decomp = DictDecomposer({
+        "G": (sketch("G", ["A", "B"]), ["A", "B"]),
+        "A": (sketch("A", ["C"]), ["C"]),
+        "B": (sketch("B", ["C"]), ["C"]),
+    })
+    trace = RunTrace("t")
+    driver = DagDriver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                       toolkit=TOOLKIT, budget=Budget(), trace=trace, memo=False)
+    res = driver.run("G")
+    assert res.proven                                   # correctness unchanged
+    assert res.dag.cache_hits == 0                       # no cross-branch reuse counted
+    assert res.trace.by_kind("cache_hit") == []         # zero cache_hit trace events
+    # C's leaf prover was invoked on BOTH branches (two fresh prove attempts), not memoized once.
+    c_proves = [e for e in res.trace.by_kind("prove_node") if e.data.get("goal") == "C"]
+    assert len(c_proves) == 2
+
+
+def test_memo_on_by_default_matches_shared_lemma_memoized():
+    """The memo default is True: a DagDriver built without memo= behaves EXACTLY like the memoized
+    baseline (a shared lemma is reused; cache_hits >= 1). Pins the default is byte-identical."""
+    prover = DictProver({"C": valid_ledger("C")})
+    decomp = DictDecomposer({
+        "G": (sketch("G", ["A", "B"]), ["A", "B"]),
+        "A": (sketch("A", ["C"]), ["C"]),
+        "B": (sketch("B", ["C"]), ["C"]),
+    })
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW])).run("G")
+    assert res.proven and res.dag.cache_hits >= 1
+
+
 # ---- acyclicity: a self-referential decomposition cannot loop forever ----
 
 def test_cycle_is_refused_and_terminates():

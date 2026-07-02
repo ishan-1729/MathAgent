@@ -1505,6 +1505,8 @@ def build_evolve_config(
     *,
     llm=None,
     claude_cfg: Optional[ClaudeConfig] = None,
+    breadth_model: str = "sonnet",
+    depth_model: str = "opus",
     breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
     depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
     rank_signal: Optional[RankSignal] = None,
@@ -1548,12 +1550,14 @@ def build_evolve_config(
         models = [LLMModelConfig(name="stub-evolve", weight=1.0, init_client=_FixedLLMFactory(llm))]
         diff_based = False
     else:
-        # Real AlphaEvolve ensemble: breadth (Sonnet, high weight) + depth (Opus, low weight).
+        # Real AlphaEvolve ensemble: breadth (fast, high weight) + depth (stronger, low weight). The
+        # two model NAMES are parameterized (default Sonnet/Opus) so a profile can address the ensemble;
+        # each LLMModelConfig.name AND its _ClaudeLLMFactory reflect the chosen model.
         models = [
-            LLMModelConfig(name="sonnet", weight=breadth_weight,
-                           init_client=_ClaudeLLMFactory("sonnet", claude_cfg)),
-            LLMModelConfig(name="opus", weight=depth_weight,
-                           init_client=_ClaudeLLMFactory("opus", claude_cfg)),
+            LLMModelConfig(name=breadth_model, weight=breadth_weight,
+                           init_client=_ClaudeLLMFactory(breadth_model, claude_cfg)),
+            LLMModelConfig(name=depth_model, weight=depth_weight,
+                           init_client=_ClaudeLLMFactory(depth_model, claude_cfg)),
         ]
         diff_based = True
 
@@ -1628,6 +1632,8 @@ def evolve_sketches(
     *,
     llm=None,
     claude_cfg: Optional[ClaudeConfig] = None,
+    breadth_model: str = "sonnet",
+    depth_model: str = "opus",
     breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
     depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
     rank_signal: Optional[RankSignal] = None,
@@ -1657,6 +1663,7 @@ def evolve_sketches(
 
     config = build_evolve_config(
         llm=llm, claude_cfg=claude_cfg,
+        breadth_model=breadth_model, depth_model=depth_model,
         breadth_weight=breadth_weight, depth_weight=depth_weight, rank_signal=rank_signal,
         iterations=iterations, num_islands=num_islands, feature_bins=feature_bins,
     )
@@ -1830,6 +1837,8 @@ class OpenEvolveBackend:
 
     def __init__(self, toolkit, claude_cfg: Optional[ClaudeConfig] = None, *,
                  generations: int = 20, llm=None,
+                 breadth_model: str = "sonnet",
+                 depth_model: str = "opus",
                  breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
                  depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
                  rank_signal: Optional[RankSignal] = None,
@@ -1838,6 +1847,9 @@ class OpenEvolveBackend:
         self.claude_cfg = claude_cfg or ClaudeConfig()
         self.generations = generations
         self.llm = llm
+        # Profile-addressable ensemble: which models search (names) and their sampling mix (weights).
+        self.breadth_model = breadth_model
+        self.depth_model = depth_model
         self.breadth_weight = breadth_weight
         self.depth_weight = depth_weight
         # P3 rank-aware routing + P2 retrieval-seeded islands (both optional / back-compat None).
@@ -1851,6 +1863,7 @@ class OpenEvolveBackend:
     def decompose(self, goal: str, feedback: Optional[list[str]] = None) -> tuple[str, list[str]]:
         sketch, _fitness, _metrics = evolve_sketches(
             goal, self.toolkit, llm=self.llm, claude_cfg=self.claude_cfg,
+            breadth_model=self.breadth_model, depth_model=self.depth_model,
             breadth_weight=self.breadth_weight, depth_weight=self.depth_weight,
             rank_signal=self.rank_signal, retriever=self.retriever,
             iterations=self.generations,

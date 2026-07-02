@@ -167,8 +167,13 @@ def build_driver(profile: RunProfile, *, toolkit: Optional[Toolkit] = None,
     terminal_gate = None
     node_verifier = None
     sketch_verifier = None
-    if policy.attach_terminal_gate or policy.attach_per_node_lean:
-        # Warm ONE shared Lean server reused by the terminal + per-node gates (Mathlib loaded once).
+    if (policy.attach_terminal_gate or policy.attach_per_node_lean) and profile.lean.server:
+        # Warm ONE shared Lean server reused by the terminal + per-node gates (Mathlib loaded once) —
+        # ONLY when lean.server is True. With lean.server=False a gate still attaches but is threaded
+        # server=None, so each compile uses the per-call lean fallback the gates already support (no
+        # persistent REPL). The supervisor (S10) has already ensured per_node => server, so a per-node
+        # gate never reaches this branch with lean.server=False; the terminal gate may (server-less
+        # terminal audit via per-call lean).
         server = _warm_lean_server()
     if policy.attach_terminal_gate:
         terminal_gate = _make_terminal_gate(profile, toolkit, server)
@@ -198,6 +203,7 @@ def build_driver(profile: RunProfile, *, toolkit: Optional[Toolkit] = None,
         lean_strict=profile.lean.strict,
         lean_server=server,
         enforce_elementarity=policy.enforce_elementarity,
+        memo=stages.memo,
     )
 
 
@@ -221,15 +227,23 @@ def _resolve_evolve_fallback(profile: RunProfile, toolkit: Toolkit):
             cfg_kwargs["model"] = spec.model
         if spec.timeout_s is not None:
             cfg_kwargs["timeout_s"] = spec.timeout_s
+        # Thread the profile-addressable breadth/depth ensemble (model names + weights) into the backend.
+        ens = profile.ensemble
         return OpenEvolveBackend(toolkit, ClaudeConfig(**cfg_kwargs),
-                                 generations=profile.stages.evolve_fallback)
+                                 generations=profile.stages.evolve_fallback,
+                                 breadth_model=ens.breadth_model, depth_model=ens.depth_model,
+                                 breadth_weight=ens.breadth_weight, depth_weight=ens.depth_weight)
     except Exception:
         return None
 
 
-def build_and_run(profile: RunProfile, goal: str) -> DagResult:
-    """Validate + build (via :func:`build_driver`) then ``.run(goal)``. The one-call entry point."""
-    driver = build_driver(profile)
+def build_and_run(profile: RunProfile, goal: str, *, toolkit: Optional[Toolkit] = None,
+                  trace: Optional[RunTrace] = None) -> DagResult:
+    """Validate + build (via :func:`build_driver`) then ``.run(goal)``. The one-call entry point.
+
+    Forwards the optional ``toolkit``/``trace`` to :func:`build_driver` (previously dropped) so a caller
+    can share one toolkit/trace across a build_and_run just as with build_driver."""
+    driver = build_driver(profile, toolkit=toolkit, trace=trace)
     return driver.run(goal)
 
 

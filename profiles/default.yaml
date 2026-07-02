@@ -4,7 +4,7 @@
 # (population/refine/evolve off), no Lean gates, DAG mode, depth 3. This is the BYTE-IDENTICAL
 # pre-feature search path expressed as data; it relies on the RunProfile field defaults (so every role
 # is provider=claude with its per-role default model: prover/refiner=opus, decomposer/reviewer/
-# formalizer/faithfulness=sonnet, comparator/judge=haiku).
+# comparator/judge/formalizer/faithfulness=sonnet).
 name: default
 notes: "Claude-backed default: soft elementarity, decompose+review, no Lean."
 mode: dag

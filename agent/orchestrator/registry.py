@@ -156,21 +156,24 @@ def _claude_reviewer(spec: RoleSpec, deps: Deps) -> object:
 def _claude_comparator(spec: RoleSpec, deps: Deps) -> object:
     from agent.tools.claude_roles import ClaudeComparator
 
-    return ClaudeComparator(_claude_cfg(spec, "haiku"))
+    return ClaudeComparator(_claude_cfg(spec, "sonnet"))
 
 
 @register(Role.judge, ProviderKey.claude)
 def _claude_judge(spec: RoleSpec, deps: Deps) -> object:
     from agent.tools.claude_roles import ClaudeJudge
 
-    return ClaudeJudge(_claude_cfg(spec, "haiku"))
+    return ClaudeJudge(_claude_cfg(spec, "sonnet"))
 
 
 @register(Role.formalizer, ProviderKey.claude)
 def _claude_formalizer(spec: RoleSpec, deps: Deps) -> object:
     from agent.tools.formalizer import ClaudeFormalizer
 
-    return ClaudeFormalizer(deps.require_toolkit(), _claude_cfg(spec, "opus"))
+    # default_model="sonnet" aligns with RolesProfile.formalizer (which always pins a model, so this
+    # fallback is a belt-and-braces default the RoleSpec normally overrides — e.g. authoritative.yaml
+    # pins opus). It was formerly "opus" (dead/unreachable and inconsistent with RolesProfile).
+    return ClaudeFormalizer(deps.require_toolkit(), _claude_cfg(spec, "sonnet"))
 
 
 @register(Role.faithfulness, ProviderKey.claude)

@@ -195,6 +195,59 @@ def test_direct_mode_with_authoritative_is_rejected_by_supervisor():
         build_driver(bad)
 
 
+# ---- lean.server wiring (item 3): warm the persistent server ONLY when lean.server=True ---------
+
+def _authoritative_offline(**lean_kw):
+    """An offline AUTHORITATIVE profile (scripted roles) with a consistent LeanProfile: terminal=True
+    (S9 requires terminal == authoritative). The scripted formalizer keeps the terminal gate buildable
+    offline. Extra lean_kw override the LeanProfile fields (e.g. server=True/False)."""
+    lean = {"terminal": True}
+    lean.update(lean_kw)
+    return _profile(elementarity=ElementarityLevel.authoritative, lean=lean)
+
+
+def test_terminal_gate_with_server_false_does_not_warm_lean_server(monkeypatch):
+    """elementarity=authoritative attaches the terminal gate, but with lean.server=False the builder must
+    NOT warm a persistent LeanServer (the gate is threaded server=None -> per-call lean fallback)."""
+    import agent.orchestrator.builder as builder_mod
+    calls = {"warm": 0}
+    monkeypatch.setattr(builder_mod, "_warm_lean_server",
+                        lambda: calls.__setitem__("warm", calls["warm"] + 1) or None)
+    d = build_driver(_authoritative_offline(server=False))
+    assert calls["warm"] == 0                 # server=False -> never warmed
+    assert d.terminal_gate is not None        # the terminal gate still attaches
+    assert d.lean_server is None              # threaded server=None (per-call lean)
+
+
+def test_terminal_gate_with_server_true_warms_lean_server(monkeypatch):
+    """With lean.server=True the builder DOES call _warm_lean_server and threads its result in."""
+    import agent.orchestrator.builder as builder_mod
+    sentinel = object()
+    calls = {"warm": 0}
+
+    def _fake_warm():
+        calls["warm"] += 1
+        return sentinel
+
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", _fake_warm)
+    d = build_driver(_authoritative_offline(server=True))
+    assert calls["warm"] == 1
+    assert d.terminal_gate is not None
+    assert d.lean_server is sentinel
+
+
+# ---- memo toggle (item 5): StageProfile.memo threads into the driver ----------------------------
+
+def test_memo_default_true_threads_into_driver():
+    d = build_driver(_profile())
+    assert d.memo is True
+
+
+def test_memo_false_threads_into_driver():
+    d = build_driver(_profile(stages=StageProfile(memo=False)))
+    assert d.memo is False
+
+
 # ---- toolkit sharing + trace naming ------------------------------------------------------------
 
 def test_build_driver_shares_one_toolkit_across_roles():
@@ -243,3 +296,24 @@ def test_build_and_run_proves_with_a_goal_bound_scripted_prover(monkeypatch):
         registry_mod.PROVIDERS[key] = saved
     assert res.proven is True
     assert res.dag.get(res.dag.get_or_create("G").key).proof_kind == "direct"
+
+
+def test_build_and_run_forwards_toolkit_and_trace(monkeypatch):
+    """item 7: build_and_run forwards the optional toolkit/trace to build_driver (previously dropped),
+    so a caller can share one toolkit + trace across the build_and_run call."""
+    from agent.gates.toolkit import load_toolkit
+    from agent.orchestrator.trace import RunTrace
+    tk = load_toolkit()
+    trace = RunTrace("shared-trace")
+    seen = {}
+    import agent.orchestrator.builder as builder_mod
+    real_build = builder_mod.build_driver
+
+    def spy(profile, *, toolkit=None, trace=None):
+        seen["toolkit"] = toolkit
+        seen["trace"] = trace
+        return real_build(profile, toolkit=toolkit, trace=trace)
+
+    monkeypatch.setattr(builder_mod, "build_driver", spy)
+    build_and_run(_profile(), "G", toolkit=tk, trace=trace)
+    assert seen["toolkit"] is tk and seen["trace"] is trace

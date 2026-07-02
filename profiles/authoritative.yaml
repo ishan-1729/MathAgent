@@ -16,6 +16,13 @@ stages:
   evolve_fallback: 0
   refine: false
   h0_consistency: true
+roles:
+  # Pin the formalizer to Opus: live-run evidence shows the Opus ClaudeFormalizer is what cleared the
+  # autoformalization reach map for the terminal Layer-4 gate (the other roles keep their profile
+  # defaults: provider=claude, per-role default model).
+  formalizer:
+    provider: claude
+    model: opus
 budgets:
   max_llm_calls: 60
   max_depth: 3

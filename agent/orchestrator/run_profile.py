@@ -95,8 +95,9 @@ class RolesProfile(BaseModel):
     """One RoleSpec per role.
 
     Each role defaults to ``provider=claude`` with a sensible per-role model:
-    prover/refiner = opus; decomposer/reviewer/formalizer/faithfulness = sonnet;
-    comparator/judge = haiku.
+    prover/refiner = opus; decomposer/reviewer/comparator/judge/formalizer/faithfulness = sonnet.
+    (comparator/judge default to sonnet — not haiku — for roster compliance: the pairwise
+    Elo/judge panels are soundness-adjacent enough to warrant sonnet over the smaller model.)
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -104,8 +105,8 @@ class RolesProfile(BaseModel):
     prover: RoleSpec = Field(default_factory=lambda: _claude("opus"))
     decomposer: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
     reviewer: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
-    comparator: RoleSpec = Field(default_factory=lambda: _claude("haiku"))
-    judge: RoleSpec = Field(default_factory=lambda: _claude("haiku"))
+    comparator: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
+    judge: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
     formalizer: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
     faithfulness: RoleSpec = Field(default_factory=lambda: _claude("sonnet"))
     refiner: RoleSpec = Field(default_factory=lambda: _claude("opus"))
@@ -122,6 +123,29 @@ class StageProfile(BaseModel):
     evolve_fallback: int = 0
     refine: bool = False
     h0_consistency: bool = True
+    # MEMOIZATION toggle (ablation axis). True (the default) keeps the split-keyed goal cache: a proven
+    # subgoal is reused across branches. False makes every node prove FRESH — the driver skips the goal
+    # cache reads (no cross-branch short-circuit / cache_hit) so an identical repeated subgoal is
+    # re-attempted. Correctness is unchanged (the split-keyed memo module itself is untouched); this only
+    # lets an ablation MEASURE the memo's contribution.
+    memo: bool = True
+
+
+class EnsembleProfile(BaseModel):
+    """The breadth/depth OpenEvolve ensemble knobs (which models search, and their sampling mix).
+
+    The AlphaEvolve-style ensemble pairs a FAST breadth model (sampled often, high weight) with a
+    STRONGER depth model (sampled rarely, low weight). These fields make that mix profile-addressable:
+    the builder threads them into the OpenEvolve backend. Defaults match the historical hardcoded
+    Sonnet-breadth / Opus-depth 0.8/0.2 split so existing callers are unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    breadth_model: str = "sonnet"
+    depth_model: str = "opus"
+    breadth_weight: float = 0.8
+    depth_weight: float = 0.2
 
 
 class LeanProfile(BaseModel):
@@ -168,6 +192,7 @@ class RunProfile(BaseModel):
     roles: RolesProfile = Field(default_factory=RolesProfile)
     budgets: BudgetProfile = Field(default_factory=BudgetProfile)
     lean: LeanProfile = Field(default_factory=LeanProfile)
+    ensemble: EnsembleProfile = Field(default_factory=EnsembleProfile)
 
     # -- loading -------------------------------------------------------------- #
     @classmethod

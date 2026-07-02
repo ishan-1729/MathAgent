@@ -126,7 +126,7 @@ def test_claude_honors_spec_model_default_when_none():
     c = resolve(Role.prover, RoleSpec(provider=ProviderKey.claude), _deps())
     assert c.cfg.model == "opus"  # per-role default
     c2 = resolve(Role.comparator, RoleSpec(provider=ProviderKey.claude), _deps())
-    assert c2.cfg.model == "haiku"
+    assert c2.cfg.model == "sonnet"  # per-role default (roster compliance: haiku -> sonnet)
 
 
 def test_claude_honors_explicit_spec_model():

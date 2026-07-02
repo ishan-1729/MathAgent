@@ -149,6 +149,7 @@ class DagDriver:
         lean_strict: bool = False,
         lean_server: Optional[object] = None,
         enforce_elementarity: bool = True,
+        memo: bool = True,
     ):
         self.prover = prover
         self.decomposer = decomposer
@@ -182,7 +183,13 @@ class DagDriver:
         # across branches; a context change invalidates a stale PROVEN. The context hash is computed
         # ONCE from the loaded toolkit and stamped onto every certificate the DAG mints.
         self.context_hash = proof_context_hash(self.toolkit)
-        self.dag = ProofDAG(context=self.context_hash)
+        # MEMOIZATION toggle (StageProfile.memo). True (default) keeps the split-keyed goal cache; False
+        # makes every node prove FRESH — the driver skips the proven-node READ short-circuit below and the
+        # DAG counts no cache hits, so an identical repeated subgoal is re-attempted (two prove attempts).
+        # The split-keyed memo module itself is untouched; only its READ is gated. Correctness is
+        # unchanged (a fresh re-proof of the same goal yields the same verdict).
+        self.memo = bool(memo)
+        self.dag = ProofDAG(context=self.context_hash, memo=self.memo)
         # P2 (forge_relevance_study §7): the SAFE parallel fan-out CAP for proving committed AND
         # children. The number of children proved in one wave is bounded by the Dilworth antichain
         # WIDTH of the open, all-deps-met children (a deep chain -> width 1, never over-spawn) AND a
@@ -340,11 +347,14 @@ class DagDriver:
         # the terminal failure states short-circuit here. EXHAUSTED is deliberately NOT memoized as a
         # cached failure: a node that only failed because it hit the depth limit (or ran out of budget)
         # on one branch may still be provable on a shallower branch, so it must stay re-attemptable.
-        if node.proven:
-            self.trace.emit("cache_hit", goal=goal[:80])
-            return True
-        if node.state in (NodeState.FAILED_GAP, NodeState.FAILED_ELEMENTARY):
-            return False
+        # With memo OFF (StageProfile.memo=False) BOTH memo READ short-circuits are skipped so every
+        # goal proves FRESH (a repeated identical subgoal is re-attempted; no cache_hit is emitted).
+        if self.memo:
+            if node.proven:
+                self.trace.emit("cache_hit", goal=goal[:80])
+                return True
+            if node.state in (NodeState.FAILED_GAP, NodeState.FAILED_ELEMENTARY):
+                return False
         if key in ancestors:               # cycle (defensive; commit guards this too)
             return False
         if depth > self.max_depth:

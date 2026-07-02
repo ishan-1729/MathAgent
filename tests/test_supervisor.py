@@ -3,7 +3,7 @@
 Every test monkeypatches the lazy capability probes in
 ``agent.orchestrator.supervisor`` so NO live model/Lean/openevolve call happens.
 
-For each guard S1..S8 we assert two things:
+For each guard S1..S11 we assert two things:
 
 * it FIRES on its offending profile, with a clear, field-naming message; and
 * (minimal restrictiveness) a coherent profile with that capability present PASSES,
@@ -81,9 +81,12 @@ def test_validate_is_fast(monkeypatch):
 # --------------------------------------------------------------------------- #
 # S1: authoritative => formalizer resolvable AND Lean reachable.              #
 # --------------------------------------------------------------------------- #
+# NOTE: an authoritative profile must ALSO set lean.terminal=True (S9: terminal is derived from
+# elementarity), so these S1 profiles carry the consistent LeanProfile(terminal=True).
 def test_s1_authoritative_requires_lean(monkeypatch):
     monkeypatch.setattr(sup, "_lean_available", lambda: False)
-    prof = _profile(elementarity=ElementarityLevel.authoritative)
+    prof = _profile(elementarity=ElementarityLevel.authoritative,
+                    lean=LeanProfile(terminal=True))
     with pytest.raises(SupervisorError) as ei:
         validate_profile(prof)
     assert "authoritative" in str(ei.value).lower()
@@ -100,6 +103,7 @@ def test_s1_authoritative_requires_formalizer(monkeypatch):
     )
     prof = _profile(
         elementarity=ElementarityLevel.authoritative,
+        lean=LeanProfile(terminal=True),
         roles=_roles_with(Role.formalizer, RoleSpec(provider=ProviderKey.codex)),
     )
     with pytest.raises(SupervisorError) as ei:
@@ -111,7 +115,8 @@ def test_s1_authoritative_requires_formalizer(monkeypatch):
 
 
 def test_s1_authoritative_passes_when_available():
-    prof = _profile(elementarity=ElementarityLevel.authoritative)
+    prof = _profile(elementarity=ElementarityLevel.authoritative,
+                    lean=LeanProfile(terminal=True))
     assert validate_profile(prof) is None
 
 
@@ -125,9 +130,10 @@ def test_s2_per_node_requires_formalizer(monkeypatch):
         "_PROVIDER_PROBE",
         {ProviderKey.claude: sup._claude_available, ProviderKey.codex: sup._codex_available},
     )
+    # per_node also requires server=True (S10), so carry the consistent LeanProfile.
     prof = _profile(
         elementarity=ElementarityLevel.soft,
-        lean=LeanProfile(per_node=True),
+        lean=LeanProfile(per_node=True, server=True),
         roles=_roles_with(Role.formalizer, RoleSpec(provider=ProviderKey.codex)),
     )
     with pytest.raises(SupervisorError) as ei:
@@ -137,7 +143,8 @@ def test_s2_per_node_requires_formalizer(monkeypatch):
 
 
 def test_s2_per_node_passes_with_claude_formalizer():
-    prof = _profile(elementarity=ElementarityLevel.soft, lean=LeanProfile(per_node=True))
+    prof = _profile(elementarity=ElementarityLevel.soft,
+                    lean=LeanProfile(per_node=True, server=True))
     assert validate_profile(prof) is None
 
 
@@ -282,6 +289,88 @@ def test_s8_scripted_via_notes_token():
         notes="this is an offline fixture",
         roles=_roles_with(Role.prover, RoleSpec(provider=ProviderKey.scripted)),
     )
+    assert validate_profile(prof) is None
+
+
+# --------------------------------------------------------------------------- #
+# S9: lean.terminal must equal (elementarity == authoritative).               #
+# --------------------------------------------------------------------------- #
+def test_s9_authoritative_without_terminal_rejected():
+    # authoritative but lean.terminal=False (the default) contradicts the derivation.
+    prof = _profile(elementarity=ElementarityLevel.authoritative, lean=LeanProfile(terminal=False))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    msg = str(ei.value).lower()
+    assert "terminal" in msg and "authoritative" in msg
+
+
+def test_s9_soft_with_terminal_rejected():
+    # soft (non-authoritative) but lean.terminal=True likewise contradicts the derivation.
+    prof = _profile(elementarity=ElementarityLevel.soft, lean=LeanProfile(terminal=True))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    assert "terminal" in str(ei.value).lower()
+
+
+def test_s9_authoritative_with_terminal_passes():
+    prof = _profile(elementarity=ElementarityLevel.authoritative, lean=LeanProfile(terminal=True))
+    assert validate_profile(prof) is None
+
+
+def test_s9_soft_without_terminal_passes():
+    prof = _profile(elementarity=ElementarityLevel.soft, lean=LeanProfile(terminal=False))
+    assert validate_profile(prof) is None
+
+
+# --------------------------------------------------------------------------- #
+# S10: lean.per_node => lean.server.                                          #
+# --------------------------------------------------------------------------- #
+def test_s10_per_node_requires_server():
+    prof = _profile(elementarity=ElementarityLevel.soft,
+                    lean=LeanProfile(per_node=True, server=False))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    msg = str(ei.value).lower()
+    assert "per_node" in msg and "server" in msg
+
+
+def test_s10_per_node_with_server_passes():
+    prof = _profile(elementarity=ElementarityLevel.soft,
+                    lean=LeanProfile(per_node=True, server=True))
+    assert validate_profile(prof) is None
+
+
+# --------------------------------------------------------------------------- #
+# S11: ensemble weights non-negative with positive sum; model names non-empty. #
+# --------------------------------------------------------------------------- #
+def test_s11_negative_weight_rejected():
+    from agent.orchestrator.run_profile import EnsembleProfile
+    prof = _profile(ensemble=EnsembleProfile(breadth_weight=-0.1))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    assert "non-negative" in str(ei.value).lower()
+
+
+def test_s11_all_zero_weights_rejected():
+    from agent.orchestrator.run_profile import EnsembleProfile
+    prof = _profile(ensemble=EnsembleProfile(breadth_weight=0.0, depth_weight=0.0))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    assert "sum to 0" in str(ei.value).lower()
+
+
+def test_s11_empty_model_name_rejected():
+    from agent.orchestrator.run_profile import EnsembleProfile
+    prof = _profile(ensemble=EnsembleProfile(breadth_model="  "))
+    with pytest.raises(SupervisorError) as ei:
+        validate_profile(prof)
+    assert "model" in str(ei.value).lower()
+
+
+def test_s11_custom_ensemble_passes():
+    from agent.orchestrator.run_profile import EnsembleProfile
+    prof = _profile(ensemble=EnsembleProfile(breadth_model="haiku-test", depth_model="opus",
+                                             breadth_weight=0.5, depth_weight=0.5))
     assert validate_profile(prof) is None
 
 

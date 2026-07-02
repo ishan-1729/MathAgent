@@ -51,12 +51,13 @@ def test_roles_satisfy_their_protocols():
 
 
 def test_default_models_match_role_tiers():
-    # prover/refiner=opus, decomposer/reviewer/faithfulness=sonnet, comparator/judge=haiku
+    # prover/refiner=opus, decomposer/reviewer/faithfulness=sonnet, comparator/judge=sonnet
+    # (roster rule: Haiku is not used anywhere, even as a bare-constructor default)
     assert ClaudeProver(FakeToolkit()).cfg.model == "opus"
     assert ClaudeDecomposer(FakeToolkit()).cfg.model == "sonnet"
     assert ClaudeReviewer(FakeToolkit()).cfg.model == "sonnet"
-    assert ClaudeComparator().cfg.model == "haiku"
-    assert ClaudeJudge().cfg.model == "haiku"
+    assert ClaudeComparator().cfg.model == "sonnet"
+    assert ClaudeJudge().cfg.model == "sonnet"
     assert ClaudeFaithfulnessChecker().cfg.model == "sonnet"
 
 

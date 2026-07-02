@@ -7,7 +7,7 @@ prompts, same shared CLI-JSON parsers (:mod:`agent.tools._cli_json`), and the SA
 ``RevisionController``) so every role plugs into the EXISTING Protocols the DAG/tournament expect.
 
 Each role takes a per-role :class:`ClaudeConfig` (so the registry can pin ``model=spec.model`` —
-prover/refiner=opus, decomposer/reviewer/faithfulness=sonnet, comparator/judge=haiku). The default
+prover/refiner=opus, decomposer/reviewer/faithfulness=sonnet, comparator/judge=sonnet). The default
 model is the codex/maintainer-sensible one for that role.
 
 SAFETY: like the Codex roles, these only *generate text*. Nothing here ``exec``/``eval``/``import``s
@@ -128,10 +128,10 @@ class ClaudeReviewer:
 class ClaudeComparator:
     """Pairwise judge for the population/Elo search: which candidate decomposition is more promising?
 
-    Mirrors :class:`agent.tools.codex_prover.CodexComparator`; Haiku by default (cheap pairwise calls)."""
+    Mirrors :class:`agent.tools.codex_prover.CodexComparator`; Sonnet by default (cheap pairwise calls)."""
 
     def __init__(self, cfg: Optional[ClaudeConfig] = None):
-        self.cfg = cfg or ClaudeConfig(model="haiku")
+        self.cfg = cfg or ClaudeConfig(model="sonnet")
 
     def compare(self, a: Candidate, b: Candidate) -> int:
         prompt = (
@@ -269,11 +269,11 @@ class ClaudeSynthesizer:
 class ClaudeJudge:
     """Pairwise judge for the incumbent tournament: which candidate solution/proof is better?
 
-    Mirrors :class:`agent.tools.codex_prover.CodexSolutionComparator` (the ``judge`` role); Haiku by
+    Mirrors :class:`agent.tools.codex_prover.CodexSolutionComparator` (the ``judge`` role); Sonnet by
     default. Returns 1 if A is better, -1 if B, 0 for a tie (a :class:`Comparator`)."""
 
     def __init__(self, cfg: Optional[ClaudeConfig] = None):
-        self.cfg = cfg or ClaudeConfig(model="haiku")
+        self.cfg = cfg or ClaudeConfig(model="sonnet")
 
     def compare(self, a: Candidate, b: Candidate) -> int:
         prompt = (

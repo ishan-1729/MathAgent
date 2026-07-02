@@ -255,6 +255,43 @@ def test_build_config_is_sonnet_opus_ensemble(toolkit):
     assert config.diff_based_evolution is True
 
 
+def test_build_config_honors_ensemble_model_names_and_weights(toolkit):
+    """item 6: build_evolve_config parameterizes the breadth/depth MODEL NAMES (defaults sonnet/opus).
+    A profile-addressable ensemble {breadth_model: haiku-test, depth_model: opus, weights 0.5/0.5}
+    produces an evolve config whose llm.models reflect those names AND weights (offline — no LLM call)."""
+    pytest.importorskip("openevolve")
+    config = build_evolve_config(breadth_model="haiku-test", depth_model="opus",
+                                 breadth_weight=0.5, depth_weight=0.5)
+    names = [m.name for m in config.llm.models]
+    assert names == ["haiku-test", "opus"]
+    weights = {m.name: m.weight for m in config.llm.models}
+    assert weights["haiku-test"] == 0.5 and weights["opus"] == 0.5
+    # Each member's factory is bound to the chosen model name (not the old hardcoded sonnet/opus).
+    factories = {m.name: m.init_client for m in config.llm.models}
+    assert isinstance(factories["haiku-test"], _ClaudeLLMFactory)
+    assert factories["haiku-test"].model_name == "haiku-test"
+    assert factories["opus"].model_name == "opus"
+
+
+def test_openevolve_backend_threads_ensemble_into_evolve_sketches(toolkit, monkeypatch):
+    """OpenEvolveBackend forwards its breadth/depth model names + weights into evolve_sketches (which
+    passes them to build_evolve_config). We spy on evolve_sketches and inspect the forwarded kwargs —
+    offline, no evolution run."""
+    import agent.tools.openevolve_bridge as oe
+    seen = {}
+
+    def _spy(goal, tk, **kw):
+        seen.update(kw)
+        return ("{}", 0.0, {})
+
+    monkeypatch.setattr(oe, "evolve_sketches", _spy)
+    backend = OpenEvolveBackend(toolkit, breadth_model="haiku-test", depth_model="opus",
+                                breadth_weight=0.3, depth_weight=0.7)
+    backend.decompose("A goal.")
+    assert seen["breadth_model"] == "haiku-test" and seen["depth_model"] == "opus"
+    assert seen["breadth_weight"] == 0.3 and seen["depth_weight"] == 0.7
+
+
 def test_build_config_stub_path_is_full_rewrite(toolkit):
     pytest.importorskip("openevolve")
     stub = StubEvolveLLM([_good_ledger_text()])
