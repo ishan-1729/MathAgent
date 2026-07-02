@@ -10,6 +10,33 @@
 > (unlike numeric constraints such as integrality). Hence soft pruning + a hard verification gate, never a
 > single soft judge.
 
+## Target theory T (what "elementary" certifies)
+
+The Layer-4 certificate does **not** assert the canonical mathematical property "this proof is elementary" —
+there is no such canonical property. As the constraint-induction synthesis documents
+([`research/docs/constraint_induction_2026-06-28.md`](../../research/docs/constraint_induction_2026-06-28.md),
+§1a and open question #1), "elementary" has no single accepted definition (the informal "no complex analysis"
+sense, first-order PA, IΔ₀+exp, the reverse-math Big Five, and Buss's feasible S¹₂ are mutually inequivalent),
+so any operational definition is a **stipulation, not a discovered fact**.
+
+What the audit actually decides is the *decidable* predicate **"this proof term's transitive
+dependency/axiom footprint is contained in a stipulated fragment T"** — where T is delimited by
+[`denylist.yaml`](denylist.yaml) (`lean_denylist_decls` — the content-bearing declarations excluded from T,
+minus the `lean_infrastructure_allowlist` / `lean_elementary_by_fiat` carve-outs) together with the positive
+vocabulary in [`allowed_toolkit.yaml`](allowed_toolkit.yaml), over the benign-axiom base
+`{propext, Classical.choice, Quot.sound}`. Informally T is a PA / IΔ₀+exp-flavored fragment of elementary
+number theory, but the *authoritative* meaning of "elementary" here is exactly and only "footprint ⊆ T as those
+two YAML files currently define it." (By Gödel/Church–Turing the complementary claim — "φ has *no* elementary
+proof" — is undecidable, so this gate is sound-but-incomplete *by theorem*, not by effort: it can over-reject a
+genuinely-elementary proof whose only found derivation routes through a denylisted lemma.)
+
+Because T is a stipulated, human-authored, versioned approximation, **the denylist version and the toolchain
+hash are part of the verdict's identity**: the same proof term can be `PROVEN`-elementary under one revision of
+`denylist.yaml`/`allowed_toolkit.yaml` and rejected under the next (the `ℤ[i]`/`Zsqrtd` additions of 2026-06-28
+are exactly such a revision). A Layer-4 verdict is therefore only meaningful relative to the denylist/allowlist
+revision and Lean/Mathlib toolchain that produced it — treat "certified elementary" as shorthand for "footprint
+⊆ T@\<denylist-version, toolchain-hash\>", never as a canonical mathematical property.
+
 ## The dual gate
 
 ### Soft gates (rank / prune during search — never authoritative)

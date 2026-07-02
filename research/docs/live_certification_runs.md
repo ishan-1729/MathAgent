@@ -148,6 +148,30 @@ GaussianInt` proof now **REJECTS** (`denylisted_dependency 'Zsqrtd.instCommSemir
 `Int`/`ZMod` elementary proofs still pass; offline suite **775 green**. (Boundary choice: this places *any*
 use of `ℤ[√d]` outside "elementary", matching the project's thesis of forcing proofs over ℤ.)
 
-**Robustness gaps surfaced (tracked separately):** a prover/decomposer model-call exception (timeout) propagates
-and crashes `DagDriver.run()` instead of being handled as a failed attempt; and the formalizer is too slow for a
-hard `ℤ[i]` proof at a 600 s cap.
+**Robustness gaps surfaced (tracked separately):**
+
+- **Model-call exception crashes `DagDriver.run()` — CLOSED.** Every live model-call site is now wrapped so a
+  raising prover/decomposer/reviewer/verifier (subprocess timeout, non-zero exit, malformed output) is caught,
+  surfaced on the trace, and classified as a *failed attempt* (`unknown_tool_error`) instead of propagating out
+  of the run: prover in [`ralph.py:71-79`](../../agent/orchestrator/ralph.py) (→ lessons-learned note, next
+  episode); decomposer in [`dag_driver.py:472-481`](../../agent/orchestrator/dag_driver.py) (re-plan/backtrack)
+  and `1286-1292` (skip the candidate in population generation); reviewer in `907-914` (reject the candidate);
+  per-node `node_verifier` in `671-674` (never refutes a clean challenger) and `754-763` (fail-open → soft
+  `PROVEN`); `sketch_verifier` in `857-862` (reject the composition). The budget unit is already spent at each
+  site, so the loop stays bounded and terminates. Regression-tested by `test_raising_decomposer_does_not_crash_run`
+  / `test_raising_reviewer_does_not_crash_run` ([`tests/test_dag_driver.py`](../../tests/test_dag_driver.py)) and
+  `test_raising_prover_does_not_crash_run` ([`tests/test_ralph.py`](../../tests/test_ralph.py)).
+- **Formalizer too slow for a hard `ℤ[i]` proof at a 600 s cap — still open.** The `ℤ[i]` render timed out; the
+  autoformalization frontier is now IMO-hard multi-step proofs (see the reach map above), which stress
+  proof-finding, not just formalization.
+
+**Update — first-class `LEAN_VERIFIED` state landed.** The P5 follow-up ("a first-class `LEAN_VERIFIED` state",
+flagged open in the P0–P2 and P4 sections above) has shipped. `NodeState.LEAN_VERIFIED`
+([`agent/orchestrator/state.py:18`](../../agent/orchestrator/state.py)) is a first-class hard-success state that
+*dominates* `PROVEN` (`is_success` treats both as terminal-success; `state.py:27,37`). It is reachable via
+`ProofDAG.mark_proven_direct(goal, ledger, lean_verified=True)`
+([`dag.py:346-354`](../../agent/orchestrator/dag.py)) for a Lean-confirmed leaf, and via the P4 parent-composition
+rule (`dag.py:390-395`: a parent is `LEAN_VERIFIED` only when its sketch compiled **and** every child is itself
+`LEAN_VERIFIED`). It is consumed by the CLI at
+[`scripts/prove.py:606`](../../scripts/prove.py) (the `--lean-per-node` report distinguishes soft `PROVEN` from
+hard `LEAN_VERIFIED` node counts).

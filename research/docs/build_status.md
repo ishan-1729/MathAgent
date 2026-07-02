@@ -4,6 +4,12 @@
 > (`stamp = sha256(timestamp | full-commit-sha)[:16]` — identifies the exact state this doc describes;
 > regenerate on every edit so a stale doc is detectable.) See the canonical
 > **[`system_design.md`](system_design.md)** for the architecture this status tracks against.
+>
+> **Refreshed 2026-07-03** (bounded truth-up; see the [2026-07-03 addendum](#8-2026-07-03-addendum) for
+> what landed since the base snapshot). The **§5** figure of "380 tests" is the 2026-06-14 state; the
+> offline suite has since grown to **1117 collected / 11 skipped** (the ~380→1117 growth is the P0–P3
+> roadmap remediation, the modular RunProfile control plane, per-node Lean, and the ArXivMath/UI/registry
+> suites). The counts and gap statuses below are annotated inline where they moved.
 
 > Status vocabulary: **data/docs** (curated, non-executable) · **built** (code present, no test asserted here) · **unit-tested** (offline deterministic tests pass) · **LIVE-validated** (exercised against real Lean/Mathlib/Codex) · **partial** (wired but not end-to-end run) · **planned** (placeholder only).
 
@@ -273,6 +279,14 @@ soundness guards, `test_tournament`, `test_dag_driver` refiner/replan, `test_lay
 hardening** suites (see below). The 8 skips are the env-gated live
 paths (`MATHAGENT_LEAN_TESTS` / `MATHAGENT_CODEX_TESTS` / `MATHAGENT_NEURAL_TESTS`).
 
+> **2026-07-03 update:** the offline suite is now **1117 collected / 11 opt-in skipped** (measured
+> `python -m pytest` on 2026-07-03; the 11 skips are the same env-gated live paths). The clean-tree pass
+> count is ~1099; the working tree was mid-refactor at measurement time (uncommitted registry/run-profile
+> WIP), which introduces test-ordering-sensitive failures under random ordering — those are WIP artifacts,
+> not documented-behavior regressions, and do not reflect a committed red suite. Growth ~380→1117 is the
+> P0–P3 remediation, RunProfile control plane, per-node Lean (P0–P4 + `LEAN_VERIFIED`), ablation harness,
+> and the ArXivMath/UI/registry/supervisor suites.
+
 **Run the prover (requires the external `codex` CLI on PATH; `--server`/Mathlib audits need a built ~5 GB `.lake`):**
 
 ```bash
@@ -309,7 +323,14 @@ found, and a follow-up fix campaign closed, a set of soundness/security defects.
   answer-grading mis-classification fixed. New suites: `test_faithfulness_gate`, `test_ralph_review`, plus
   hardening tests across `test_lean_*`, `test_numeric`, `test_obligations`, `test_dag_driver`, `test_answer_check`.
 
-**Tracked follow-ups (non-blocking):** `boundary_rulings` is declared but not yet gate-wired; FlatDriver
+**Tracked follow-ups (non-blocking):** `Toolkit.ruling()` / `boundary_rulings`
+([`agent/gates/toolkit.py:63`](../../agent/gates/toolkit.py); populated from
+[`agent/gates/allowed_toolkit.yaml`](../../agent/gates/allowed_toolkit.yaml) `boundary_rulings`) remain
+**spec-only** — declared and loaded, but *never consulted by a gate to admit or reject anything*. The
+`ruling()` accessor has no callers; the only reader of `boundary_rulings` is `dag.py:147-148`, which folds
+the rulings into the certificate-invalidation context fingerprint (so a tool moving allowed↔disallowed
+invalidates a stale `PROVEN` cert) — that is context-hashing, not a contested-tool ruling being enforced.
+Keep flagged as a documented limitation. FlatDriver
 informal `claim==problem` and ledger `conclusion==claim` remain conditional (robust binding is in the
 orchestrator via `goal_hash`); a shared `canonical_form` between gates and orchestrator is the clean
 refactor; a regression test pinning the Lean shadow-elaborator class is advisable.
@@ -367,7 +388,7 @@ refactor; a regression test pinning the Lean shadow-elaborator class is advisabl
 
 | # | Gap | Next step |
 |---|---|---|
-| 1 | **Autoformalization is still the main wall** — but now with live data: 2/3 of a real NT ladder certified end-to-end (incl. infinite descent); the miss (`3∣a²+b²⇒3∣a∧3∣b`) was a brittle `decide`-over-`Fin`/`ZMod` formalization that failed `Decidable` synthesis, and the 3-iter repair didn't steer off `decide`. | Bias the formalizer/repair prompts toward `omega`/`Int.ModEq`/`ZMod` residue analysis over `decide`; add a "prefer `omega` on a `failed to synthesize Decidable` error" repair hint. Then scale the ladder. |
+| 1 | **Autoformalization wall moved (was the T1-rung miss; now IMO-hard multi-step).** The specific 2026-06-14 miss (`3∣a²+b²⇒3∣a∧3∣b`, brittle `decide`-over-`Fin`/`ZMod` → `Decidable`-synthesis failure) is **CLOSED**: `ClaudeFormalizer` produces a compiling proof using `decide` on the finite `ZMod 3` core only, bridged via `ZMod.intCast_zmod_eq_zero_iff_dvd`, and the winning tactic discipline is encoded in `Formalizer._RULES`. The reach map (live) shows residue casework **and** infinite descent reliably covered at the T1 rung. See [`live_certification_runs.md`](live_certification_runs.md) (2026-06-28 reach map). | Genuine frontier is now **IMO-hard multi-step** proofs (Vieta jumping, coprime-factorization Diophantine, sum-of-two-squares descent), which stress *proof-finding*, not just formalization. Scale the ladder there. |
 | 2 | **No *lift* measured yet** — first live run done (vanilla 80% / harness 3/3 non-regression), but vanilla is at ceiling on this tiny NT subset so the harness had no headroom. | Sweep vanilla across the full 30 (or the harder aggregate items) to find **failures**, then run the harness only on those — the only place lift can show. |
 | 4 | **Statement-faithfulness same-model caveat** — judges/prover can be the same model; no cross-model independence. | Use an independent judge model; widen the lens panel. |
 | 8 | **V_leg AST-legality gate deferred** (LongCat HARD #2: statement-mutation / `unsafe`/`macro`/redefinition / smuggled `import`) — a deterministic AST legality check distinct from the dependency audit. **Deliberately deferred.** | Build the V_leg-style AST legality pass as a coarse first filter backstopping the Layer-4 dependency audit (PLAN §5 Layer 4 item 3). |
@@ -377,3 +398,43 @@ refactor; a regression test pinning the Lean shadow-elaborator class is advisabl
 > Numbering note: #3/#5/#6/#7 are resolved above; #2 is narrowed; #8 is the newly-tracked deferred
 > V_leg gate; #9/#10 are carried forward. Gap #1 (autoformalization) + #2 (real run records) are the
 > two that actually block a first headline result — the search/retrieval/gate machinery is now in place.
+
+---
+
+## 8. 2026-07-03 addendum
+
+Bounded truth-up. The base snapshot (§1–§7) is 2026-06-14; the items below landed since and are
+grounded in current code. This section adds pointers rather than rewriting the history above.
+
+**Landed since the base snapshot:**
+
+- **P0–P3 roadmap remediation — done.** Both report roadmaps (forge §7 + OpenEvolve §9) built across
+  6 remediation rounds; board [`docs/goals/roadmap-p0-p3/state.yaml`](../../docs/goals/roadmap-p0-p3/state.yaml)
+  reports `status: done` with oracle conditions 1+2 holding (the one residual is an *accepted*,
+  Layer-4-bounded, search-signal-only trivial-cover spoof that never yields a false certificate).
+- **Modular RunProfile control plane.** One declarative `RunProfile` (config-as-data) +
+  fail-closed supervisor (`validate_profile`) + Claude-default role registry drives the pipeline;
+  the elementarity toggle is `{none, soft, authoritative}` (`ElementarityLevel` in
+  `agent/orchestrator/run_profile.py`; level→gate-wiring via `elementarity_policy.policy_for`). Ablation
+  harness (`profiles/ablation/`, `scripts/ablate.py`) shipped.
+- **Per-node Lean (P0–P4) + first-class `LEAN_VERIFIED`.** Opt-in per-leaf verifier and AND-node
+  sketch-composition check are live-validated; the P5 `NodeState.LEAN_VERIFIED` hard-success state has
+  landed (`agent/orchestrator/state.py:18`; set by `dag.mark_proven_direct(..., lean_verified=True)` and
+  the P4 composition rule at `dag.py:390-395`; reported by `scripts/prove.py:606`). See
+  [`live_certification_runs.md`](live_certification_runs.md).
+- **Robustness: model-call exceptions no longer crash `DagDriver.run()`.** All live prover/decomposer/
+  reviewer/verifier call sites are wrapped and classify a raise as a failed attempt (`unknown_tool_error`);
+  regression-tested (`test_ralph.py`, `test_dag_driver.py`). See
+  [`live_certification_runs.md`](live_certification_runs.md) ("Robustness gaps surfaced").
+- **Denylist `GaussianInt`/`Zsqrtd` fix.** The 2026-06-28 adversarial probe (`x²+1=y³` → an LLM reached
+  for non-elementary `ℤ[i]` UFD, which Layer-4 *admitted*) exposed a denylist gap; `GaussianInt`, `Zsqrtd`,
+  `Mathlib.NumberTheory.Zsqrtd` are now in `lean_denylist_decls`
+  ([`agent/gates/denylist.yaml:67-69`](../../agent/gates/denylist.yaml)) and the `ℤ[i]` proof now REJECTS.
+- **Target-theory framing documented.** The Layer-4 certificate is now stated as "footprint ⊆ a stipulated,
+  versioned fragment T," not a canonical "elementary" property — see
+  [`agent/gates/README.md`](../../agent/gates/README.md) ("Target theory T") and
+  [`constraint_induction_2026-06-28.md`](constraint_induction_2026-06-28.md) (open question #1).
+
+**Still open (unchanged from §7):** #2 (no measured lift / held-out eval set), #4 (faithfulness cross-model
+independence), #8 (V_leg AST-legality gate), #9 (restricted-import env), #10 (v2 training), and the §5
+`Toolkit.ruling()`/`boundary_rulings` spec-only follow-up.

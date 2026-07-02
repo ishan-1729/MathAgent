@@ -4,8 +4,12 @@
 (GPT 5.5) alike. `AGENTS.md` is a pointer to this file. `README.md` is the layout map.
 
 MathAgent is a **training-free agentic harness** that proves elementary number-theory theorems
-*and* certifies the proof is elementary. A correct **non-elementary** proof is a **failure**, not a
-partial success. Only the Lean **Layer-4** proof-term dependency/axiom audit
+and, when a run enforces elementarity authoritatively (`elementarity=authoritative`), certifies via the
+terminal Layer-4 Lean audit that the proof is elementary. When a run **enforces** elementarity
+(`elementarity=soft` or `authoritative`), a correct but non-elementary proof is an
+elementarity-objective failure (`FAILED_ELEMENTARY`), not a partial success — but never a soundness
+failure. Under `elementarity=none` (e.g. `profiles/solution-only.yaml`) elementarity is not enforced
+and a sound non-elementary proof is reported PROVEN (`soft_proven`). Only the Lean **Layer-4** proof-term dependency/axiom audit
 (`agent/gates/lean_audit.py`, `agent/gates/lean/Audit.lean`) is authoritative for "elementary".
 
 ---
@@ -155,8 +159,9 @@ placeholder with an invented theorem.
   theory, class groups, elliptic curves, modular forms, Catalan/Mihailescu, Baker theory, and
   heavy computational black boxes. This list is the informal complement to the authoritative
   Layer-4 denylist (`agent/gates/denylist.yaml`).
-- You **may** study standard or non-elementary methods for inspiration — but any final proof must
-  be translated into permitted elementary language before it counts.
+- You **may** study standard or non-elementary methods for inspiration — but under an
+  elementarity-enforcing run (`elementarity=soft`/`authoritative`) any final proof must
+  be translated into permitted elementary language before it counts as an elementary result.
 - `research/papers/` is **systems literature** — brainstorming material for agent architectures,
   Lean tooling, workflow configurations, and evaluation designs. It is **not** part of the default
   mathematical context for benchmark proof attempts.
@@ -181,7 +186,9 @@ transformations, examples, downstream moves, failure modes, and Lean-relevant le
 - CLI entry: `scripts/prove.py` (flags incl. `--profile`, `--lean-per-node`, `--lean-strict`).
 - Control lever: `agent/orchestrator/run_profile.py` → `supervisor.validate_profile` (fail-closed)
   → `builder.build_driver` → `registry.resolve` → `DagDriver`. Elementarity toggle
-  `{none, soft, authoritative}` in `agent/orchestrator/elementarity_policy.py`.
+  `{none, soft, authoritative}` = the `ElementarityLevel` enum / `RunProfile.elementarity` field in
+  `agent/orchestrator/run_profile.py`; its level→gate-wiring policy is `policy_for` in
+  `agent/orchestrator/elementarity_policy.py`.
 - Profiles: `profiles/*.yaml` (+ `profiles/ablation/`); ablation sweep `scripts/ablate.py`.
 - The gate: `agent/gates/` — `denylist.yaml`, `obligations.py`, `lean_audit.py`, `Audit.lean`.
 - Persistent memory: `~/.claude/.../memory/` with the `MEMORY.md` index — record one lesson per
