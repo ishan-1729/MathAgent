@@ -13,11 +13,20 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Dataset statements carry Unicode math (e.g. `∣`, `≤`, Greek); make stdout/stderr UTF-8 so --list /
+# --dump don't crash on a legacy Windows codepage (cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
 
 from agent.benchmarks.arxivmath import ArxivMathDataset, run_benchmark
 
@@ -87,8 +96,76 @@ class HarnessAnswerSolver:
         return _extract_final_answer(refined.content)
 
 
+def _run_list_dump(dataset_name: str, args) -> int:
+    """--list / --dump support for the non-answer datasets (arxivlean, brokenarxiv, mathnet).
+
+    These datasets are NOT runnable end-to-end yet: arxivlean needs a Lean checker, brokenarxiv needs a
+    do-not-prove judge, and the MathNet answer-run path is not wired. So the v1 runner only inspects them
+    — it never pretends to "run" what it cannot grade. Solver flags (--dry/--harness/model/effort) are
+    rejected here so nothing is silently ignored."""
+    for bad in ("dry", "harness"):
+        if getattr(args, bad, False):
+            print(f"ERROR: --{bad} is not supported for --dataset {dataset_name} "
+                  f"(only --list / --dump; proof/Lean/false-statement running arrives in a later phase).",
+                  file=sys.stderr)
+            return 2
+    if not (args.list or args.dump):
+        print(f"ERROR: --dataset {dataset_name} supports only --list or --dump for now "
+              f"(proof/Lean/false-statement running arrives in a later phase).", file=sys.stderr)
+        return 2
+
+    if dataset_name == "arxivlean":
+        from agent.benchmarks.arxivlean import ArxivLeanDataset as _DS
+        stmt_attr = "formal_statement"
+    elif dataset_name == "brokenarxiv":
+        from agent.benchmarks.brokenarxiv import BrokenArxivDataset as _DS
+        stmt_attr = "statement"
+    elif dataset_name == "mathnet":
+        from agent.benchmarks.mathnet import MathNetDataset as _DS
+        stmt_attr = "statement"
+    else:  # pragma: no cover - guarded by argparse choices
+        print(f"ERROR: unknown dataset {dataset_name}", file=sys.stderr)
+        return 2
+
+    if args.jsonl:
+        dataset = _DS.from_jsonl(args.jsonl)
+    else:
+        try:
+            if dataset_name == "mathnet":
+                dataset = _DS.from_huggingface(args.hf_config or "all", args.split, args.cache_dir)
+            else:
+                dataset = _DS.from_huggingface(args.hf_config, args.split, args.cache_dir)
+        except Exception as e:
+            print(f"ERROR: could not load {dataset_name} ({args.hf_config}): {e}", file=sys.stderr)
+            print("  (install with: pip install 'mathagent[benchmark]')", file=sys.stderr)
+            return 2
+
+    problems = dataset.problems()
+    print(f"# {dataset_name} [{dataset.release}] — {len(dataset)} raw items, "
+          f"{len(problems)} after default filtering (solver never sees held-out oracle fields)")
+    for p in problems:
+        text = getattr(p, stmt_attr, "")
+        if args.dump:
+            print(json.dumps({"idx": p.idx, stmt_attr: text}))
+        else:
+            print(f"  {p.idx}: {text[:100]!r}")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Run the ArXivMath benchmark (non-contaminative).")
+    ap = argparse.ArgumentParser(
+        description="Inspect / run MathAgent benchmark datasets (non-contaminative).",
+        epilog="NOTE: only --dataset arxivmath runs end-to-end (final-answer solving + SymPy grading). "
+               "arxivlean/brokenarxiv/mathnet support ONLY --list / --dump for now — Lean proving, "
+               "do-not-prove judging, and MathNet answer-running arrive in a later phase.")
+    ap.add_argument("--dataset", choices=["arxivmath", "arxivlean", "brokenarxiv", "mathnet"],
+                    default="arxivmath",
+                    help="which dataset to use (default: arxivmath — the only one that runs end-to-end; "
+                         "the other three support only --list / --dump)")
+    ap.add_argument("--list", action="store_true",
+                    help="(non-answer datasets) list problem idx + statement and exit")
+    ap.add_argument("--dump", action="store_true",
+                    help="(non-answer datasets) dump problem idx + statement as JSONL and exit")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--jsonl", help="local JSONL release (e.g. the synthetic fixture)")
     src.add_argument("--hf-config", help="HuggingFace release config, e.g. arxivmath-0326")
@@ -107,6 +184,14 @@ def main() -> int:
     ap.add_argument("--n-judges", type=int, default=1, help="(harness) Codex judges per tournament pass")
     ap.add_argument("--passes", type=int, default=2, help="(harness) refinement passes")
     args = ap.parse_args()
+
+    if args.dataset != "arxivmath":
+        return _run_list_dump(args.dataset, args)
+
+    if args.list or args.dump:
+        print("ERROR: --list / --dump apply to the non-answer datasets "
+              "(--dataset arxivlean|brokenarxiv|mathnet), not arxivmath.", file=sys.stderr)
+        return 2
 
     if args.jsonl:
         dataset = ArxivMathDataset.from_jsonl(args.jsonl)

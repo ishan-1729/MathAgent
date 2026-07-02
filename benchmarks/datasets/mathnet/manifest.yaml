@@ -1,0 +1,46 @@
+# MathNet release configuration. See README.md and agent/benchmarks/mathnet.py.
+#
+# The harness loads a HuggingFace config (live) or a local JSONL (offline/synthetic). Downloaded data
+# contains the gold answers and is cached OUTSIDE the repo (never committed).
+# SAFETY: the loader only PARSES data — it never exec/eval/imports any dataset content.
+
+dataset: ShadenA/MathNet              # HuggingFace org/name
+hf_id: ShadenA/MathNet
+config: all                           # the "all" config
+split: train
+size: 27800                          # ~27.8k rows (before NT+English filtering)
+
+task_type: final-answer               # SymPy answer-equivalence, like ArXivMath
+
+# For MathAgent v1 we take the Number-Theory slice in English:
+subset:
+  topic_prefix: "Number Theory"       # keep rows whose topics_flat has a path starting with this
+  language: English                   # default language filter (upstream `language` is NULLABLE — a
+                                       # null-language row is NOT dropped, only a set-and-different one)
+
+grading_protocol: >
+  Final-answer benchmark. A submission is a final value graded by SymPy answer-equivalence
+  (agent/tools/answer_check.py), matching the ArXivMath protocol. The v1 runner supports --list / --dump
+  for this dataset; a scored final-answer run can be slotted in behind the Solver protocol later.
+
+# Upstream schema (verified 2026-07-03): id (string slug), problem_markdown (the statement — the only
+# thing a solver sees), final_answer (gold), topics_flat (FLAT list of strings, each a hierarchical path
+# using " > " as separator, e.g. "Number Theory > Divisibility > gcd"), language (string, NULLABLE),
+# problem_type, plus solutions_markdown / images / country / competition.
+schema_fields: [id, problem_markdown, final_answer, topics_flat, language, problem_type, solutions_markdown, images, country, competition]
+oracle_field: final_answer            # held out; never shown to the solver
+solver_visible_fields: [problem_markdown]   # (+ idx, topics); final_answer/solutions never in a prompt
+
+# PUBLISHED, NO-HARNESS baselines — read from mathnet.mit.edu on 2026-07-03. These are the upstream
+# project's own vanilla-model numbers, NOT MathAgent harness runs.
+baselines:
+  provenance: "PUBLISHED no-harness baselines read from https://mathnet.mit.edu on 2026-07-03"
+  mathnet:
+    Gemini-3.1-Pro: {score: 78.4, units: percent, source: "https://mathnet.mit.edu"}
+    GPT-5:          {score: 69.3, units: percent, source: "https://mathnet.mit.edu"}
+    Opus-4.6:       {score: 45.7, units: percent, source: "https://mathnet.mit.edu"}
+
+license: CC BY 4.0
+source_url: https://mathnet.mit.edu
+cache_dir: ""                          # HF default cache (gitignored); keep downloads OUTSIDE the repo
+fixture: fixtures/sample.jsonl         # SYNTHETIC (not real MathNet) — for offline tests only

@@ -1,0 +1,47 @@
+# ArXivLean release configuration. See README.md and agent/benchmarks/arxivlean.py.
+#
+# The harness loads a HuggingFace config (live) or a local JSONL (offline/synthetic). Downloaded data
+# contains the gold answers + source provenance and is cached OUTSIDE the repo (never committed).
+# SAFETY: the loader only PARSES data — it never exec/eval/imports any dataset content (a
+# formal_statement is inert Lean text handed to the Lean checker as data).
+
+dataset: MathArena/arxivlean-0326     # HuggingFace org/name (config "default")
+hf_id: MathArena/arxivlean-0326
+default_release: arxivlean-0326       # the 03/2026 set (41 problems)
+split: train
+config: default
+size: 41                              # problems
+
+task_type: lean-proof                 # produce a Lean 4 proof that closes `formal_statement`
+grading_protocol: >
+  A submission is a Lean proof term / tactic block that closes the item's `formal_statement`. It is
+  graded by COMPILING the proof against the item's Lean statement (pass = the file compiles with no
+  `sorry`/errors and no added axioms beyond the allowed set). Grading requires the Lean checker and is
+  OUT OF SCOPE for the v1 runner (which supports only --list / --dump for this dataset).
+
+# Toolchain / compile-compatibility: upstream `arxivlean-0326` targets Lean v4.29.0; OUR toolchain is
+# Lean 4.30. We do NOT assume cross-version compilation. compile_compat is a PER-PROBLEM fact the runner
+# must record for each attempt (did it compile under our 4.30 toolchain?), not a dataset-wide assumption.
+toolchain:
+  upstream_lean: "4.29.0"
+  our_lean: "4.30"
+  compile_compat: per-problem          # record for each problem in its run record; never assumed
+
+# Upstream schema (verified 2026-07-03): problem_idx (int), problem (NL statement), answer (gold — in
+# this release the target Lean `theorem …` to close), formal_statement (Lean statement), and provenance
+# source (arXiv id) / title / authors. No category/problem_type field; no Lean-version field.
+schema_fields: [problem_idx, problem, answer, formal_statement, source, title, authors]
+oracle_field: answer                   # held out; never shown to the solver
+solver_visible_fields: [formal_statement]   # (+ idx); source/title/authors are metadata, never in a prompt
+
+# PUBLISHED, NO-HARNESS baselines — read from matharena.ai on 2026-07-03. These are the upstream
+# platform's own vanilla-model numbers, NOT MathAgent harness runs.
+baselines:
+  provenance: "PUBLISHED no-harness baselines read from https://matharena.ai/models on 2026-07-03"
+  arxivlean-0326:
+    GPT-5.5-xhigh: {score: 17.07, stderr: 11.52, units: percent, source: "https://matharena.ai/models"}
+
+license: CC BY-SA 4.0
+source_url: https://matharena.ai/arxivlean/
+cache_dir: ""                          # HF default cache (gitignored); keep downloads OUTSIDE the repo
+fixture: fixtures/sample.jsonl         # SYNTHETIC (not real ArXivLean) — for offline tests only

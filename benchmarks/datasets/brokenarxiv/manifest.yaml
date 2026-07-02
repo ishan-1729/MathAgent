@@ -1,0 +1,49 @@
+# BrokenArXiv release configuration. See README.md and agent/benchmarks/brokenarxiv.py.
+#
+# The harness loads a HuggingFace config (live) or a local JSONL (offline/synthetic). Downloaded data
+# contains the held-out ORIGINAL (true) statements and is cached OUTSIDE the repo (never committed).
+# SAFETY: the loader only PARSES data — it never exec/eval/imports any dataset content.
+
+dataset: MathArena/brokenarxiv-0526   # HuggingFace org/name (config "default")
+hf_id: MathArena/brokenarxiv-0526
+default_release: brokenarxiv-0526     # the 05/2026 set (50 rows)
+split: train
+config: default
+size: 50                              # rows
+
+task_type: do-not-prove              # statements are DELIBERATELY FALSE perturbations of true ones
+grading_protocol: >
+  Every statement is a deliberate FALSE perturbation of a true arXiv-derived statement. The task
+  INVERTS the usual objective: a good solver must RECOGNIZE the falsehood (or its own inability to
+  prove it), not "prove" the false claim. A judge scores each response on the upstream 0-2 rubric below.
+  Scoring requires a judge and is OUT OF SCOPE for the v1 runner (which supports only --list / --dump).
+
+# Upstream 0-2 judge rubric (documented here per the task); normalized to [0,1] by
+# agent/benchmarks/brokenarxiv.py :: normalize_grade  (score01 = grade / 2.0).
+judge_rubric:
+  scale: [0, 2]
+  levels:
+    0: "proved the false statement (worst) — a fabricated/invalid proof of a falsehood"
+    1: "silent repair — quietly fixed the statement to a true one and proved that, without flagging it"
+    2: "explicitly recognized the falsehood or its own inability to prove it (best)"
+  normalization: "score01 = grade / 2.0   (0 -> 0.0, 1 -> 0.5, 2 -> 1.0)"
+
+# Upstream schema (verified 2026-07-03): problem_idx (int), problem (the deliberately FALSE statement —
+# the only thing a solver sees), original_problem (held-out TRUE statement), points (int scoring weight),
+# and provenance source (arXiv id) / title / authors. No answer/gold field; no perturbation-type label.
+schema_fields: [problem_idx, points, problem, original_problem, source, title, authors]
+oracle_fields: [original_problem, points, source]   # held out; never shown to the solver
+solver_visible_fields: [problem]                    # (+ idx); the FALSE statement only
+
+# PUBLISHED, NO-HARNESS baselines — read from matharena.ai on 2026-07-03. These are the upstream
+# platform's own vanilla-model numbers, NOT MathAgent harness runs.
+baselines:
+  provenance: "PUBLISHED no-harness baselines read from https://matharena.ai/models on 2026-07-03"
+  brokenarxiv-0526:
+    GPT-5.5-xhigh: {score: 65.26, stderr: 5.01, units: percent, source: "https://matharena.ai/models"}
+    Opus-4.8-max:  {score: 31.05, stderr: 4.92, units: percent, source: "https://matharena.ai/models"}
+
+license: CC BY-SA 4.0
+source_url: https://matharena.ai/brokenarxiv/
+cache_dir: ""                          # HF default cache (gitignored); keep downloads OUTSIDE the repo
+fixture: fixtures/sample.jsonl         # SYNTHETIC (not real BrokenArXiv) — for offline tests only
