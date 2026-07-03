@@ -284,13 +284,16 @@ def _blank_row() -> dict:
     return {f: None for f in ROW_FIELDS}
 
 
-def run_one(problem: Problem, profile: RunProfile, *, builder=None) -> dict:
+def run_one(problem: Problem, profile: RunProfile, *, builder=None,
+            ledgers_dir: Optional[Path] = None) -> dict:
     """Build + run one ``profile`` on one ``problem`` and return its structured result row.
 
     The build/run is wrapped: an inadmissible profile (SupervisorError) or any runtime error becomes a
     row with ``error`` set and ``proven=False`` rather than aborting the sweep. ``builder`` is the
     callable used to build+run (defaults to :func:`agent.orchestrator.builder.build_and_run`); tests
-    inject a stub so the harness is exercised fully offline."""
+    inject a stub so the harness is exercised fully offline. When ``ledgers_dir`` is given, the run's
+    proof artifacts (proof tree + per-node winning ledgers) are dumped there for scrutiny — a
+    soft_proven row is NOT a certificate, so the ledger must be inspectable."""
     if builder is None:
         from agent.orchestrator.builder import build_and_run as builder  # lazy: keep import cheap
     # Fix 2: the goal handed to the builder is the PURE statement; the per-problem citable-inputs clause
@@ -330,12 +333,42 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None) -> dict:
             row["proven_nodes"] = sum(1 for n in dag.nodes.values()
                                       if getattr(getattr(n, "state", None), "name", "") in
                                       ("PROVEN", "LEAN_VERIFIED"))
+        if ledgers_dir is not None:
+            _dump_ledgers(ledgers_dir, problem, profile, res)
     except Exception as e:  # noqa: BLE001 — one bad (problem, profile) must not abort the sweep.
         row["error"] = f"{type(e).__name__}: {e}"
         row["reporting_status"] = report_status(proven=False).label
     finally:
         row["wall_s"] = round(time.perf_counter() - t0, 4)
     return row
+
+
+def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res) -> None:
+    """Dump the run's proof artifacts to ``ledgers_dir/<slug>__<profile>.json`` (best-effort:
+    missing attributes dump as null — never raises into the sweep)."""
+    ledgers_dir.mkdir(parents=True, exist_ok=True)
+    tree = None
+    pt = getattr(res, "proof_tree", None)
+    if callable(pt):
+        try:
+            tree = pt()
+        except Exception:  # noqa: BLE001 — artifact capture must never break the sweep
+            tree = None
+    nodes = []
+    dag = getattr(res, "dag", None)
+    for n in (getattr(dag, "nodes", {}) or {}).values():
+        nodes.append({
+            "goal": getattr(n, "goal", None),
+            "state": getattr(getattr(n, "state", None), "name", None),
+            "proof": getattr(n, "proof", None),
+        })
+    out = ledgers_dir / f"{problem.slug}__{profile.name}.json"
+    out.write_text(json.dumps({
+        "problem": problem.slug, "profile": profile.name,
+        "profile_hash": profile.profile_hash,
+        "proven": bool(getattr(res, "proven", False)),
+        "proof_tree": tree, "nodes": nodes,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _skip_row(slug: str, problem: Optional[Problem], reason: str) -> dict:
@@ -355,7 +388,7 @@ def _skip_row(slug: str, problem: Optional[Problem], reason: str) -> dict:
 
 def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
               profiles: list[RunProfile], out: Path, *, builder=None,
-              verbose: bool = True) -> list[dict]:
+              verbose: bool = True, ledgers_dir: Optional[Path] = None) -> list[dict]:
     """Run every (ready problem x profile) pair, plus one skip/error row per non-ready or unparseable
     folder, write the rows to ``out``, and return them.
 
@@ -395,7 +428,7 @@ def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
             if verbose:
                 print(f"# run: {slug} x {prof.name} (hash {prof.profile_hash[:12]})",
                       file=sys.stderr, flush=True)
-            row = run_one(problem, prof, builder=builder)
+            row = run_one(problem, prof, builder=builder, ledgers_dir=ledgers_dir)
             _emit(row)
             if verbose:
                 tag = row["error"] or row["reporting_status"]
@@ -458,6 +491,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--timeout-s", type=int, default=None, metavar="N",
                     help="per-run wall-clock cap (seconds); overrides each profile's roles' timeout_s")
     ap.add_argument("--quiet", action="store_true", help="suppress per-run progress on stderr")
+    ap.add_argument("--ledgers-dir", type=Path, default=None, metavar="DIR",
+                    help="dump each run's proof artifacts (proof tree + per-node winning ledgers) "
+                         "here for scrutiny — a soft_proven row is NOT a certificate")
     return ap
 
 
@@ -485,7 +521,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not selected:
         print(f"ERROR: no problem folders found under {args.problems_dir}", file=sys.stderr)
         return 2
-    run_sweep(selected, profiles, args.out, verbose=not args.quiet)
+    run_sweep(selected, profiles, args.out, verbose=not args.quiet,
+              ledgers_dir=args.ledgers_dir)
     return 0
 
 
