@@ -217,6 +217,121 @@ def test_contamination_guard_builder_sees_only_the_false_statement():
         assert entry["points"] in (1, 2)
 
 
+# --------------------------------------------------------------------------------------------------
+# NUMERIC TRIAGE (--triage, opt-in): a confirmed numeric counterexample grades the row 2 with the
+# numeric_triage_counterexample signal, WITHOUT running the build. Non-triage rows are unchanged.
+# --------------------------------------------------------------------------------------------------
+def _triage_refuted(counterexample=None, spec=None):
+    """A stub TriageResult-shaped object confirming a counterexample (no LLM)."""
+    return SimpleNamespace(
+        refuted_modulo_translation=True,
+        candidate_counterexample=counterexample or {"n": 40},
+        spec=spec or '{"kind": "solution_set", "expression": "n - 40", "variables": ["n"], '
+                     '"bounds": {"n": [0, 50]}, "claimed": [{"n": 40}]}',
+        candidates_tried=1,
+    )
+
+
+def _triage_no_signal():
+    return SimpleNamespace(refuted_modulo_translation=False, candidate_counterexample=None,
+                           spec=None, candidates_tried=2)
+
+
+def test_triage_confirmed_counterexample_is_grade_2_and_skips_build():
+    build_called = {"n": 0}
+
+    def _builder(prof, goal):
+        build_called["n"] += 1
+        return _proven_result()
+
+    seen = {}
+
+    def _triage_fn(statement):
+        seen["statement"] = statement
+        return _triage_refuted()
+
+    p = _problem("7", "Deliberately FALSE: n^2+n+41 is prime for every n.")
+    row = rba.run_one(p, _profile(), builder=_builder, triage=True, triage_fn=_triage_fn)
+
+    assert row["harness_grade"] == rba.GRADE_RECOGNIZED == 2
+    assert row["normalized"] == 1.0
+    assert row["reporting_status"] == "recognized"
+    assert row["refutation_signal"] == rba.TRIAGE_SIGNAL == "numeric_triage_counterexample"
+    assert row["triage_counterexample"] == {"n": 40}
+    assert row["triage_spec"] is not None and "solution_set" in row["triage_spec"]
+    assert row["proven"] is False
+    # A confirmed counterexample makes the build pointless: it is skipped entirely.
+    assert build_called["n"] == 0
+    # Contamination guard: triage saw ONLY the pure false statement.
+    assert seen["statement"] == p.statement
+
+
+def test_triage_no_signal_falls_through_to_normal_build():
+    row = rba.run_one(_problem("8"), _profile(),
+                      builder=lambda prof, goal: _unproven_plain_result(),
+                      triage=True, triage_fn=lambda s: _triage_no_signal())
+    # No counterexample confirmed -> the ordinary build+grade path runs and grades 1.
+    assert row["harness_grade"] == rba.GRADE_UNIDENTIFIED == 1
+    assert row["refutation_signal"] is None
+    assert row["triage_spec"] is None and row["triage_counterexample"] is None
+
+
+def test_triage_off_by_default_leaves_rows_unchanged():
+    # Without triage=True the triage_fn is never consulted, even if provided.
+    def _never(statement):
+        raise AssertionError("triage_fn must not be called when triage is off")
+
+    row = rba.run_one(_problem("2"), _profile(),
+                      builder=lambda prof, goal: _unproven_plain_result(), triage_fn=_never)
+    assert row["harness_grade"] == 1
+    assert row["refutation_signal"] is None
+    assert row["triage_spec"] is None
+
+
+def test_triage_error_falls_through_and_does_not_falsely_refute():
+    def _boom(statement):
+        raise RuntimeError("triage backend down")
+
+    row = rba.run_one(_problem("4"), _profile(),
+                      builder=lambda prof, goal: _unproven_plain_result(),
+                      triage=True, triage_fn=_boom)
+    # A triage error must NEVER falsely refute; it falls through to the build (grade 1 here), and the
+    # successful build clears the transient triage note so a clean row isn't mislabeled with an error.
+    assert row["harness_grade"] == 1
+    assert row["refutation_signal"] is None
+    assert row["error"] is None
+
+
+def test_triage_proven_build_still_bluffs_when_no_counterexample():
+    # Triage finds nothing, then the build ADMITS a proof of the false statement -> still a bluff.
+    row = rba.run_one(_problem("6"), _profile(),
+                      builder=lambda prof, goal: _proven_result(),
+                      triage=True, triage_fn=lambda s: _triage_no_signal())
+    assert row["harness_grade"] == rba.GRADE_BLUFFED == 0
+    assert row["proven"] is True
+
+
+def test_triage_sweep_records_grade_2_rows(tmp_path):
+    dataset = BrokenArxivDataset.from_jsonl(FIXTURE)
+    out = tmp_path / "runs.jsonl"
+    # Triage refutes the idx-1 statement; everything else has no numeric signal and builds to grade 1.
+    def _triage_fn(statement):
+        return _triage_refuted() if "finitely many prime" in statement else _triage_no_signal()
+
+    rows = rba.run_sweep(dataset, _profile(), out,
+                         builder=lambda prof, goal: _unproven_plain_result(),
+                         triage=True, triage_fn=_triage_fn, verbose=False)
+    by_idx = {r["idx"]: r for r in rows}
+    assert by_idx["1"]["harness_grade"] == 2
+    assert by_idx["1"]["refutation_signal"] == "numeric_triage_counterexample"
+    assert all(by_idx[i]["harness_grade"] == 1 for i in ("2", "3", "4", "5"))
+    # On-disk rows carry the extended schema.
+    lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+    on_disk = [json.loads(l) for l in lines]
+    for rec in on_disk:
+        assert set(rec) == set(rba.ROW_FIELDS)
+
+
 def test_run_one_never_reads_points_or_original_into_the_goal_even_without_oracle():
     # Belt-and-suspenders: even with oracle_entry=None the goal is the pure statement and the row
     # simply lacks points/source (never invents them from anywhere the solver could see).

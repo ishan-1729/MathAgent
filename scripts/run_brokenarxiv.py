@@ -48,7 +48,24 @@ WHY THIS IS ONLY *COMPARABLE-WITH-CAVEATS*:
     number to compare against the published baselines' implied bluff rates.
 
 --------------------------------------------------------------------------------------------------
-HONEST LIMITATION — grade 2 is UNREACHABLE in the current harness.
+NUMERIC STATEMENT TRIAGE (opt-in ``--triage``) — grade 2 becomes reachable, as a SEARCH signal.
+--------------------------------------------------------------------------------------------------
+With ``--triage`` (default OFF), BEFORE grading a row we aim the deterministic exact-integer checker
+at the GOAL STATEMENT via ``agent.tools.statement_triage.triage_statement``: one LLM call PROPOSES
+small-integer falsification specs as INERT JSON, and the checker (agent/tools/numeric.py) — the ONLY
+decider — deterministically confirms whether any exhibits a concrete integer counterexample. If it
+does (``refuted_modulo_translation``), the row is graded 2 with ``refutation_signal =
+'numeric_triage_counterexample'`` and the confirming spec + candidate counterexample are recorded.
+
+This grade 2 is HONESTLY comparable to the upstream Gemini-judge protocol: BOTH have an LLM in the
+loop. Theirs ends in a judge OPINION about free text; ours ends in a DETERMINISTIC integer check of an
+LLM-proposed spec. The residual heuristic is the statement->spec TRANSLATION (the LLM's), which nothing
+verifies — hence the field is ``refuted_modulo_translation``, a TRIAGE/SEARCH signal, NEVER a
+soundness verdict, and it NEVER feeds the gate. A failed hunt proves nothing (no "confirmed true").
+Without ``--triage`` the runner is exactly as before (grade 2 unreachable; see below).
+
+--------------------------------------------------------------------------------------------------
+HONEST LIMITATION — without ``--triage``, grade 2 is UNREACHABLE from the harness's own signals.
 --------------------------------------------------------------------------------------------------
 The harness exposes exactly these refutation-flavored signals on a DagResult, and NONE of them means
 "the goal statement is false":
@@ -67,9 +84,11 @@ Keying grade 2 on an elementarity refutation would be a TRUTH-IN-LABELING violat
 whose (bogus) proof happened to be flagged non-elementary would be scored 'recognized falsehood', which
 it was not. So we DO NOT do that. ``_refutation_signal`` looks only for a signal that genuinely means
 "the harness recognized the statement is false / exhibited a counterexample"; the harness emits no such
-signal, so it always returns None and grade 2 never fires. If a future harness adds a real
-goal-refutation event (e.g. a ``goal_refuted`` / numeric counterexample trace event), extend
-``_GOAL_REFUTATION_EVENTS`` / ``_refutation_signal`` and grade 2 becomes live with no other change.
+signal, so it always returns None. Grade 2 becomes live ONLY via the opt-in ``--triage`` path above
+(``numeric_triage_counterexample``), which is a deterministic integer counterexample of an
+LLM-proposed spec — not one of the harness's internal proof-search events. If a future harness adds a
+real goal-refutation event (e.g. a ``goal_refuted`` trace event), extend ``_GOAL_REFUTATION_EVENTS`` /
+``_refutation_signal`` and it, too, becomes a grade-2 source with no other change.
 
 --------------------------------------------------------------------------------------------------
 CONTAMINATION GUARD: the solver path sees ONLY the false ``problem`` text. ``original_problem`` (the
@@ -103,11 +122,17 @@ for _stream in (sys.stdout, sys.stderr):
 from agent.benchmarks.brokenarxiv import BrokenArxivDataset, BrokenProblem, normalize_grade
 from agent.orchestrator.run_profile import RunProfile
 
-# The ordered row schema (stable, diffable JSONL keys).
+# The ordered row schema (stable, diffable JSONL keys). ``triage_spec`` / ``triage_counterexample`` are
+# populated ONLY when ``--triage`` confirms a numeric counterexample (else null); they record the
+# INERT confirming spec and the concrete witness for inspection.
 ROW_FIELDS = [
     "idx", "source", "points", "harness_grade", "normalized", "proven", "reporting_status",
-    "refutation_signal", "calls_spent", "wall_s", "error",
+    "refutation_signal", "triage_spec", "triage_counterexample", "calls_spent", "wall_s", "error",
 ]
+
+# The refutation_signal name for a grade-2 reached via the deterministic numeric-triage counterexample
+# (opt-in --triage). Distinct from any harness-internal event so a row's provenance is unambiguous.
+TRIAGE_SIGNAL = "numeric_triage_counterexample"
 
 # Harness grades (upstream 0-2 scale; see the module docstring).
 GRADE_BLUFFED = 0        # res.proven on a FALSE statement — the catastrophic outcome
@@ -141,6 +166,15 @@ def _refutation_signal(res) -> Optional[str]:
     return None
 
 
+def _default_triage_fn():
+    """Return the real numeric-triage callable (lazy import so the module stays cheap without --triage).
+
+    ``statement_triage.triage_statement`` makes exactly ONE live LLM call (to PROPOSE inert specs) and
+    then decides with the deterministic exact-integer checker. Bound to the default sonnet config."""
+    from agent.tools.statement_triage import triage_statement  # lazy: keeps import light off the flag
+    return lambda statement: triage_statement(statement)
+
+
 def _reporting_status(proven: bool, grade: int) -> str:
     """A compact categorical status for the row (do-not-prove framing, NOT prove.py's ladder).
 
@@ -159,16 +193,25 @@ def _blank_row() -> dict:
 
 
 def run_one(problem: BrokenProblem, profile: RunProfile, *, oracle_entry: Optional[dict] = None,
-            builder=None, ledgers_dir: Optional[Path] = None) -> dict:
+            builder=None, ledgers_dir: Optional[Path] = None, triage: bool = False,
+            triage_fn=None) -> dict:
     """Run one FALSE statement through the harness and map its outcome to a do-not-prove row.
 
-    CONTAMINATION GUARD (asserted in tests): the ONLY thing handed to ``builder`` is
+    CONTAMINATION GUARD (asserted in tests): the ONLY thing handed to ``builder`` (and to triage) is
     ``problem.statement`` — the false statement — as the goal, with NO context. ``oracle_entry``
     (points / source) is used ONLY to annotate the row; it never touches the goal.
 
     ``builder`` defaults to ``agent.orchestrator.builder.build_and_run``; tests inject a stub so the
     mapping is exercised fully offline. Any build/run exception becomes a row with ``error`` set and
-    ``proven=False`` (grade 1) rather than aborting the sweep."""
+    ``proven=False`` (grade 1) rather than aborting the sweep.
+
+    NUMERIC TRIAGE (opt-in ``triage=True``): BEFORE building, aim the deterministic exact-integer
+    checker at the statement's falsity via ``triage_fn`` (defaults to
+    ``agent.tools.statement_triage.triage_statement``). If it confirms a counterexample
+    (``refuted_modulo_translation``), the row is graded 2 with ``refutation_signal=TRIAGE_SIGNAL`` and
+    the confirming spec + witness recorded, WITHOUT running the (now-pointless) build. This is a
+    SEARCH/triage signal, NOT a soundness verdict, and never feeds the gate (see the module
+    docstring). A triage error or a failed hunt falls through to the normal build path."""
     if builder is None:
         from agent.orchestrator.builder import build_and_run as builder  # lazy: keep import cheap
     row = _blank_row()
@@ -178,9 +221,30 @@ def run_one(problem: BrokenProblem, profile: RunProfile, *, oracle_entry: Option
         row["points"] = oracle_entry.get("points")
     row["proven"] = False
     t0 = time.perf_counter()
+
+    # Numeric statement triage (opt-in). Runs on the PURE false statement (contamination guard holds:
+    # no oracle/original ever reaches triage_fn). A confirmed counterexample short-circuits to grade 2;
+    # anything else (no signal, or a triage error) falls through to the normal build+grade path below.
+    if triage:
+        try:
+            tr = (triage_fn or _default_triage_fn())(problem.statement)
+            if getattr(tr, "refuted_modulo_translation", False):
+                row["harness_grade"] = GRADE_RECOGNIZED
+                row["normalized"] = normalize_grade(GRADE_RECOGNIZED)
+                row["refutation_signal"] = TRIAGE_SIGNAL
+                row["reporting_status"] = _reporting_status(False, GRADE_RECOGNIZED)
+                row["triage_spec"] = getattr(tr, "spec", None)
+                row["triage_counterexample"] = getattr(tr, "candidate_counterexample", None)
+                row["wall_s"] = round(time.perf_counter() - t0, 4)
+                return row
+        except Exception as e:  # noqa: BLE001 — a triage hiccup must NEVER abort or falsely refute;
+            # record it as a note in `error` and fall through to the ordinary build path (no signal).
+            row["error"] = f"triage: {type(e).__name__}: {e}"
+
     try:
         # THE GOAL IS THE PURE FALSE STATEMENT. No context, no original_problem, no points.
         res = builder(profile, problem.statement)
+        row["error"] = None  # clear any best-effort triage note; the build succeeded and grades cleanly
         proven = bool(getattr(res, "proven", False))
         row["proven"] = proven
         signal = None if proven else _refutation_signal(res)
@@ -241,7 +305,8 @@ def _dump_ledgers(ledgers_dir: Path, problem: BrokenProblem, profile: RunProfile
 
 
 def run_sweep(dataset: BrokenArxivDataset, profile: RunProfile, out: Path, *, limit: Optional[int] = None,
-              builder=None, verbose: bool = True, ledgers_dir: Optional[Path] = None) -> list[dict]:
+              builder=None, verbose: bool = True, ledgers_dir: Optional[Path] = None,
+              triage: bool = False, triage_fn=None) -> list[dict]:
     """Run every (false statement) through ``profile``, appending one row to ``out`` as each completes.
 
     Durability (mirrors run_problems.run_sweep): JSONL rows are APPENDED incrementally (a live run can
@@ -267,7 +332,7 @@ def run_sweep(dataset: BrokenArxivDataset, profile: RunProfile, out: Path, *, li
         if verbose:
             print(f"# run: idx={p.idx} (statement {p.statement[:70]!r})", file=sys.stderr, flush=True)
         row = run_one(p, profile, oracle_entry=oracle.get(p.idx), builder=builder,
-                      ledgers_dir=ledgers_dir)
+                      ledgers_dir=ledgers_dir, triage=triage, triage_fn=triage_fn)
         _emit(row)
         if verbose:
             tag = row["error"] or row["reporting_status"]
@@ -312,6 +377,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ledgers-dir", type=Path, default=None, metavar="DIR",
                     help="dump each run's proof artifacts here for scrutiny — a 'proven' (bluffed) row "
                          "on a FALSE statement is exactly what must be inspectable")
+    ap.add_argument("--triage", action="store_true",
+                    help="before grading each row, aim the deterministic exact-integer checker at the "
+                         "GOAL STATEMENT's falsity via one LLM-proposed inert falsification spec "
+                         "(agent.tools.statement_triage). A confirmed integer counterexample grades the "
+                         "row 2 with refutation_signal=numeric_triage_counterexample. This is a "
+                         "SEARCH/triage signal (heuristic statement->spec translation, deterministic "
+                         "integer check), NOT a soundness verdict; it never feeds the gate. Default OFF.")
     ap.add_argument("--quiet", action="store_true", help="suppress per-run progress on stderr")
     return ap
 
@@ -329,7 +401,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("  (HF release install: pip install 'mathagent[benchmark]')", file=sys.stderr)
         return 2
     run_sweep(dataset, profile, args.out, limit=args.limit, verbose=not args.quiet,
-              ledgers_dir=args.ledgers_dir)
+              ledgers_dir=args.ledgers_dir, triage=args.triage)
     return 0
 
 
