@@ -1,0 +1,7 @@
+{
+  "kind": "solution_set",
+  "expression": "y*y = x*x*x + 7",
+  "variables": ["x", "y"],
+  "bounds": {"x": [-100, 100], "y": [-1100, 1100]},
+  "claimed": []
+}

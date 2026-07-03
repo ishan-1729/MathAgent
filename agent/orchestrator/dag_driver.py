@@ -979,11 +979,25 @@ class DagDriver:
         sketch_report = evaluate(sketch, self.toolkit)
         if sketch_report.rejected:
             return False, [str(f) for f in sketch_report.rejects()], ReasonCode.gap_found.value
+        # Soundness (checked BEFORE the NEEDS_REVIEW refutation): the sketch must conclude THIS goal. If
+        # its conclusion proves a different statement than the parent goal, the decomposition is not a
+        # valid plan for this node — that is a GOAL/BINDING GAP, not an elementarity finding. Doing this
+        # FIRST means a binding miss classifies as gap_found (rejection) rather than being handed to
+        # _refute_for_enforcement, which (under enforcement) would refute the SAME unbound conclusion on
+        # its goal_binding dimension and mislabel a gap as elementary_violation -> FAILED_ELEMENTARY. The
+        # verifier below therefore only ever rules on a genuinely goal-BOUND sketch; an unbound sketch is
+        # rejected here and never commits (truth-in-labeling; no weakening of the never-commit invariant).
+        concl = _conclusion_claim(sketch)
+        if concl is None or goal_hash(concl) != goal_hash(goal):
+            return (False, ["sketch conclusion does not prove the parent goal"],
+                    ReasonCode.gap_found.value)
+
         # Fail closed: a NEEDS_REVIEW sketch (e.g. an elastic justification routed to Layer 2) must be
         # adjudicated. With no reviewer, the OLD behaviour rejected outright. Now the INDEPENDENT
-        # adversarial verifier gets a refuting pass first: an undischarged-elastic / denylist-prose /
-        # goal-binding violation is a SPECIFIC elementary refutation (downgrade-don't-discard); only an
-        # un-refuted-but-still-unreviewed sketch is rejected as needing a reviewer.
+        # adversarial verifier gets a refuting pass first: an undischarged-elastic / denylist-prose
+        # violation is a SPECIFIC elementary refutation (downgrade-don't-discard); only an
+        # un-refuted-but-still-unreviewed sketch is rejected as needing a reviewer. (Goal-binding is
+        # already settled above, so any refutation here is a genuine elementarity finding on a bound sketch.)
         if sketch_report.verdict is Verdict.NEEDS_REVIEW and self.reviewer is None:
             try:
                 vr = self._refute_for_enforcement(sketch_report.ledger or sketch, goal)
@@ -997,13 +1011,6 @@ class DagDriver:
                 return False, [str(r) for r in vr.refutations], ReasonCode.elementary_violation.value
             return (False, ["decomposition sketch needs Layer-2 review but no reviewer is configured"],
                     ReasonCode.needs_review_no_reviewer.value)
-
-        # Soundness: the sketch must conclude THIS goal. If its conclusion proves a different
-        # statement than the parent goal, the decomposition is not a valid plan for this node.
-        concl = _conclusion_claim(sketch)
-        if concl is None or goal_hash(concl) != goal_hash(goal):
-            return (False, ["sketch conclusion does not prove the parent goal"],
-                    ReasonCode.gap_found.value)
 
         # P4 (LEAP §2.2/§2.5 COMPOSITION check): when a sketch_verifier is configured, formalize this
         # candidate's SKETCH as a SORRY-FREE Lean theorem proving the parent ASSUMING the children as

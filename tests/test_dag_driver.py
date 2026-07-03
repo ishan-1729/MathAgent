@@ -723,6 +723,56 @@ def test_adversarial_verifier_refutes_needs_review_decomposition_sketch():
     assert g.reason == ReasonCode.elementary_violation.value
 
 
+def test_needs_review_no_reviewer_unbound_sketch_classifies_gap_not_elementary():
+    """TRUTH-IN-LABELING: a NEEDS_REVIEW decomposition sketch (no reviewer) whose conclusion does NOT
+    bind to the goal is a GOAL/BINDING GAP, not an elementarity finding. The conclusion-binding check
+    must run BEFORE _refute_for_enforcement — otherwise the (default-enforcing) verifier refutes the
+    unbound conclusion on its goal_binding dimension and mislabels the gap as elementary_violation
+    (feeding FAILED_ELEMENTARY). This fires only in review:false profiles (an ablation arm). The
+    sketch is un-refutable on ELEMENTARITY (a clean descent, no denylist prose), so the ONLY thing
+    wrong with it is the binding miss -> the reason must be gap_found, and it must never commit."""
+    prover = DictProver({"A": valid_ledger("A")})
+    # lemma A (matches the declared child), a CLEAN descent step (routes to NEEDS_REVIEW but the
+    # adversarial verifier cannot refute it — not a denylist hit), and a conclusion proving WRONG != G.
+    unbound_sketch = json.dumps({"problem": "p", "claim": "G", "steps": [
+        {"id": "L0", "claim": "A", "justification": "lemma", "depends_on": []},
+        {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": ["L0"],
+         "obligations": {"descent": {"measure": "x", "strictly_decreases": True,
+                                     "stays_in_domain": True}}},
+        {"id": "c", "claim": "WRONG", "justification": "conclusion", "depends_on": ["s1"]}]})
+    # Sanity: the gate ADMITS this as NEEDS_REVIEW (elastic descent), NOT a deterministic REJECT.
+    assert _gate_evaluate(unbound_sketch, TOOLKIT).verdict is Verdict.NEEDS_REVIEW
+    decomp = ScriptedDecomposer([(unbound_sketch, ["A"])])
+    res = _driver(prover, decomposer=decomp, reviewer=None, max_decomp_attempts=1).run("G")
+    assert not res.proven                                   # an unbound sketch must NEVER commit
+    g = res.dag.get(res.dag.get_or_create("G").key)
+    assert g.state is not NodeState.FAILED_ELEMENTARY       # a binding miss is NOT an elementarity failure
+    assert g.reason != ReasonCode.elementary_violation.value
+    assert g.reason == ReasonCode.gap_found.value
+    # The binding check ran FIRST: the sketch never reached the adversarial verifier (no refutation event).
+    assert not res.trace.by_kind("verifier_refuted")
+
+
+def test_needs_review_no_reviewer_bound_non_elementary_sketch_still_classifies_elementary():
+    """CONTROL for the fix above: a BOUND (conclusion == G) NEEDS_REVIEW decomposition sketch that is
+    genuinely NON-ELEMENTARY (denylist prose) must STILL classify elementary_violation. The reordered
+    binding check passes (the conclusion binds), so the sketch reaches the adversarial verifier, which
+    refutes the denylist hit — the elementarity finding is preserved, not weakened by the fix."""
+    prover = DictProver({"A": valid_ledger("A")})
+    bound_bad_sketch = json.dumps({"problem": "p", "claim": "G", "steps": [
+        {"id": "L0", "claim": "A", "justification": "lemma", "depends_on": []},
+        {"id": "d", "claim": "reduce to an elliptic curve over Q", "justification": "algebra",
+         "depends_on": ["L0"]},
+        {"id": "c", "claim": "G", "justification": "conclusion", "depends_on": ["d"]}]})
+    assert _gate_evaluate(bound_bad_sketch, TOOLKIT).verdict is Verdict.NEEDS_REVIEW
+    decomp = ScriptedDecomposer([(bound_bad_sketch, ["A"])])
+    res = _driver(prover, decomposer=decomp, reviewer=None, max_decomp_attempts=1).run("G")
+    assert not res.proven
+    assert res.trace.by_kind("verifier_refuted")            # the verifier DID rule (bound sketch reached it)
+    g = res.dag.get(res.dag.get_or_create("G").key)
+    assert g.reason == ReasonCode.elementary_violation.value
+
+
 def test_adversarial_verifier_downgrades_needs_review_direct_proof():
     """A NEEDS_REVIEW DIRECT proof routed through the verifier with a denylist-prose hit is downgraded
     to FAILED_ELEMENTARY (not silently discarded) recording the elementary_violation reason."""

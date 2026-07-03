@@ -1,0 +1,5 @@
+{"spec": "amc12_2000_p1_solution_set.json", "valid_schema": true, "confirmed": true, "score": 1.0, "error": null}
+{"spec": "kissing_number_dim11_REJECTED.json", "valid_schema": false, "confirmed": false, "score": 0.0, "error": "spec bound for 'x' must be integers"}
+{"spec": "mordell_k7_no_solutions.json", "valid_schema": true, "confirmed": true, "score": 1.0, "error": null}
+{"spec": "squares_mod8_cover.json", "valid_schema": true, "confirmed": true, "score": 1.0, "error": null}
+{"spec": "tensor_rank_444_REJECTED.json", "valid_schema": false, "confirmed": false, "score": 0.0, "error": "ValueError: invalid literal for int() with base 10: '2+3i'"}
