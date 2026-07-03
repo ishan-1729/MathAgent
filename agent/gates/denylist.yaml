@@ -136,6 +136,44 @@ lean_denylist_decls:
   - Ideal.Quotient
   - HasQuotient
   - Ideal.span
+  # ANALYSIS / TRIGONOMETRY (live-audited 2026-07-03, CEGAR-style refinement from a real counterexample).
+  # v1's stipulated fragment T is INTEGER ELEMENTARY NUMBER THEORY. Real-analytic / trigonometric machinery
+  # (Real.cos/sin/pi, exp/log, the inverse trig functions) is OUT-OF-DOMAIN for T — a proof whose proof-term
+  # closure reaches into real analysis is not an integer-elementary proof, even if it compiles and is
+  # sorry-free. DISCOVERED VIA THE `imo_1963_p5` NEGATIVE CONTROL: the trig identity
+  # cos(pi/7)-cos(2pi/7)+cos(3pi/7)=1/2 was FALSELY certified `authoritative_elementary` under
+  # profiles/authoritative.yaml because the denylist banned heavy algebraic-NT machinery but had ZERO
+  # real-analysis/trig coverage — `Real.cos`/`Real.sin`/`Real.pi` in the closure matched nothing and were
+  # waved through. The certificate semantics ("footprint within the stipulated fragment T") held; T's
+  # BOUNDARY was simply wrong for v1. This section fixes the boundary from the live counterexample.
+  #
+  # DELIBERATE BOUNDARY — `Complex.exp` is NOT banned. The roots-of-unity filter (summing Σ_{n≡r} over ζ)
+  # is an ALLOWED technique (agent/PLAN.md §2.1: "Finite, mechanical, no analysis") and it goes through
+  # `Complex.exp` (ζ = exp(2πi/n)). Banning `Complex.exp` would break that allowed elementary tool. So we
+  # ban the trig functions (`Real.cos`/`Real.sin`/`Complex.cos`/`Complex.sin`, ...) and the analytic
+  # transcendentals (`Real.exp`/`Real.log`) but LEAVE `Complex.exp` allowed — an explicit tension held
+  # open on purpose. (`Real.cos`/`Complex.cos` etc. are dotted, so they scope to exactly those decls and
+  # do NOT touch `Complex.exp`.)
+  #
+  # `Real.sqrt` is DELIBERATELY NOT banned. The shipped √2 / √3 irrationality certifications
+  # (research/docs/live_certification_runs.md: T3, and the √3 reach-map row) state the theorem over the
+  # INTEGERS as `¬∃ x,y>0. x²=2y²` (infinite descent) — their proof-term closures are Int/Nat-only with
+  # axioms ⊆ {propext, Classical.choice, Quot.sound}, and contain NO `Real.sqrt` (there is no `Real.sqrt`
+  # anywhere in the repo). Elementary irrationality proofs legitimately use the `x²=D·y²` formulation, so
+  # banning `Real.sqrt` would risk collateral-rejecting a legitimate elementary technique for no live gain.
+  # Left alone.
+  - Real.cos
+  - Real.sin
+  - Real.tan
+  - Real.pi
+  - Real.arccos
+  - Real.arcsin
+  - Real.arctan
+  - Real.exp
+  - Real.log
+  - Complex.cos
+  - Complex.sin
+  - Mathlib.Analysis.SpecialFunctions.Trigonometric
 
 lean_infrastructure_allowlist:
   - WellFounded.fix

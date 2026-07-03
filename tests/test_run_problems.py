@@ -260,6 +260,33 @@ def test_bad_builder_run_is_error_row_and_sweep_continues(tmp_path):
     assert by_prof["ok"]["proven"] is True
 
 
+def test_ledgers_dump_captures_terminal_gate_result(tmp_path):
+    """When a terminal Layer-4 gate ran, _dump_ledgers records its summary + the run's
+    authoritative_elementary verdict under a top-level ``terminal`` key (best-effort). When no
+    terminal gate ran (terminal=None) the key is null — never a raise."""
+    class _Terminal:
+        def summary(self):
+            return "lean-audit: reject (rejects=1)"
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    prof = _scripted_profile("dump")
+    ldir = tmp_path / "ledgers"
+
+    # A run whose terminal gate ran but did NOT certify elementary.
+    rp.run_one(imo, prof, builder=lambda p, g, **kw: _StubResult(
+        proven=True, authoritative=False, terminal=_Terminal()), ledgers_dir=ldir)
+    dumped = json.loads((ldir / f"{imo.slug}__dump.json").read_text(encoding="utf-8"))
+    assert dumped["terminal"] is not None
+    assert dumped["terminal"]["summary"] == "lean-audit: reject (rejects=1)"
+    assert dumped["terminal"]["authoritative_elementary"] is False
+
+    # A run with NO terminal gate -> terminal key is null, still no crash.
+    rp.run_one(imo, prof, builder=lambda p, g, **kw: _StubResult(proven=True, terminal=None),
+               ledgers_dir=ldir)
+    dumped2 = json.loads((ldir / f"{imo.slug}__dump.json").read_text(encoding="utf-8"))
+    assert dumped2["terminal"] is None
+
+
 def test_reporting_status_authoritative_when_terminal_gate_certifies(tmp_path):
     class _Terminal:
         authoritative = True

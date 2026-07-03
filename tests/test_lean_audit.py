@@ -351,6 +351,73 @@ def test_rdeny_additions_do_not_overreject_zmod_intcast_elementary():
     assert res.passed, [str(f) for f in res.rejects()]
 
 
+# ---- ANALYSIS/TRIG scope (live-audited 2026-07-03): the imo_1963_p5 negative control certified
+#      authoritative_elementary because the denylist had NO real-analysis/trig coverage — Real.cos in the
+#      closure matched nothing. v1's fragment T is INTEGER elementary NT; real-analytic/trig machinery is
+#      out-of-domain and must REJECT. Deliberate boundary: Complex.exp stays ALLOWED (roots-of-unity
+#      filter, PLAN §2.1). ----
+
+# (family label, a real constant that would appear in that construct's proof-term closure)
+_ANALYSIS_DENY_FAMILIES = [
+    ("real cosine",         "Real.cos"),
+    ("real sine",           "Real.sin"),
+    ("real tangent",        "Real.tan"),
+    ("real pi",             "Real.pi"),
+    ("real arccos",         "Real.arccos"),
+    ("real exp",            "Real.exp"),
+    ("real log",            "Real.log"),
+    ("complex cosine",      "Complex.cos"),
+    ("complex sine",        "Complex.sin"),
+    ("trig namespace decl", "Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic.cos_sq_pi_div_two"),
+]
+
+
+@pytest.mark.parametrize("label,const", _ANALYSIS_DENY_FAMILIES)
+def test_analysis_trig_shortcut_rejected(label, const):
+    """A synthetic report whose closure contains a real-analysis/trig constant (the imo_1963_p5
+    negative-control shape) is REJECTED by the SHIPPED denylist. Each fails against the pre-change
+    denylist (analysis/trig was a live GAP that certified the trig identity)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, f"{label}: {const!r} should be rejected"
+    assert "denylisted_dependency" in _codes(res), label
+
+
+def test_analysis_namespaced_trig_decl_rejected():
+    """A `Mathlib.Analysis.SpecialFunctions.Trigonometric.*` namespaced declaration is rejected via the
+    dotted namespace-prefix denylist entry (not just the bare `Real.cos`/`Real.sin` components)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic.Real.cos_pi_div_seven",
+                 "theorem")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "denylisted_dependency" in _codes(res)
+
+
+def test_analysis_boundary_complex_exp_still_passes():
+    """THE DELIBERATE BOUNDARY: `Complex.exp` is NOT banned (the roots-of-unity filter, PLAN §2.1,
+    goes through ζ = exp(2πi/n)). A closure containing ONLY Complex.exp plus infrastructure STILL
+    PASSES — banning the trig functions must not collaterally ban Complex.exp (they are dotted, so
+    `Complex.cos`/`Complex.sin` do not touch `Complex.exp`)."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Complex.exp", "definition"),
+        ConstDep("Nat.add"), ConstDep("Int.add"),
+        ConstDep("WellFounded.fix"), ConstDep("Nat.rec", "recursor"),
+        ConstDep("Decidable"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
+def test_analysis_additions_do_not_touch_whitelisted_axioms():
+    """The three whitelisted axioms still pass after the analysis/trig additions (no axiom-floor
+    regression)."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"],
+                           constants=[ConstDep("Nat.add")])
+    assert audit_report(rep, TOOLKIT).passed
+
+
 # ---- theorem cross-check (L2 fix b) ----
 
 def test_theorem_name_mismatch_rejected():

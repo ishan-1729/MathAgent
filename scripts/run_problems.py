@@ -362,11 +362,25 @@ def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res)
             "state": getattr(getattr(n, "state", None), "name", None),
             "proof": getattr(n, "proof", None),
         })
+    # Capture the terminal Layer-4 gate result when a terminal gate actually ran, so a certified-vs-not
+    # verdict is inspectable alongside the ledger (best-effort: never raises into the sweep).
+    terminal = None
+    try:
+        term = getattr(res, "terminal", None)
+        if term is not None:
+            summ = getattr(term, "summary", None)
+            terminal = {
+                "summary": summ() if callable(summ) else str(term),
+                "authoritative_elementary": getattr(res, "authoritative_elementary", None),
+            }
+    except Exception:  # noqa: BLE001 — artifact capture must never break the sweep
+        terminal = None
     out = ledgers_dir / f"{problem.slug}__{profile.name}.json"
     out.write_text(json.dumps({
         "problem": problem.slug, "profile": profile.name,
         "profile_hash": profile.profile_hash,
         "proven": bool(getattr(res, "proven", False)),
+        "terminal": terminal,
         "proof_tree": tree, "nodes": nodes,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
 
