@@ -1,0 +1,18 @@
+{
+  "problem": "imo_1963_p5_negative_control",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": true,
+  "proof_tree": {
+    "goal": "Prove that cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = 1/2.",
+    "state": "lean_verified",
+    "kind": "direct"
+  },
+  "nodes": [
+    {
+      "goal": "Prove that cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = 1/2.",
+      "state": "LEAN_VERIFIED",
+      "proof": "```json\n{\n  \"problem\": \"cos-pi7-alternating-sum\",\n  \"claim\": \"cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = 1/2\",\n  \"steps\": [\n    {\n      \"id\": \"s1\",\n      \"claim\": \"For every integer k, 2*sin(pi/7)*cos(2*k*pi/7) = sin((2*k+1)*pi/7) - sin((2*k-1)*pi/7). (Product-to-sum: 2*sin(A)*cos(B) = sin(A+B) + sin(A-B), with A = pi/7 and B = 2*k*pi/7, using sin((1-2*k)*pi/7) = -sin((2*k-1)*pi/7).)\",\n      \"justification\": \"sum_to_product\",\n      \"depends_on\": [],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s2\",\n      \"claim\": \"Summing the s1 identity over k = 1, 2, 3 telescopes: 2*sin(pi/7)*(cos(2*pi/7) + cos(4*pi/7) + cos(6*pi/7)) = sin(7*pi/7) - sin(pi/7) = sin(pi) - sin(pi/7) = -sin(pi/7), since the intermediate terms sin(3*pi/7) and sin(5*pi/7) cancel and sin(pi) = 0.\",\n      \"justification\": \"algebra\",\n      \"depends_on\": [\"s1\"],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s3\",\n      \"claim\": \"Since 0 < pi/7 < pi we have sin(pi/7) > 0, so dividing s2 by 2*sin(pi/7) gives cos(2*pi/7) + cos(4*pi/7) + cos(6*pi/7) = -1/2.\",\n      \"justification\": \"algebra\",\n      \"depends_on\": [\"s2\"],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s4\",\n      \"claim\": \"By the reflection identity cos(pi - x) = -cos(x): cos(6*pi/7) = cos(pi - pi/7) = -cos(pi/7), hence cos(pi/7) = -cos(6*pi/7); and cos(4*pi/7) = cos(pi - 3*pi/7) = -cos(3*pi/7), hence cos(3*pi/7) = -cos(4*pi/7).\",\n      \"justification\": \"algebra\",\n      \"depends_on\": [],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s5\",\n      \"claim\": \"Substituting the two relations from s4 into the left-hand side: cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = -cos(6*pi/7) - cos(2*pi/7) - cos(4*pi/7) = -(cos(2*pi/7) + cos(4*pi/7) + cos(6*pi/7)).\",\n      \"justification\": \"algebra\",\n      \"depends_on\": [\"s4\"],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s6\",\n      \"claim\": \"Combining s5 with the evaluation in s3: cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = -(-1/2) = 1/2.\",\n      \"justification\": \"algebra\",\n      \"depends_on\": [\"s5\", \"s3\"],\n      \"obligations\": {}\n    },\n    {\n      \"id\": \"s7\",\n      \"claim\": \"cos(pi/7) - cos(2*pi/7) + cos(3*pi/7) = 1/2\",\n      \"justification\": \"conclusion\",\n      \"depends_on\": [\"s6\"],\n      \"obligations\": {}\n    }\n  ]\n}\n```"
+    }
+  ]
+}

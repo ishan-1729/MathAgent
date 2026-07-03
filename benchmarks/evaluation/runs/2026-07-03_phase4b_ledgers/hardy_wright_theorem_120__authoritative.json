@@ -1,0 +1,18 @@
+{
+  "problem": "hardy_wright_theorem_120",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "In Hardy & Wright's Bernoulli indexing (B_1 = 1/6, B_2 = 1/30, ..., so B_k = |B_{2k}| in modern even-index notation), prove that for every prime k of the form 3n + 1 the rational B_k - 1/6 is an integer, i.e. B_k = 1/6 (mod 1).",
+    "state": "failed_gap",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "In Hardy & Wright's Bernoulli indexing (B_1 = 1/6, B_2 = 1/30, ..., so B_k = |B_{2k}| in modern even-index notation), prove that for every prime k of the form 3n + 1 the rational B_k - 1/6 is an integer, i.e. B_k = 1/6 (mod 1).",
+      "state": "FAILED_GAP",
+      "proof": null
+    }
+  ]
+}

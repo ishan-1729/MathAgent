@@ -1,0 +1,18 @@
+{
+  "problem": "amc12_2000_p1",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "Let i, m, o be distinct positive integers with i*m*o = 2001. Prove that the maximum possible value of i + m + o is 671.",
+    "state": "failed_gap",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "Let i, m, o be distinct positive integers with i*m*o = 2001. Prove that the maximum possible value of i + m + o is 671.",
+      "state": "FAILED_GAP",
+      "proof": null
+    }
+  ]
+}

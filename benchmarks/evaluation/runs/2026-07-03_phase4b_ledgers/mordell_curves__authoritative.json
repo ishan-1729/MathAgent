@@ -1,0 +1,18 @@
+{
+  "problem": "mordell_curves",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "Prove that the Mordell equation y^2 = x^3 + 7 has no solutions in integers x, y. (Primary pinned case; the folder also lists further vetted k with elementary non-existence proofs.)",
+    "state": "failed_gap",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "Prove that the Mordell equation y^2 = x^3 + 7 has no solutions in integers x, y. (Primary pinned case; the folder also lists further vetted k with elementary non-existence proofs.)",
+      "state": "FAILED_GAP",
+      "proof": null
+    }
+  ]
+}

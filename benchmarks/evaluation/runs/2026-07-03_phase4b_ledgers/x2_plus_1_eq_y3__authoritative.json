@@ -1,0 +1,18 @@
+{
+  "problem": "x2_plus_1_eq_y3",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "Find all integer solutions of X^2 + 1 = Y^3, and show that the only integer solution is (X, Y) = (0, 1).",
+    "state": "failed_elementary",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "Find all integer solutions of X^2 + 1 = Y^3, and show that the only integer solution is (X, Y) = (0, 1).",
+      "state": "FAILED_ELEMENTARY",
+      "proof": null
+    }
+  ]
+}

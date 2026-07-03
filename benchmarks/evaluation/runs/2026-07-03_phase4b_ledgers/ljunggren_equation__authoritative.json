@@ -1,0 +1,18 @@
+{
+  "problem": "ljunggren_equation",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "Determine all solutions in positive integers X, Y of X^2 + 1 = 2 Y^4. Show the only positive-integer solutions are (X, Y) = (1, 1) and (X, Y) = (239, 13).",
+    "state": "failed_elementary",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "Determine all solutions in positive integers X, Y of X^2 + 1 = 2 Y^4. Show the only positive-integer solutions are (X, Y) = (1, 1) and (X, Y) = (239, 13).",
+      "state": "FAILED_ELEMENTARY",
+      "proof": null
+    }
+  ]
+}

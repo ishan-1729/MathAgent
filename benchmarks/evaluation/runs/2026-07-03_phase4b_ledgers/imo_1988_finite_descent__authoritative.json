@@ -1,0 +1,18 @@
+{
+  "problem": "imo_1988_finite_descent",
+  "profile": "authoritative",
+  "profile_hash": "d9b71730eec421e6ad49ee0e0ebf0da5b16928d544b15d2f3b9b06945fd5a46b",
+  "proven": false,
+  "proof_tree": {
+    "goal": "Let a and b be positive integers such that ab + 1 divides a^2 + b^2. Prove that (a^2 + b^2) / (ab + 1) is a perfect square.",
+    "state": "failed_gap",
+    "kind": null
+  },
+  "nodes": [
+    {
+      "goal": "Let a and b be positive integers such that ab + 1 divides a^2 + b^2. Prove that (a^2 + b^2) / (ab + 1) is a perfect square.",
+      "state": "FAILED_GAP",
+      "proof": null
+    }
+  ]
+}
