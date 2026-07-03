@@ -1,0 +1,28 @@
+# ABLATION: the default profile with the OpenEvolve FALLBACK decomposer armed at 20 iterations.
+#
+# stages.evolve_fallback=20 -> when the ordinary decompose/prove path stalls, the driver falls back to
+# the OpenEvolve MAP-Elites ledger search for up to 20 iterations (the deterministic gate is the fitness
+# oracle). Requires the optional 'openevolve' package (supervisor S3 fails closed without it).
+# Evidence: OpenEvolve's own bridge default budget — a low-tens iteration count is the documented
+# per-node fallback size — is the arm this profile measures.
+name: ablation-evolve-fallback-20
+notes: "Ablation of the default profile: evolve_fallback=20 (OpenEvolve MAP-Elites fallback decomposer)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 20
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

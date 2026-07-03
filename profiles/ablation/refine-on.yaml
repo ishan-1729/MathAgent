@@ -1,0 +1,28 @@
+# ABLATION: the default profile with the REFINE stage explicitly ON (the ON arm of the refine axis).
+#
+# stages.refine=True -> the builder resolves the refiner (Claude Opus) and a directly-proven node's
+# ledger is run through the AutoReason incumbent tournament (monotone no-regression polish). The default
+# ships refine OFF, so this pairs with ablation/no-refine.yaml to isolate the refiner's contribution.
+# Evidence: AutoReason's k=2 revision-tournament result — a small self-revision budget lifts solution
+# quality — is what this arm measures against the refine-OFF default.
+name: ablation-refine-on
+notes: "Ablation of the default profile: refine ON (AutoReason tournament; refiner=Opus)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: true
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

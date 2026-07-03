@@ -1,0 +1,29 @@
+# ABLATION: the default profile with MEMOIZATION (the split-keyed goal cache / DAG reuse) OFF.
+#
+# stages.memo=False -> the driver skips the goal-cache reads, so an identical repeated subgoal is
+# re-proven FRESH per branch (no cross-branch short-circuit / cache_hit); correctness is unchanged,
+# only the DAG's reuse contribution is removed so an ablation can MEASURE it.
+# Evidence: LEAP's DAG-vs-tree ablation on Advanced Number Theory (66.6 -> 100 with the memoizing DAG)
+# is the headroom this arm quantifies for MathAgent's own split-keyed memo.
+name: ablation-no-memo
+notes: "Ablation of the default profile: memo OFF (no split-keyed goal cache / DAG reuse)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+  memo: false
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

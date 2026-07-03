@@ -346,32 +346,50 @@ def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
 
     A load-error folder (``problem is None``) emits ONE error row (not one per profile — there is no
     profile-independent thing to sweep). A non-ready folder emits ONE skip row. A ready folder emits one
-    run row per profile."""
+    run row per profile.
+
+    Durability: JSONL rows are APPENDED to ``out`` as each run finishes (a live run can take minutes to
+    hours, and a process-level crash must not lose completed rows); the final write_rows pass then
+    rewrites the file atomically-in-effect with the complete, ordered set. CSV stays end-only (no
+    incremental append with a header). Progress lines are flushed so a piped stderr shows live state."""
     rows: list[dict] = []
+    incremental = out.suffix.lower() != ".csv"
+    if incremental:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("", encoding="utf-8")     # start fresh; rows land as they complete
+
+    def _emit(row: dict) -> None:
+        rows.append(row)
+        if incremental:
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({k: row[k] for k in ROW_FIELDS}, sort_keys=True) + "\n")
+
     for slug, problem, err in problems:
         if err is not None:                       # unparseable folder -> a single error row
             if verbose:
-                print(f"# {slug}: LOAD ERROR ({err})", file=sys.stderr)
-            rows.append(_skip_row(slug, problem, f"load error: {err}"))
+                print(f"# {slug}: LOAD ERROR ({err})", file=sys.stderr, flush=True)
+            _emit(_skip_row(slug, problem, f"load error: {err}"))
             continue
         assert problem is not None
         if not problem.is_runnable:               # draft/blocked folder -> a single skip row
             if verbose:
-                print(f"# {slug}: SKIP (status={problem.status!r})", file=sys.stderr)
-            rows.append(_skip_row(slug, problem, f"skipped: status={problem.status!r} (not runnable)"))
+                print(f"# {slug}: SKIP (status={problem.status!r})", file=sys.stderr, flush=True)
+            _emit(_skip_row(slug, problem, f"skipped: status={problem.status!r} (not runnable)"))
             continue
         for prof in profiles:
             if verbose:
-                print(f"# run: {slug} x {prof.name} (hash {prof.profile_hash[:12]})", file=sys.stderr)
+                print(f"# run: {slug} x {prof.name} (hash {prof.profile_hash[:12]})",
+                      file=sys.stderr, flush=True)
             row = run_one(problem, prof, builder=builder)
-            rows.append(row)
+            _emit(row)
             if verbose:
                 tag = row["error"] or row["reporting_status"]
                 print(f"#   -> proven={row['proven']} status={tag} "
-                      f"injected={row['injected_context']} wall={row['wall_s']}s", file=sys.stderr)
+                      f"injected={row['injected_context']} wall={row['wall_s']}s",
+                      file=sys.stderr, flush=True)
     write_rows(rows, out)
     if verbose:
-        print(f"# wrote {len(rows)} rows -> {out}", file=sys.stderr)
+        print(f"# wrote {len(rows)} rows -> {out}", file=sys.stderr, flush=True)
     return rows
 
 

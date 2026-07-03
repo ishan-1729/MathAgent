@@ -1,0 +1,27 @@
+# ABLATION: the default profile with the population (breadth-search) knob set to K=10.
+#
+# stages.population=10 -> the driver runs a breadth of 10 sketch candidates per node before selecting;
+# K=0 (default) is the no-breadth baseline. Pairs with population-3.yaml to trace the breadth curve.
+# Evidence: AlphaProof's Nexus best-of-K sampling swept K in {1,3,6,10}; K=10 is the high-breadth end of
+# that curve — the point of diminishing best-of-K returns, so this arm bounds the breadth headroom.
+name: ablation-population-10
+notes: "Ablation of the default profile: population K=10 (AlphaProof Nexus best-of-K, high-breadth arm)."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 10
+  evolve_fallback: 0
+  refine: false
+  h0_consistency: true
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

@@ -1,0 +1,33 @@
+# ABLATION: the OpenEvolve ensemble at an EVEN 50/50 breadth/depth mix (vs the 80/20 default).
+#
+# ensemble = sonnet breadth @ 0.5 / opus depth @ 0.5 -> the strong depth model is sampled far more often
+# than in the AlphaEvolve-style 80/20 default (which samples cheap breadth 4x as often). evolve_fallback=20
+# arms the search. Pairs with breadth-only / depth-only to trace the mix curve around the 80/20 default.
+# Evidence: AlphaEvolve's breadth/depth ensemble is a TUNABLE mix, not a fixed constant; this arm probes
+# whether shifting weight toward the strong model past the default 0.2 depth share pays for its cost.
+name: ablation-ensemble-50-50
+notes: "Ablation: OpenEvolve ensemble 50/50 (Sonnet 0.5 / Opus 0.5) vs the 80/20 default mix."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 20
+  refine: false
+  h0_consistency: true
+ensemble:
+  breadth_model: sonnet
+  depth_model: opus
+  breadth_weight: 0.5
+  depth_weight: 0.5
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

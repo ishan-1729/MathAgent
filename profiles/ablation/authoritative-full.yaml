@@ -1,0 +1,35 @@
+# ABLATION: the "EVERYTHING ON + CERTIFICATION" arm — authoritative elementarity with breadth + refine.
+#
+# elementarity=authoritative wires the terminal Layer-4 gate and, with lean.per_node + lean.server, Lean-
+# verifies every leaf + AND-composition (LEAN_VERIFIED reachable). On top of authoritative.yaml this adds
+# population=3 (best-of-K breadth) and refine=True (AutoReason tournament) — the maximal in-engine config.
+# Requires a built Lean REPL and a resolvable formalizer (supervisor S1/S2 fail closed otherwise); DAG only.
+# Evidence: the upper-bound arm — combines AlphaProof best-of-K breadth + AutoReason refine + full Layer-4
+# certification to measure whether the certified-elementary reach improves when every knob is turned on.
+name: ablation-authoritative-full
+notes: "Ablation: authoritative + population=3 + refine ON — everything-on certified-elementary arm."
+mode: dag
+elementarity: authoritative
+stages:
+  decompose: true
+  review: true
+  population: 3
+  evolve_fallback: 0
+  refine: true
+  h0_consistency: true
+roles:
+  # Pin the formalizer to Opus (matches authoritative.yaml): the Opus ClaudeFormalizer is what cleared
+  # the autoformalization reach map for the terminal Layer-4 gate.
+  formalizer:
+    provider: claude
+    model: opus
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: true
+  terminal: true
+  strict: false
+  server: true

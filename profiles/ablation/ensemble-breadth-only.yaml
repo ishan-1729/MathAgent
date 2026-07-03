@@ -1,0 +1,33 @@
+# ABLATION: the OpenEvolve ensemble collapsed to BREADTH-ONLY (a single cheap Sonnet, no depth model).
+#
+# ensemble = sonnet breadth @ weight 1.0 / sonnet depth @ weight 0.0 -> every evolve generation samples
+# the cheap breadth model; the stronger depth model never fires. evolve_fallback=20 arms the search so the
+# ensemble actually runs. Pairs with ensemble-depth-only / -50-50 against the 80/20 default mix.
+# Evidence: AlphaProof reports that cheap-prover-ONLY configurations solved ZERO hard problems; this arm
+# is designed to reproduce that failure signal and quantify what pure breadth cannot reach.
+name: ablation-ensemble-breadth-only
+notes: "Ablation: OpenEvolve ensemble breadth-only (Sonnet 1.0 / 0.0); AlphaProof cheap-only-solves-zero arm."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 20
+  refine: false
+  h0_consistency: true
+ensemble:
+  breadth_model: sonnet
+  depth_model: sonnet
+  breadth_weight: 1.0
+  depth_weight: 0.0
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false

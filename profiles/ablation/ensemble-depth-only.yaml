@@ -1,0 +1,33 @@
+# ABLATION: the OpenEvolve ensemble collapsed to DEPTH-ONLY (a single strong Opus, no cheap breadth).
+#
+# ensemble = opus breadth @ weight 0.0 / opus depth @ weight 1.0 -> every evolve generation samples the
+# strong depth model; the cheap breadth model never fires. evolve_fallback=20 arms the search so the
+# ensemble actually runs. Pairs with ensemble-breadth-only / -50-50 against the 80/20 default mix.
+# Evidence: the depth counterpart to AlphaProof's cheap-only warning — it measures the cost/quality
+# ceiling of an all-strong-model search (no breadth diversity, maximum per-call cost).
+name: ablation-ensemble-depth-only
+notes: "Ablation: OpenEvolve ensemble depth-only (Opus 0.0 / 1.0); all-strong-model, no-breadth arm."
+mode: dag
+elementarity: soft
+stages:
+  decompose: true
+  review: true
+  population: 0
+  evolve_fallback: 20
+  refine: false
+  h0_consistency: true
+ensemble:
+  breadth_model: opus
+  depth_model: opus
+  breadth_weight: 0.0
+  depth_weight: 1.0
+budgets:
+  max_llm_calls: 60
+  max_depth: 3
+  max_decomp_attempts: 2
+  episodes: 3
+lean:
+  per_node: false
+  terminal: false
+  strict: false
+  server: false
