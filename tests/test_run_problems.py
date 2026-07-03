@@ -124,28 +124,37 @@ def test_discover_skips_template_and_finds_all_authored():
 
 
 # --------------------------------------------------------------------------------------------------
-# Context injection: the clause appears in the goal iff the problem declares per-problem inputs.
+# Context injection (Fix 2): the citable-inputs clause travels the seed-context CHANNEL — the goal
+# handed to the builder stays the PURE statement (never carries the clause), and the clause is the
+# SECOND element returned by context_for(), forwarded as build_and_run(..., context=...).
 # --------------------------------------------------------------------------------------------------
-def test_goal_for_injects_only_when_note_present():
+def test_context_for_returns_pure_statement_and_clause_only_when_note_present():
     lj = rp.load_problem(_PROBLEMS_DIR / "ljunggren_equation")
-    goal, injected = rp.goal_for(lj)
-    assert injected is True
-    assert "Per-problem citable inputs" in goal
-    assert lj.statement in goal
+    statement, clause = rp.context_for(lj)
+    # The goal string is the PURE statement — the clause is NOT appended to it (goal identity is clean).
+    assert statement == lj.statement
+    assert "Per-problem citable inputs" not in statement
+    # The clause is the dedicated context channel's payload.
+    assert clause is not None
+    assert "Per-problem citable inputs" in clause
+    assert lj.allowed_inputs_note in clause
 
     imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
-    goal2, injected2 = rp.goal_for(imo)
-    assert injected2 is False
-    assert goal2 == imo.statement
-    assert "Per-problem citable inputs" not in goal2
+    statement2, clause2 = rp.context_for(imo)
+    assert statement2 == imo.statement
+    assert clause2 is None
 
 
-def test_builder_receives_injected_clause_exactly_for_declared_inputs(tmp_path):
-    """Capture the goal string handed to the (fake) builder: injected for ljunggren, bare for imo."""
-    seen: dict[str, str] = {}
+def test_builder_receives_pure_goal_and_clause_via_context_channel(tmp_path):
+    """Fix 2 (test spec c): the goal handed to the builder is the PURE statement even for a
+    context-carrying problem, while the citable-inputs clause arrives via the keyword-only ``context``
+    channel; the row's injected_context flag stays True. Captured via a stub builder."""
+    seen_goal: dict[str, str] = {}
+    seen_ctx: dict[str, object] = {}
 
-    def builder(profile, goal):
-        seen[profile.name] = goal
+    def builder(profile, goal, **kwargs):
+        seen_goal[profile.name] = goal
+        seen_ctx[profile.name] = kwargs.get("context")
         return _StubResult(proven=True)
 
     lj = rp.load_problem(_PROBLEMS_DIR / "ljunggren_equation")
@@ -153,15 +162,20 @@ def test_builder_receives_injected_clause_exactly_for_declared_inputs(tmp_path):
     prof = _scripted_profile("cap")
 
     row_lj = rp.run_one(lj, prof, builder=builder)
-    lj_goal = seen["cap"]
-    seen.clear()
+    lj_goal, lj_ctx = seen_goal["cap"], seen_ctx["cap"]
+    seen_goal.clear(); seen_ctx.clear()
     row_imo = rp.run_one(imo, prof, builder=builder)
-    imo_goal = seen["cap"]
+    imo_goal, imo_ctx = seen_goal["cap"], seen_ctx["cap"]
 
-    # The clause is present in the ljunggren goal (and the row flags it); absent for imo.
-    assert "Per-problem citable inputs" in lj_goal
-    assert lj.allowed_inputs_note.split(";")[0][:20] in lj_goal
-    assert "Per-problem citable inputs" not in imo_goal
+    # The GOAL handed to the builder is the PURE statement for BOTH problems (clause never in the goal).
+    assert lj_goal == lj.statement
+    assert "Per-problem citable inputs" not in lj_goal
+    assert imo_goal == imo.statement
+    # The ljunggren clause arrives via the dedicated context channel; imo gets None.
+    assert lj_ctx is not None and "Per-problem citable inputs" in lj_ctx
+    assert lj.allowed_inputs_note.split(";")[0][:20] in lj_ctx
+    assert imo_ctx is None
+    # The row still flags injected context for ljunggren (a clause was passed), not for imo.
     assert row_lj["injected_context"] is True
     assert row_imo["injected_context"] is False
 
@@ -170,7 +184,7 @@ def test_builder_receives_injected_clause_exactly_for_declared_inputs(tmp_path):
 # Full offline sweep: well-formed rows with profile_hash; skip/error rows; no crash.
 # --------------------------------------------------------------------------------------------------
 def test_full_sweep_offline_writes_well_formed_rows(tmp_path):
-    def builder(profile, goal):
+    def builder(profile, goal, **kwargs):
         return _StubResult(proven=True, spent=5, nodes=2)
 
     discovered = rp.discover_problems(_PROBLEMS_DIR)
@@ -221,7 +235,7 @@ def test_malformed_folder_produces_error_row_not_crash(tmp_path):
 
     discovered = rp.discover_problems(pdir)
     rows = rp.run_sweep(discovered, [_scripted_profile("m")], tmp_path / "o.jsonl",
-                        builder=lambda p, g: _StubResult(proven=True), verbose=False)
+                        builder=lambda p, g, **kw: _StubResult(proven=True), verbose=False)
     by_problem = {r["problem"]: r for r in rows}
     assert "load error" in by_problem["broken"]["error"]
     assert by_problem["broken"]["proven"] is False
@@ -230,7 +244,7 @@ def test_malformed_folder_produces_error_row_not_crash(tmp_path):
 
 
 def test_bad_builder_run_is_error_row_and_sweep_continues(tmp_path):
-    def builder(profile, goal):
+    def builder(profile, goal, **kwargs):
         if profile.name == "boom":
             raise RuntimeError("kaboom")
         return _StubResult(proven=True)
@@ -252,8 +266,8 @@ def test_reporting_status_authoritative_when_terminal_gate_certifies(tmp_path):
 
     imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
     row = rp.run_one(imo, _scripted_profile("auth"),
-                     builder=lambda p, g: _StubResult(proven=True, authoritative=True,
-                                                      terminal=_Terminal()))
+                     builder=lambda p, g, **kw: _StubResult(proven=True, authoritative=True,
+                                                            terminal=_Terminal()))
     assert row["reporting_status"] == "authoritative_elementary"
     assert row["authoritative_elementary"] is True
 
@@ -265,7 +279,7 @@ def test_csv_output_has_header_and_rows(tmp_path):
     imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
     out = tmp_path / "runs.csv"
     rp.run_sweep([(imo.slug, imo, None)], [_scripted_profile("a"), _scripted_profile("b")], out,
-                 builder=lambda p, g: _StubResult(proven=True), verbose=False)
+                 builder=lambda p, g, **kw: _StubResult(proven=True), verbose=False)
     lines = [ln for ln in out.read_text().splitlines() if ln]
     assert lines[0].split(",") == rp.ROW_FIELDS
     assert len(lines) == 3  # header + 2 rows
@@ -275,7 +289,7 @@ def test_rerun_is_diffable_except_wall(tmp_path):
     imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
     prof = _scripted_profile("repro")
     triple = [(imo.slug, imo, None)]
-    b = lambda p, g: _StubResult(proven=True, spent=7, nodes=1)
+    b = lambda p, g, **kw: _StubResult(proven=True, spent=7, nodes=1)
     r1 = rp.run_sweep(triple, [prof], tmp_path / "1.jsonl", builder=b, verbose=False)[0]
     r2 = rp.run_sweep(triple, [prof], tmp_path / "2.jsonl", builder=b, verbose=False)[0]
     r1.pop("wall_s"); r2.pop("wall_s")
@@ -299,7 +313,7 @@ def test_main_selects_single_problem_and_writes_row(tmp_path, monkeypatch):
     # Route the real builder through a stub so main() is fully offline.
     import agent.orchestrator.builder as builder_mod
     monkeypatch.setattr(builder_mod, "build_and_run",
-                        lambda profile, goal: _StubResult(proven=True), raising=True)
+                        lambda profile, goal, **kwargs: _StubResult(proven=True), raising=True)
     prof = _scripted_profile("cli")
     ppath = tmp_path / "p.yaml"
     import yaml

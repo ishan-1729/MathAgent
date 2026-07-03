@@ -260,6 +260,14 @@ class DagDriver:
         # conclusion-binding live outside these chokepoints and are never relaxed. The flag only ever
         # flips the elementarity dimension; it never touches goal<->claim soundness.
         self.enforce_elementarity = bool(enforce_elementarity)
+        # PER-RUN SEED CONTEXT (Fix 2): an optional prover-facing clause (e.g. a problem's per-problem
+        # citable-inputs whitelist) stored for the whole run by `run(goal, context=...)`. It is threaded
+        # as a STANDING lesson into EVERY RalphLoop invocation (root AND child subgoals) and into the
+        # decomposer feedback. It is per-RUN context, NOT per-node: a child sub-lemma may legitimately
+        # need the same citable inputs (e.g. quartic-residue permission on a Ljunggren sub-lemma), so the
+        # SAME context is threaded into child RalphLoop calls too. It NEVER touches goal identity —
+        # goal-binding always checks the pure goal string. None (the default) is byte-identical to before.
+        self.context: Optional[str] = None
 
     def _refute_for_enforcement(self, source, goal: Optional[str]):
         """Run the independent adversarial verifier, applying the ELEMENTARITY-ENFORCEMENT switch.
@@ -283,7 +291,12 @@ class DagDriver:
                               inspected_steps=verdict.inspected_steps,
                               rules_evaluated=verdict.rules_evaluated)
 
-    def run(self, goal: str) -> DagResult:
+    def run(self, goal: str, *, context: Optional[str] = None) -> DagResult:
+        """Prove ``goal`` end to end. ``context`` (Fix 2) is optional per-RUN seed context — a
+        prover-facing clause stored on the driver and threaded as a STANDING lesson into every RalphLoop
+        invocation (root AND child subgoals) and the decomposer feedback. It NEVER changes goal identity
+        (goal-binding checks the pure goal string); None is byte-identical to the pre-feature path."""
+        self.context = context
         proven = self._prove(goal, ancestors=set(), depth=0)
 
         # Terminal authoritative gate: formalize the assembled proof -> Lean Layer-4 audit -> faithfulness.
@@ -375,10 +388,14 @@ class DagDriver:
 
         node.state = NodeState.IN_PROGRESS
 
-        # 1. Direct attempt (Ralph loop with the focused prover).
+        # 1. Direct attempt (Ralph loop with the focused prover). The per-RUN seed context (Fix 2) is
+        # threaded into EVERY RalphLoop.run — this `_prove` runs for the root AND every child subgoal
+        # (via `_prove_and_children`), so passing self.context here propagates the same standing lesson
+        # to child nodes too (context is per-RUN, not per-node; a child may legitimately need the same
+        # citable inputs). It is prover-facing only; goal-binding still checks the pure goal string.
         ralph = RalphLoop(self.prover, toolkit=self.toolkit, budget=self.budget,
                           trace=self.trace, max_episodes=self.ralph_episodes, judges=self.judges)
-        res = ralph.run(goal)
+        res = ralph.run(goal, context=self.context)
         node.attempts += res.episodes
 
         # DECIDE the next move via the TOTAL FSM table; the orchestrator EXECUTES the returned Action.
@@ -459,7 +476,11 @@ class DagDriver:
             self.trace.emit("decomposer_absent", goal=goal[:80], reason=reason)
             return False
 
-        feedback = list(res.lessons)
+        # The per-RUN seed context (Fix 2) is a STANDING prefix on the decomposer feedback too, so the
+        # decomposer sees the same citable-inputs clause the prover does. It is prover/decomposer-facing
+        # context only and never enters goal identity. None (the default) leaves the feedback unchanged.
+        context_prefix: list[str] = [self.context] if self.context else []
+        feedback = context_prefix + list(res.lessons)
         child_ancestors = ancestors | {key}
         last_reason = ReasonCode.gap_found.value
 
@@ -723,6 +744,19 @@ class DagDriver:
                             reason=ReasonCode.elementary_violation.value)
             return False
         if verdict.refuted:
+            # Fix 3 (assertion-comment, NOT a routing change): a refutation reaching HERE should be a
+            # GENUINE elementarity violation (denylist_prose / undischarged_elastic), NOT a bare
+            # goal_binding miss. With Fix 1 in place, RalphLoop pre-filters goal-binding as a per-episode
+            # acceptance criterion, so a res.success ledger AND a NEEDS_REVIEW ledger routed here are
+            # already goal-bound — refute_elementary should no longer refute purely on 'goal_binding'
+            # through this path (which would misclassify a binding miss as terminal FAILED_ELEMENTARY at
+            # 1 call). Classifying FAILED_ELEMENTARY here is only correct for a real elementarity
+            # violation; if the codes are ONLY goal_binding, Ralph's pre-filter regressed (a bug).
+            assert not (verdict.refutations
+                        and all(r.code == "goal_binding" for r in verdict.refutations)), (
+                "refute_elementary refuted a NEEDS_REVIEW direct proof PURELY on goal_binding after "
+                "Ralph's per-episode binding pre-filter should have caught it — this is a Ralph "
+                "pre-filter regression, not a genuine elementarity violation")
             self.dag.mark_failed(goal, elementary=True,
                                  reason=ReasonCode.elementary_violation.value)
             self.trace.emit("verifier_refuted", goal=goal[:80], step=verdict.offending_step,

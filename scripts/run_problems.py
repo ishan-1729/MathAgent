@@ -13,12 +13,16 @@ Flow (mirrors scripts/ablate.py, the sibling sweep harness)::
       -> for each --profile:  build_and_run(profile, goal)  [supervisor fail-CLOSED first]
       -> one JSONL/CSV row per (problem, profile), reusing prove.py's categorical report_status.
 
-Per-problem context injection: when a problem declares per-problem citable inputs (e.g. Ljunggren's
-quartic-residue whitelist, the triangular-number three-squares theorem), and the harness exposes no
-supported side-channel for extra context (it does not — ``build_and_run`` takes only ``(profile, goal)``),
-the runner appends a short "Per-problem citable inputs: ..." clause to the goal STATEMENT handed to the
-prover and records ``injected_context=True`` on the row. It does NOT build a new gate-config channel —
-the GLOBAL gate stays authoritative; the clause is only prover-facing prompt context.
+Per-problem context injection (Fix 2): when a problem declares per-problem citable inputs (e.g.
+Ljunggren's quartic-residue whitelist, the triangular-number three-squares theorem), the runner passes
+them through the harness's dedicated seed-context CHANNEL — ``build_and_run(profile, goal, context=...)``
+threads the clause as a standing prover/decomposer lesson WITHOUT touching goal identity. Crucially the
+goal string handed to the builder stays the PURE statement, so goal-binding hashes the mathematics only
+(previously the clause was APPENDED to the goal string, which made the goal's hash include the clause
+while the prover restated only the mathematics — every context-injected problem then died at 1 call on a
+spurious goal_binding refutation). The row records ``injected_context=True`` when a clause was passed.
+It does NOT build a new gate-config channel — the GLOBAL gate stays authoritative; the clause is only
+prover-facing prompt context.
 
 SAFETY: like ablate.py, this never exec/eval/imports model output; it only constructs + runs drivers via
 the builder, whose deterministic gate stays authoritative. A folder that fails to parse, a profile the
@@ -248,22 +252,29 @@ def discover_problems(problems_dir: Path) -> list[tuple[str, Optional[Problem], 
 
 
 # --------------------------------------------------------------------------------------------------
-# Per-problem context injection: append the citable-inputs clause to the goal handed to the prover.
+# Per-problem context injection (Fix 2): the citable-inputs clause travels the seed-context CHANNEL —
+# it is NOT appended to the goal string (which would corrupt goal-binding), so goal identity stays pure.
 # --------------------------------------------------------------------------------------------------
-def goal_for(problem: Problem) -> tuple[str, bool]:
-    """Return ``(goal_string, injected)`` for a problem.
+def context_for(problem: Problem) -> tuple[str, Optional[str]]:
+    """Return ``(statement, context_clause_or_None)`` for a problem.
 
-    When the problem declares a per-problem ``allowed_inputs_note``, append a compact
-    "Per-problem citable inputs: ..." clause to the statement (the ONLY supported channel — the harness
-    exposes no extra-context param) and flag ``injected=True``. Otherwise return the bare statement with
-    ``injected=False``. The clause is prover-facing prompt context only; the global gate stays
-    authoritative and is NOT reconfigured."""
+    The FIRST element is ALWAYS the PURE ``problem.statement`` — the goal string handed to the builder,
+    whose hash must include only the mathematics (goal-binding depends on this).
+
+    The SECOND element is the seed-context CLAUSE: when the problem declares a per-problem
+    ``allowed_inputs_note``, a compact "Per-problem citable inputs: ..." clause the caller forwards via
+    ``build_and_run(..., context=clause)`` (a standing prover/decomposer lesson), or ``None`` when the
+    problem declares no per-problem inputs. The clause is prover-facing prompt context only; the global
+    gate stays authoritative and is NOT reconfigured.
+
+    (Previously this was ``goal_for`` and APPENDED the clause to the goal string; that made the goal's
+    hash include the clause while the prover restated only the mathematics, so every context-injected
+    problem died at 1 call on a spurious goal_binding refutation. Fix 2 routes the clause off the goal.)"""
     if problem.allowed_inputs_note:
-        goal = (f"{problem.statement}\n\n"
-                f"Per-problem citable inputs (admitted for this problem only): "
-                f"{problem.allowed_inputs_note}")
-        return goal, True
-    return problem.statement, False
+        clause = (f"Per-problem citable inputs (admitted for this problem only): "
+                  f"{problem.allowed_inputs_note}")
+        return problem.statement, clause
+    return problem.statement, None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -282,7 +293,10 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None) -> dict:
     inject a stub so the harness is exercised fully offline."""
     if builder is None:
         from agent.orchestrator.builder import build_and_run as builder  # lazy: keep import cheap
-    goal, injected = goal_for(problem)
+    # Fix 2: the goal handed to the builder is the PURE statement; the per-problem citable-inputs clause
+    # (if any) travels the dedicated seed-context CHANNEL (context=...) so it never enters goal identity.
+    statement, context_clause = context_for(problem)
+    injected = context_clause is not None
     row = _blank_row()
     row["problem"] = problem.slug
     row["tier"] = problem.tier
@@ -296,7 +310,8 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None) -> dict:
     row["contaminated"] = problem.contaminated
     t0 = time.perf_counter()
     try:
-        res = builder(profile, goal)
+        # PURE statement as the goal; the citable-inputs clause via the keyword-only context channel.
+        res = builder(profile, statement, context=context_clause)
         row["proven"] = bool(getattr(res, "proven", False))
         authoritative = bool(getattr(res, "authoritative_elementary", False))
         row["authoritative_elementary"] = authoritative

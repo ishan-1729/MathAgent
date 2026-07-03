@@ -238,6 +238,74 @@ def test_goal_bound_ledger_still_succeeds():
     assert res.episodes == 1
 
 
+# ---- Fix 2 (context threading): the per-RUN seed context is a STANDING lesson prepended to the
+#      feedback on EVERY episode (incl. after a failure), while goal-binding checks the PURE goal. ----
+
+class _SpyProver:
+    """Records the (goal, feedback) it was handed each episode. Episode 1 paraphrases (fails binding),
+    episode 2 binds — so we can assert the context clause arrives BOTH before and after the failure."""
+
+    def __init__(self, goal: str, paraphrase: str):
+        self._goal = goal
+        self._paraphrase = paraphrase
+        self.calls = 0
+        self.goals: list[str] = []
+        self.feedbacks: list = []
+
+    def prove(self, problem: str, feedback=None) -> str:
+        self.calls += 1
+        self.goals.append(problem)
+        self.feedbacks.append(list(feedback) if feedback else [])
+        if self.calls == 1:
+            return _paraphrased_ledger(self._paraphrase)
+        return _passing_ledger(self._goal)
+
+
+def _paraphrased_ledger(paraphrase: str) -> str:
+    """A gate-passing ledger whose claim/conclusion is `paraphrase`, not the goal (fails binding)."""
+    return json.dumps({
+        "problem": "p", "claim": paraphrase,
+        "steps": [
+            {"id": "s1", "claim": "x", "justification": "given", "depends_on": []},
+            {"id": "s2", "claim": paraphrase, "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    })
+
+
+def test_context_is_standing_lesson_on_every_episode_and_not_in_goal():
+    """Fix 2 (test spec b): a per-RUN context clause passed to RalphLoop.run(goal, context=...) arrives
+    in the prover feedback on EVERY episode — including episode 2, AFTER episode 1's binding failure —
+    as a STANDING lesson (never consumed). Meanwhile the GOAL string handed to the prover (and to
+    goal-binding) is the PURE goal and never contains the clause."""
+    goal = "For every integer n, n^2 is 0 or 1 mod 4."
+    clause = "Per-problem citable inputs: quartic-residue whitelist for this problem only."
+    prover = _SpyProver(goal, paraphrase="n squared mod 4 is 0 or 1")
+    res = RalphLoop(prover, toolkit=TOOLKIT, trace=RunTrace("t"), max_episodes=3).run(
+        goal, context=clause)
+    assert res.success is True
+    assert prover.calls == 2                       # ep1 paraphrase (fails binding), ep2 binds
+    # The context clause is the FIRST (standing) feedback item on BOTH episodes.
+    assert prover.feedbacks[0][0] == clause        # episode 1: standing context, no prior lessons
+    assert prover.feedbacks[1][0] == clause        # episode 2: standing context STILL first, after fail
+    # Episode 2 also carries the verbatim-restatement lesson from episode 1 (context did NOT displace it).
+    assert any("verbatim" in item for item in prover.feedbacks[1])
+    # The GOAL handed to the prover is the PURE goal on every episode — the clause is NOT in it.
+    assert all(g == goal for g in prover.goals)
+    assert all(clause not in g for g in prover.goals)
+
+
+def test_no_context_is_byte_identical_feedback():
+    """With context=None (the default), the feedback the prover receives is exactly the pre-feature
+    feedback (no standing prefix injected)."""
+    goal = "some goal G"
+    prover = _SpyProver(goal, paraphrase="paraphrase")
+    RalphLoop(prover, toolkit=TOOLKIT, trace=RunTrace("t"), max_episodes=3).run(goal)
+    # Episode 1: no feedback at all (empty). Episode 2: only the verbatim-restatement lesson, no prefix.
+    assert prover.feedbacks[0] == []
+    assert all("Per-problem" not in item for item in prover.feedbacks[1])
+    assert any("verbatim" in item for item in prover.feedbacks[1])
+
+
 def test_raising_judge_does_not_crash_run():
     """A live adversarial-judge call that RAISES must NOT crash run(): fail CLOSED (an un-runnable judge
     leaves the ledger not cleanly admitted) and surface the error on the trace. Pre-change,

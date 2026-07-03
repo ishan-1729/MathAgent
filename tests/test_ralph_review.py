@@ -82,3 +82,69 @@ def test_needs_review_with_failing_judge_retries_not_unhandled():
     assert res.success is False
     # Judges were present, so the review was handled (failed), not silently unhandled.
     assert trace.by_kind("review_unhandled") == []
+
+
+# ---- Fix 1 (ordering): the per-episode goal-binding check runs BEFORE the NEEDS_REVIEW-no-judge
+#      return, so an UNBOUND NEEDS_REVIEW ledger is a FAILED (feedback-repair) episode, not a
+#      terminal review_unhandled exhaustion. Only a BOUND NEEDS_REVIEW ledger takes review_unhandled.
+
+def _unbound_descent_ledger():
+    """A structurally-valid NEEDS_REVIEW ledger (elastic `descent`) whose claim/conclusion is a
+    PARAPHRASE, not the run() goal "p" — so it is gate-admitted NEEDS_REVIEW but NOT goal-bound."""
+    return json.dumps({
+        "problem": "p", "claim": "some paraphrase of p",
+        "steps": [
+            {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
+             "obligations": {"descent": {"measure": "x", "strictly_decreases": True,
+                                         "stays_in_domain": True}}},
+            {"id": "s2", "claim": "some paraphrase of p", "justification": "conclusion",
+             "depends_on": ["s1"]},
+        ],
+    })
+
+
+def test_unbound_needs_review_is_feedback_repair_not_review_unhandled():
+    """Fix 1 core: episode 1 returns an UNBOUND NEEDS_REVIEW ledger (gate says NEEDS_REVIEW, but the
+    claim/conclusion paraphrases the goal). Because goal-binding is now checked FIRST, this is a FAILED
+    episode carrying the verbatim-restatement lesson (NOT the terminal review_unhandled exhaustion that
+    would route the driver to a 1-call FAILED_ELEMENTARY). Episode 2 returns a BOUND NEEDS_REVIEW ledger,
+    which THEN takes the review_unhandled path (exhausted, no judge to resolve it)."""
+    trace = RunTrace("t")
+    prover = ScriptedProver([_unbound_descent_ledger(), _descent_ledger()])
+    res = RalphLoop(prover, toolkit=TOOLKIT, trace=trace, judges=None, max_episodes=3).run("p")
+    # Episode 1 unbound -> feedback repair (not review_unhandled). Episode 2 bound NEEDS_REVIEW,
+    # no judge -> the review_unhandled exhaustion. Two episodes ran.
+    assert res.success is False
+    assert res.exhausted is True
+    assert res.episodes == 2
+    # The unbound episode was recorded as a goal-unbound feedback-repair, NOT a review_unhandled.
+    unbound = trace.by_kind("ralph_goal_unbound")
+    assert len(unbound) == 1
+    # review_unhandled fires exactly ONCE, on the BOUND episode 2 (not the unbound episode 1).
+    unhandled = trace.by_kind("review_unhandled")
+    assert len(unhandled) == 1
+    assert "elastic_justification" in unhandled[0].data["reviews"]
+    # The verbatim-restatement lesson from episode 1 is carried into the loop's lessons.
+    assert any("verbatim" in l for l in res.lessons)
+
+
+def test_unbound_passed_ledger_also_feedback_repair_regardless_of_verdict():
+    """Fix 1 semantics: an unbound ledger is a FAILED episode REGARDLESS of gate verdict. Here episode 1
+    is an unbound PASSED_DETERMINISTIC ledger (no elastic step) — still feedback-repair, not success —
+    and episode 2 binds and succeeds cleanly."""
+    def _unbound_passed():
+        return json.dumps({
+            "problem": "p", "claim": "paraphrase",
+            "steps": [
+                {"id": "s1", "claim": "x", "justification": "given", "depends_on": []},
+                {"id": "s2", "claim": "paraphrase", "justification": "conclusion",
+                 "depends_on": ["s1"]},
+            ],
+        })
+    trace = RunTrace("t")
+    prover = ScriptedProver([_unbound_passed(), _passing_ledger()])
+    res = RalphLoop(prover, toolkit=TOOLKIT, trace=trace, judges=None, max_episodes=3).run("p")
+    assert res.success is True
+    assert res.episodes == 2
+    assert len(trace.by_kind("ralph_goal_unbound")) == 1
+    assert trace.by_kind("review_unhandled") == []

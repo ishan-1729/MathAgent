@@ -237,14 +237,22 @@ def _resolve_evolve_fallback(profile: RunProfile, toolkit: Toolkit):
         return None
 
 
-def build_and_run(profile: RunProfile, goal: str, *, toolkit: Optional[Toolkit] = None,
+def build_and_run(profile: RunProfile, goal: str, *, context: Optional[str] = None,
+                  toolkit: Optional[Toolkit] = None,
                   trace: Optional[RunTrace] = None) -> DagResult:
     """Validate + build (via :func:`build_driver`) then ``.run(goal)``. The one-call entry point.
 
     Forwards the optional ``toolkit``/``trace`` to :func:`build_driver` (previously dropped) so a caller
-    can share one toolkit/trace across a build_and_run just as with build_driver."""
+    can share one toolkit/trace across a build_and_run just as with build_driver.
+
+    ``context`` (Fix 2) is optional per-RUN seed context — a prover-facing clause (e.g. a problem's
+    per-problem citable-inputs whitelist) forwarded to ``DagDriver.run(goal, context=...)``. It is
+    threaded as a standing lesson into every RalphLoop invocation and the decomposer feedback; it NEVER
+    changes goal identity (the goal string handed here stays the PURE statement). The param is
+    keyword-only with a None default, so every existing positional caller (e.g. ``builder(profile,
+    goal)`` in ablate.py / tests) is unchanged."""
     driver = build_driver(profile, toolkit=toolkit, trace=trace)
-    return driver.run(goal)
+    return driver.run(goal, context=context)
 
 
 __all__ = ["build_driver", "build_and_run"]

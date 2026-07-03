@@ -2246,3 +2246,77 @@ def test_enforce_default_is_true_byte_identical_construction():
     # The whole pre-feature dag_driver suite (above) runs with this default -> byte-identical behavior.
     src = relabeled_undischarged_descent("G")
     assert d._refute_for_enforcement(src, "G").refuted == refute_elementary(src, TOOLKIT, goal="G").refuted
+
+
+# ---- Fix 2 (per-RUN seed context threading): the context passed to DagDriver.run(goal, context=...)
+#      reaches the ROOT prover AND every CHILD sub-lemma prover as a standing feedback prefix, while
+#      goal identity stays pure (child goals never carry the clause). ----
+
+class _FeedbackRecordingProver:
+    """prove(goal) -> mapping[goal] (else a rejected default), recording the feedback per goal so a
+    test can assert the standing context clause reached each node's prover."""
+
+    def __init__(self, mapping: dict[str, str], default: str = BAD):
+        self.mapping = mapping
+        self.default = default
+        self.calls = 0
+        self.feedback_by_goal: dict[str, list] = {}
+
+    def prove(self, goal: str, feedback=None) -> str:
+        self.calls += 1
+        self.feedback_by_goal.setdefault(goal, []).append(list(feedback) if feedback else [])
+        return self.mapping.get(goal, self.default)
+
+
+class _FeedbackRecordingDecomposer:
+    """decompose(goal) -> mapping[goal], recording the feedback it was handed per goal."""
+
+    def __init__(self, mapping: dict[str, tuple[str, list[str]]]):
+        self.mapping = mapping
+        self.feedback_by_goal: dict[str, list] = {}
+
+    def decompose(self, goal: str, feedback=None):
+        self.feedback_by_goal.setdefault(goal, []).append(list(feedback) if feedback else [])
+        return self.mapping.get(goal, ("", []))
+
+
+def test_run_context_threads_to_root_and_child_provers():
+    """Fix 2 (test spec d): DagDriver.run(goal, context=clause) threads the clause as a standing
+    feedback prefix into the ROOT prover AND every decomposed CHILD's prover — context is per-RUN, not
+    per-node. The child goals themselves stay PURE (the clause is prover-facing feedback, never in the
+    goal string). Also asserts the decomposer feedback carries the clause."""
+    clause = "Per-problem citable inputs: quartic-residue whitelist for this problem only."
+    # G fails direct (default BAD) -> decompose into A, B, both proved directly.
+    prover = _FeedbackRecordingProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = _FeedbackRecordingDecomposer({"G": (sketch("G", ["A", "B"]), ["A", "B"])})
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW])).run(
+        "G", context=clause)
+    assert res.proven
+
+    # The ROOT prover (G) received the standing context clause as the FIRST feedback item every episode.
+    assert "G" in prover.feedback_by_goal
+    for fb in prover.feedback_by_goal["G"]:
+        assert fb and fb[0] == clause
+    # Both CHILD provers (A, B) ALSO received the standing context clause first — per-RUN propagation.
+    for child in ("A", "B"):
+        assert child in prover.feedback_by_goal, f"{child} prover was never invoked"
+        for fb in prover.feedback_by_goal[child]:
+            assert fb and fb[0] == clause, f"{child} prover missing standing context"
+    # The child goal strings stay PURE — the clause is feedback, never part of the goal identity.
+    assert "A" in prover.feedback_by_goal and "B" in prover.feedback_by_goal
+    assert not any(clause in g for g in prover.feedback_by_goal)
+    # The decomposer feedback for G also carries the clause (standing prefix on the decomposer path).
+    assert "G" in decomp.feedback_by_goal
+    assert any(clause in item for fb in decomp.feedback_by_goal["G"] for item in fb)
+
+
+def test_run_without_context_is_byte_identical_child_feedback():
+    """context=None (default): no standing prefix is injected — the child provers see the pre-feature
+    feedback (here empty, since the children prove on the first episode with no prior lessons)."""
+    prover = _FeedbackRecordingProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = _FeedbackRecordingDecomposer({"G": (sketch("G", ["A", "B"]), ["A", "B"])})
+    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW])).run("G")
+    assert res.proven
+    for child in ("A", "B"):
+        for fb in prover.feedback_by_goal[child]:
+            assert all("Per-problem" not in item for item in fb)

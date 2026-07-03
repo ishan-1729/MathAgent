@@ -368,6 +368,12 @@ def effective_profile(args) -> RunProfile:
 
 
 def main() -> int:
+    # Windows consoles default to cp1252, which cannot print Unicode math (≡, ², √) that appears in
+    # goals/ledgers — reconfigure to UTF-8 so a goal string can never crash a print (mirrors
+    # scripts/run_benchmark.py).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_arg_parser().parse_args()
     normalize_lean_flags(args)
 
