@@ -623,28 +623,39 @@ def main() -> int:
                 trace=trace, server=server, terminal_gate=terminal_gate, comparator=comparator,
                 refiner=refiner, evolve_fallback=evolve_fallback,
             )
-        res = driver.run(args.goal)
-        # In the --profile path the builder constructed its OWN budget from the profile; point the
-        # final "calls spent" report at the budget the driver actually spent (not main's unused one).
-        if getattr(args, "profile", None):
-            budget = res.budget
-        ok = res.proven
-        print(f"result: {'PROVEN' if ok else 'NOT PROVEN'}")
-        print(f"dag: {res.dag.stats()}")
-        import json as _json
-        print("\n--- proof tree ---\n" + _json.dumps(res.proof_tree(), indent=2))
-        # Report per-node Lean states: PROVEN (soft) vs the first-class LEAN_VERIFIED hard-success state.
-        if args.lean_per_node:
-            from agent.orchestrator.state import NodeState as _NodeState
-            lean_nodes = sum(1 for n in res.dag.nodes.values()
-                             if n.state is _NodeState.LEAN_VERIFIED)
-            soft_nodes = sum(1 for n in res.dag.nodes.values()
-                             if n.state is _NodeState.PROVEN)
-            print(f"node states: proven={soft_nodes} lean_verified={lean_nodes}")
-        if res.terminal is not None:
-            print("\nterminal Layer-4 gate:", res.terminal.summary())
-            print("authoritative_elementary:", res.authoritative_elementary)
-            cert_authoritative = res.authoritative_elementary
+        # LeanServer ownership: on the --profile path build_driver warms a LeanServer for lean.server
+        # profiles and stores it on driver.lean_server (mirroring build_and_run); this branch owns it for
+        # the single run, so it must close() it — otherwise a lean.server --profile run leaks an orphaned
+        # repl.exe holding Mathlib. try/finally so close() runs on BOTH success and a raising run()
+        # (DagDriver.close() is idempotent and never raises). The NON-profile path manages its OWN
+        # --server server, closed at the end of main(), so it does not close here.
+        profile_driven = bool(getattr(args, "profile", None))
+        try:
+            res = driver.run(args.goal)
+            # In the --profile path the builder constructed its OWN budget from the profile; point the
+            # final "calls spent" report at the budget the driver actually spent (not main's unused one).
+            if profile_driven:
+                budget = res.budget
+            ok = res.proven
+            print(f"result: {'PROVEN' if ok else 'NOT PROVEN'}")
+            print(f"dag: {res.dag.stats()}")
+            import json as _json
+            print("\n--- proof tree ---\n" + _json.dumps(res.proof_tree(), indent=2))
+            # Report per-node Lean states: PROVEN (soft) vs the first-class LEAN_VERIFIED hard-success state.
+            if args.lean_per_node:
+                from agent.orchestrator.state import NodeState as _NodeState
+                lean_nodes = sum(1 for n in res.dag.nodes.values()
+                                 if n.state is _NodeState.LEAN_VERIFIED)
+                soft_nodes = sum(1 for n in res.dag.nodes.values()
+                                 if n.state is _NodeState.PROVEN)
+                print(f"node states: proven={soft_nodes} lean_verified={lean_nodes}")
+            if res.terminal is not None:
+                print("\nterminal Layer-4 gate:", res.terminal.summary())
+                print("authoritative_elementary:", res.authoritative_elementary)
+                cert_authoritative = res.authoritative_elementary
+        finally:
+            if profile_driven:
+                driver.close()
 
     # Optional: close the loop — formalize the proven ledger to Lean and run the Layer-4 audit.
     winning_ledger = res.ledger if (args.direct and ok and res.ledger) else None

@@ -204,8 +204,10 @@ class DagDriver:
         # OpenEvolve FALLBACK decomposer (P3 / brief §9 #1, openevolve_stacking_brief §9 P2): fires ONLY
         # on STUCK nodes (after the normal direct + decomposer attempts have all failed). A flag-gated,
         # OPTIONAL Decomposer (typically OpenEvolveBackend). Its evolved blueprint is committed ONLY if
-        # it is goal-bound and its obligations are discharged — reusing the SAME Phase-1 binding +
-        # acyclicity/strict-simpler-child + H0 checks as a normal decomposition (no weaker gate). None =>
+        # it is goal-bound and its obligations are discharged — reusing the SAME _try_decomposition gate
+        # as a normal decomposition (goal-binding + obligation-discharge + acyclicity + sketch validity +
+        # H0; no weaker gate). Simplification is NOT a deterministic check — only the OPTIONAL soft
+        # ReviewVerdict.useful signal, when a reviewer is configured, prefers a simpler child. None =>
         # disabled (graceful no-op); also a no-op if the backend reports itself unavailable.
         self.evolve_fallback = evolve_fallback
         # OPT-IN per-node Lean authority (P0/P2): a callable (node_goal, node_proof_text) -> verdict
@@ -328,6 +330,20 @@ class DagDriver:
                         cache_hits=stats["cache_hits"], **self.budget.snapshot())
         return DagResult(goal=goal, proven=proven, dag=self.dag, trace=self.trace,
                          budget=self.budget, terminal=terminal)
+
+    def close(self) -> None:
+        """Release the warm LeanServer this driver was handed (if any). Idempotent and NEVER raises —
+        closing the REPL is best-effort teardown, not part of the proof result. Deliberately NOT called
+        from ``run()``: a ``build_driver`` caller may run several goals on one warm server, and
+        ``LeanServer.audit`` lazily restarts a closed server, so only the ONE-SHOT ``build_and_run`` path
+        (which owns the server it warmed) closes it. After this the field is a None-safe closed state."""
+        server, self.lean_server = self.lean_server, None
+        if server is None:
+            return
+        try:
+            server.close()
+        except Exception:
+            pass
 
     # ---- direct-attempt outcome -> FSM event classification -----------------------------------
     def _direct_event(self, res: RalphResult, goal: str) -> NodeEvent:
@@ -497,8 +513,12 @@ class DagDriver:
                 last_reason = ReasonCode.budget_starved.value
                 break
             if self.population_k and self.comparator is not None:
-                if self._prove_via_population(goal, feedback, child_ancestors, depth):
+                ok, reason = self._prove_via_population(goal, feedback, child_ancestors, depth)
+                if ok:
                     return True
+                # Carry the population arm's failing reason exactly like the non-population arm below, so
+                # a budget-starved committed child routes to EXHAUSTED (retryable), not FAILED_GAP.
+                last_reason = reason or last_reason
             else:
                 self.budget.spend_call()
                 # ROBUSTNESS (Thread 2): a live decomposer (Codex/Claude CLI) can RAISE (subprocess
@@ -527,8 +547,9 @@ class DagDriver:
 
         # STUCK node: the direct attempt failed AND every normal decomposition attempt failed. As a LAST
         # resort fire the OpenEvolve fallback decomposer (flag-gated). Its evolved blueprint is committed
-        # ONLY through the SAME _try_decomposition gate (goal-binding + acyclicity + strict-simpler-child
-        # + sketch validity + H0) plus an explicit goal-bound + obligation-discharge pre-check, so a
+        # ONLY through the SAME _try_decomposition gate (goal-binding + obligation-discharge + acyclicity
+        # + sketch validity + H0; simplification is only the OPTIONAL soft ReviewVerdict.useful signal,
+        # not a deterministic check) plus an explicit goal-bound + obligation-discharge pre-check, so a
         # gameable blueprint can never be committed. Graceful no-op if the backend is unavailable.
         if self._evolve_fallback_available() and self.budget.can_call():
             if self._try_evolve_fallback(goal, feedback, child_ancestors, depth):
@@ -603,7 +624,8 @@ class DagDriver:
 
         Spends one call, asks the fallback for an evolved blueprint, and commits it ONLY if it passes
         the deterministic goal-bound + obligation-discharge pre-check AND the full _try_decomposition
-        gate (acyclicity / strict-simpler-child / sketch validity / H0). Returns True iff the node proved
+        gate (goal-binding / obligation-discharge / acyclicity / sketch validity / H0; simplification is
+        only the OPTIONAL soft ReviewVerdict.useful signal, not a deterministic check). Returns True iff the node proved
         via the evolved blueprint. Any backend exception is a graceful failure (the node stays stuck)."""
         self.budget.spend_call()
         try:
@@ -1328,12 +1350,19 @@ class DagDriver:
         return _ok
 
     def _prove_via_population(self, goal: str, feedback: list[str],
-                             child_ancestors: set[str], depth: int) -> bool:
+                             child_ancestors: set[str], depth: int) -> tuple[bool, Optional[str]]:
         """Generate K candidate decompositions, rank them by an Elo comparison tournament, and try
         them best-first (AlphaProof_Nexus population/Elo over incomplete sketches).
 
         Candidates pass a DETERMINISTIC hard pre-gate (goal-binding + obligation-discharge) BEFORE the
-        tournament — a gate-gaming candidate is never ranked or selected (P3 / brief §9 #5)."""
+        tournament — a gate-gaming candidate is never ranked or selected (P3 / brief §9 #5).
+
+        Returns ``(True, None)`` on success; on failure ``(False, last_reason)`` where ``last_reason`` is
+        the LAST tried candidate's ``_try_decomposition`` ReasonCode (None if no candidate was ever tried,
+        e.g. empty cands or every candidate hard-filtered). The caller (``_decompose``) folds this into its
+        own ``last_reason`` so a budget-starved committed child routes the parent to a RETRYABLE EXHAUSTED
+        rather than a terminal FAILED_GAP that would poison the split-keyed memo (mirrors the non-population
+        arm; the same memo-poisoning bug the V1 child-reason propagation fixed)."""
         cands: list[Candidate] = []
         for i in range(self.population_k):
             if not self.budget.can_call():
@@ -1352,7 +1381,7 @@ class DagDriver:
             if children:
                 cands.append(Candidate(id=f"cand{i}", content=sketch, goal=goal, children=children))
         if not cands:
-            return False
+            return False, None
 
         # Hard pre-gate: a candidate failing goal-binding / obligation-discharge is NEVER admitted, so
         # the Elo/BT/PUCT machinery (unchanged) only ranks gate-passing candidates.
@@ -1363,7 +1392,7 @@ class DagDriver:
             # Every candidate failed the hard filter — nothing safe to rank.
             self.trace.emit("population_all_filtered", goal=goal[:80],
                             candidates=len(cands), rejected=pop.rejected_by_filter)
-            return False
+            return False, None
         comparisons = pop.tournament(self.comparator, rounds=self.population_rounds,
                                      budget_ok=self._compare_budget_ok, trace=self.trace)
         # Bradley-Terry latent strengths from the tournament win matrix (a stable batch estimate over
@@ -1372,17 +1401,19 @@ class DagDriver:
         self.trace.emit("population", goal=goal[:80], candidates=len(cands), comparisons=comparisons)
 
         tried = 0
+        last_reason: Optional[str] = None
         while tried < min(self.max_decomp_attempts, len(pop.candidates)):
             cand = pop.select_puct()
             if cand is None:
                 break
             tried += 1
-            ok, _notes, _reason = self._try_decomposition(goal, cand.content, cand.children,
+            ok, _notes, reason = self._try_decomposition(goal, cand.content, cand.children,
                                                           child_ancestors, depth)
             if ok:
-                return True
+                return True, None
+            last_reason = reason or last_reason   # keep the LAST tried candidate's real reason
             cand.alive = False          # don't reselect a failed candidate
-        return False
+        return False, last_reason
 
 
 # --------------------------------------------------------------------------------------------------

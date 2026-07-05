@@ -96,16 +96,25 @@ def _norm_claim(s: str) -> str:
 def _extract_json(text: str) -> dict:
     """Pull a ledger object out of raw text: a dict, a JSON string, or a fenced ```json block."""
     text = text.strip()
-    # Try a fenced block first (most common in LLM output).
-    m = _FENCE_RE.search(text)
-    candidate = m.group(1) if m else text
-    try:
-        obj = json.loads(candidate)
-    except json.JSONDecodeError as e:
-        raise LedgerError(f"could not parse ledger JSON: {e}") from e
-    if not isinstance(obj, dict):
+    # Prefer fenced blocks (most common in LLM output). A DECOY fence can precede the real ledger, so
+    # scan ALL fenced blocks and take the LAST one that parses as JSON — the real ledger is
+    # conventionally emitted last, so an earlier decoy cannot win. Fall back to the raw text when
+    # there is no fenced block.
+    matches = list(_FENCE_RE.finditer(text))
+    candidates = [m.group(1) for m in matches] if matches else [text]
+    parsed = None
+    last_err: Optional[json.JSONDecodeError] = None
+    for cand in reversed(candidates):
+        try:
+            parsed = json.loads(cand)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
+    if parsed is None:
+        raise LedgerError(f"could not parse ledger JSON: {last_err}") from last_err
+    if not isinstance(parsed, dict):
         raise LedgerError("ledger must be a JSON object")
-    return obj
+    return parsed
 
 
 def parse_ledger(source: Any) -> Ledger:

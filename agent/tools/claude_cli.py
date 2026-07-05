@@ -22,7 +22,9 @@ be shipped to OpenEvolve worker processes inside a model-factory.
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -32,6 +34,35 @@ from typing import Optional
 
 class ClaudeError(RuntimeError):
     pass
+
+
+# `model` reaches the cmd.exe command line (--model <model>); cmd.exe re-parses its arguments, so a
+# value like `x" & calc & rem "` would execute commands (BatBadBut). REJECT anything outside this
+# conservative shell-safe set rather than trying to escape it.
+_SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a launched process AND its descendants (stdlib only; no psutil).
+
+    On Windows the launcher is a cmd.exe shim whose claude/node grandchild outlives a plain
+    ``proc.kill()`` — use ``taskkill /T`` to walk the tree. On POSIX the child was started in its own
+    session (``start_new_session=True``) so ``killpg`` reaches the whole group. Then reap briefly.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
 
 
 def find_claude() -> Optional[str]:
@@ -55,6 +86,15 @@ class ClaudeConfig:
     model: str = "sonnet"
     timeout_s: int = 600
     launcher: Optional[str] = None
+
+    def __post_init__(self):
+        # `model` reaches the cmd.exe command line — reject shell metacharacters (fail closed) rather
+        # than sanitizing. Reachable from prove.py --model and ui/server.py /run?model=.
+        # fullmatch, not match: `$` would tolerate a trailing newline in a security gate.
+        if not (isinstance(self.model, str) and _SAFE_ARG_RE.fullmatch(self.model)):
+            raise ClaudeError(
+                f"invalid ClaudeConfig.model={self.model!r}: must match {_SAFE_ARG_RE.pattern}"
+            )
 
 
 def _run_claude(prompt: str, cfg: ClaudeConfig) -> str:
@@ -86,21 +126,27 @@ def _run_claude(prompt: str, cfg: ClaudeConfig) -> str:
     else:
         argv = [launcher, *flags]
 
+    # subprocess.run(timeout=...) only kills the cmd.exe shim; the real claude/node grandchild leaks.
+    # Use Popen + communicate(timeout) and, on timeout, kill the WHOLE process tree before raising.
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace",  # prompts contain Unicode (->, math); avoid cp1252
+        cwd=workdir,
+        start_new_session=(os.name != "nt"),  # POSIX: own process group so we can killpg the tree
+    )
     try:
-        proc = subprocess.run(
-            argv, input=prompt, capture_output=True,
-            encoding="utf-8", errors="replace",  # prompts contain Unicode (->, math); avoid cp1252
-            timeout=cfg.timeout_s, cwd=workdir,
-        )
+        try:
+            stdout, stderr = proc.communicate(input=prompt, timeout=cfg.timeout_s)
+        except subprocess.TimeoutExpired as e:
+            _kill_tree(proc)
+            raise ClaudeError(f"claude -p timed out after {cfg.timeout_s}s") from e
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "").strip()[-600:]
+            tail = (stderr or stdout or "").strip()[-600:]
             raise ClaudeError(f"claude -p failed (exit {proc.returncode}): {tail}")
-        msg = (proc.stdout or "").strip()
+        msg = (stdout or "").strip()
         if not msg:
             raise ClaudeError("claude returned empty output")
         return msg
-    except subprocess.TimeoutExpired as e:
-        raise ClaudeError(f"claude -p timed out after {cfg.timeout_s}s") from e
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

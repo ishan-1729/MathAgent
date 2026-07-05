@@ -102,6 +102,32 @@ class TestSentinelInjectionOffline:
             with pytest.raises(lean_bridge.LeanBridgeError):
                 lean_bridge._reject_if_forbidden(bad)
 
+    def test_reject_run_cmd_and_qualified_emitters(self):
+        # 2026-07-04 audit: `run_cmd`/`run_elab` run arbitrary CommandElabM/TermElabM code (incl.
+        # logInfo) and were not banned; and the bare-name-only match was bypassable via namespace
+        # qualification (`Lean.logInfo`, `_root_.IO.println`). All must raise now.
+        for bad in (
+            'run_cmd Lean.logInfo "hi"',
+            'run_cmd Lean.logInfoAt stx "hi"',
+            'run_elab do pure ()',
+            'def f := Lean.logInfo "hi"',
+            'def f := Lean.Elab.logWarningAt stx "x"',
+            'def f := _root_.IO.println "x"',
+            'def f := Std.dbg_trace "x"',
+        ):
+            with pytest.raises(lean_bridge.LeanBridgeError):
+                lean_bridge._reject_if_forbidden(bad)
+
+    def test_qualified_emitter_ban_has_no_new_false_positives(self):
+        # The dotted-qualification fix is scoped to the EMIT family; the keyword tokens
+        # (prefix/infix/syntax/...) stay bare-name-only, so legit dotted decl components and
+        # identifiers merely containing a banned token must still pass.
+        lean_bridge._reject_if_forbidden(
+            "theorem t : True := trivial\n"
+            "example := List.prefix_append\n"      # `.prefix` component must NOT trip `prefix`
+            "example := Nat.log 2 8\n"             # `.log` is not an emit token
+            "def my_run_cmd := 1")                 # substring inside an identifier
+
     def test_reject_literal_audit_token_and_sentinel_in_body(self):
         # Defense in depth: the untrusted body may not name the trusted `#audit` command nor embed
         # the sentinel string, even absent a redefinition keyword.

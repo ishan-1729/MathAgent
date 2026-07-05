@@ -15,6 +15,7 @@ available, and the only build exercised uses the SCRIPTED provider. We pin:
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -270,6 +271,70 @@ def test_build_driver_from_a_loaded_scripted_profile(tmp_path):
     assert driver.enforce_elementarity is True
     assert driver.decomposer is not None and driver.reviewer is not None
     assert driver.terminal_gate is None and driver.node_verifier is None
+
+
+# ---- FIX 3: the --profile path CLOSES its driver (releases the warm LeanServer build_driver stored on
+#      it) on BOTH success and a raising run() — mirroring build_and_run's try/finally. Without this a
+#      lean.server --profile run leaks an orphaned repl.exe holding Mathlib. ------------------------------
+
+class _SpyResult:
+    """Just enough DagResult surface for prove.main()'s --profile post-run block."""
+    class _Dag:
+        nodes = {}
+        def stats(self):
+            return "nodes=0"
+    def __init__(self):
+        self.proven = False
+        self.dag = self._Dag()
+        self.terminal = None
+        self.authoritative_elementary = False
+        self.budget = SimpleNamespace(calls_spent=0, max_llm_calls=1)
+    def proof_tree(self):
+        return {}
+
+
+class _SpyDriver:
+    """Records close() calls; run() either returns a stub result or raises (parametrized by the test)."""
+    def __init__(self, *, raise_on_run=False):
+        self.closed = 0
+        self._raise = raise_on_run
+    def run(self, goal, *a, **k):
+        if self._raise:
+            raise RuntimeError("run blew up mid-proof")
+        return _SpyResult()
+    def close(self):
+        self.closed += 1
+
+
+def _run_profile_main(monkeypatch, tmp_path, *, raise_on_run):
+    """Drive prove.main() down the REAL --profile branch with a scripted profile, intercepting
+    build_driver to return a spy so the try/finally close() contract is observed. Returns the spy."""
+    prof = _scripted_offline_profile()
+    yaml_path = tmp_path / "prof.yaml"
+    import yaml
+    yaml_path.write_text(yaml.safe_dump(prof.model_dump(mode="json")), encoding="utf-8")
+
+    spy = _SpyDriver(raise_on_run=raise_on_run)
+    # build_driver is imported inside the branch as `from agent.orchestrator.builder import build_driver`,
+    # so patch the SOURCE symbol (not prove_cli's namespace) to intercept the real construction site.
+    import agent.orchestrator.builder as builder_mod
+    monkeypatch.setattr(builder_mod, "build_driver", lambda *a, **k: spy)
+    monkeypatch.setattr(sys, "argv", ["prove.py", "some goal", "--profile", str(yaml_path)])
+    return spy
+
+
+def test_profile_path_closes_driver_on_success(monkeypatch, tmp_path, all_probes_available):
+    spy = _run_profile_main(monkeypatch, tmp_path, raise_on_run=False)
+    rc = prove_cli.main()
+    assert rc in (0, 1)                     # NOT PROVEN stub -> exit 0/1, but the run completed
+    assert spy.closed == 1, "the --profile path must close() its driver on success"
+
+
+def test_profile_path_closes_driver_when_run_raises(monkeypatch, tmp_path, all_probes_available):
+    spy = _run_profile_main(monkeypatch, tmp_path, raise_on_run=True)
+    with pytest.raises(RuntimeError, match="run blew up"):
+        prove_cli.main()
+    assert spy.closed == 1, "the --profile path must close() its driver even when run() raises (finally)"
 
 
 def test_supervisor_is_sole_chokepoint_in_main(tmp_path, monkeypatch):

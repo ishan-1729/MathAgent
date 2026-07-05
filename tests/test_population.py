@@ -4,8 +4,9 @@ import json
 from agent.orchestrator.population import (
     Candidate, EloPopulation, KeyComparator, ScriptedComparator, fit_bradley_terry, DEFAULT_RATING,
 )
-from agent.orchestrator.dag_driver import DagDriver, ReviewVerdict, ScriptedReviewer
-from agent.orchestrator.state import Budget
+from agent.orchestrator.dag_driver import DagDriver, ReasonCode, ReviewVerdict, ScriptedReviewer
+from agent.orchestrator.dag import goal_hash
+from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.trace import RunTrace
 from agent.gates.toolkit import load_toolkit
 
@@ -174,6 +175,35 @@ def test_population_picks_good_candidate_first():
     res = driver.run("G")
     assert res.proven  # Elo ranked the "A" candidate first; tried under a 1-attempt cap
     assert res.trace.by_kind("population")
+
+
+def test_population_child_budget_starved_makes_parent_exhausted():
+    # FIX 1 (memo-poisoning): the population arm's committed child fails ONLY because the LLM-call
+    # budget ran out (budget_starved), a LIMIT-induced/retryable failure — NOT a genuine logical gap.
+    # The parent must end retryable EXHAUSTED (reason budget_starved), NOT terminal FAILED_GAP; the
+    # latter would poison the split-keyed memo so a budget-refilled retry of the SAME goal could never
+    # prove it. Before the fix, _prove_via_population returned a bare bool and _decompose discarded the
+    # child reason, leaving last_reason at its gap_found init -> FAILED_GAP.
+    #
+    # Exact call accounting with max_llm_calls=3 (ralph_episodes=1, population_k=1, 1 candidate,
+    # max_decomp_attempts=1): (1) G direct RalphLoop episode; (2) population candidate generation;
+    # (3) the _try_decomposition review; then proving child "C" finds the budget spent -> C is
+    # mark_exhausted(budget_starved), which propagates up through the population arm.
+    prover = DictProver({})                         # nothing proves directly (G fails -> decompose)
+    queues = {"G": [(_sketch("G", ["C"]), ["C"])]}  # one committed candidate with child "C"
+    driver = DagDriver(prover, decomposer=QueueDecomposer(queues),
+                       reviewer=ScriptedReviewer([OK_REVIEW]), toolkit=TOOLKIT,
+                       budget=Budget(max_llm_calls=3), trace=RunTrace("t"),
+                       comparator=KeyComparator(key=lambda c: 1.0),
+                       population_k=1, max_decomp_attempts=1, ralph_episodes=1)
+    res = driver.run("G")
+    assert not res.proven
+    node = driver.dag.get_or_create("G")
+    assert node.state is NodeState.EXHAUSTED            # retryable, NOT terminal FAILED_GAP
+    assert node.state is not NodeState.FAILED_GAP
+    assert node.reason == ReasonCode.budget_starved.value
+    # The committed child that starved is itself EXHAUSTED (the limit-induced source of the parent's reason).
+    assert driver.dag.get_or_create("C").state is NodeState.EXHAUSTED
 
 
 def test_without_population_first_candidate_loses():

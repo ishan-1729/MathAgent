@@ -222,7 +222,7 @@ def test_stale_lean_verified_certificate_is_evicted_on_context_change():
     # the same eviction that resets a stale PROVEN clears the LEAN_VERIFIED state + its Lean stamps.
     dag = ProofDAG(context="ctxA")
     dag.mark_proven_direct("L", "ledger", lean_verified=True)
-    assert dag.get("L" and goal_hash("L")) is not None
+    assert dag.get(goal_hash("L")) is not None
     dag.context = "ctxB"                              # the context changed (toolkit/gate/denylist edit)
     n = dag.get_or_create("L")                        # read-through eviction
     assert n.state is NodeState.OPEN                  # stale -> reset to OPEN (a cache MISS)

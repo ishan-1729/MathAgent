@@ -14,6 +14,7 @@ LeanUnavailable, so callers fall back to per-call `lake env lean`.
 """
 from __future__ import annotations
 
+import collections
 import json
 import queue
 import subprocess
@@ -56,7 +57,9 @@ class LeanServer:
         self.proc: Optional[subprocess.Popen] = None
         self.base_env: Optional[int] = None
         self._q: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._stderr: list[str] = []
+        # Bounded ring buffer: only the last ~20 lines are ever read (for error context), so an
+        # unbounded list would grow forever across a long-lived server for no benefit.
+        self._stderr: "collections.deque[str]" = collections.deque(maxlen=256)
 
     # --- discovery ---
     @staticmethod
@@ -135,18 +138,23 @@ class LeanServer:
         while True:
             remaining = end - time.monotonic()
             if remaining <= 0:
-                # Drain late output so the NEXT command does not read this command's stale reply.
+                # Timeout: drain buffered output AND tear down the still-running REPL. Draining alone is
+                # NOT enough — the live REPL would emit its late reply AFTER the drain and desync every
+                # subsequent read (silently losing Layer-4 certification on later audits). close() kills
+                # it; audit() lazily restarts a closed server (mirrors the EOF branch below).
                 self._drain_queue()
+                self.close()
                 raise LeanBridgeError(f"lean-server response timed out after {timeout_s}s")
             try:
                 line = self._q.get(timeout=remaining)
             except queue.Empty:
                 self._drain_queue()
+                self.close()
                 raise LeanBridgeError(f"lean-server response timed out after {timeout_s}s")
             if line is None:
                 # EOF: the REPL exited. Tear down so the server is not reused in a dead state.
                 self.close()
-                raise LeanBridgeError("lean-server process exited: " + "".join(self._stderr[-20:]))
+                raise LeanBridgeError("lean-server process exited: " + "".join(list(self._stderr)[-20:]))
             buf += line
             s = buf.strip()
             if not s:

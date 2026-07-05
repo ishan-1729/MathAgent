@@ -179,7 +179,17 @@ def run_benchmark(dataset: ArxivMathDataset, solver: Solver, *, number_theory_on
             predicted, err = solver.solve(prob.statement), False
         except Exception as e:
             predicted, err = f"<error: {type(e).__name__}: {e}>"[:200], True
-        correct = (not err) and answers_equivalent(predicted, oracle.get(prob.idx), atol=atol)
+        if err:
+            correct = False
+        else:
+            # Grade in its OWN try: a grader exception (e.g. a malformed model answer that trips
+            # SymPy) must NOT abort the whole benchmark run. On grader failure the item is scored
+            # incorrect and we continue. ItemResult.error tracks SOLVER failures (a bool), so it
+            # stays as-is (False) here; only `correct` is affected.
+            try:
+                correct = answers_equivalent(predicted, oracle.get(prob.idx), atol=atol)
+            except Exception:
+                correct = False
         item = ItemResult(idx=prob.idx, predicted=predicted, correct=correct,
                           problem_type=prob.problem_type, error=err)
         report.results.append(item)

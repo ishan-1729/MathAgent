@@ -122,9 +122,11 @@ def test_read_response_eof_closes_server():
     assert srv.proc is None  # EOF tore down the server
 
 
-def test_read_response_timeout_drains_queue():
+def test_read_response_timeout_drains_queue_and_tears_down():
     srv = LeanServer.__new__(LeanServer)
-    srv.proc = _FakeProc()
+    proc = _FakeProc()
+    srv.proc = proc
+    srv.base_env = 0
     srv._q = queue.Queue()
     srv._stderr = []
     srv._q.put("late partial output that never forms valid JSON\n")
@@ -132,6 +134,32 @@ def test_read_response_timeout_drains_queue():
         srv._read_response(timeout_s=0.05)
     # The stale line was drained so the next command will not read it.
     assert srv._q.empty()
+    # FIX 3: the still-running REPL is torn down on timeout so its late reply cannot desync every
+    # subsequent audit (which would silently lose Layer-4 certification). audit() lazily restarts it.
+    assert srv.proc is None and srv.base_env is None
+    assert proc.terminated and proc.waited
+
+
+def test_audit_restarts_after_timeout_teardown_instead_of_reading_stale():
+    # After a timeout tore the server down (proc is None), the NEXT audit() must go through start()
+    # (a fresh REPL) rather than reading whatever stale output is still queued from the timed-out cmd.
+    srv = LeanServer.__new__(LeanServer)
+    srv.proc = None                       # torn-down state left by a prior timeout
+    srv._q = queue.Queue()
+    srv._q.put("STALE reply from the timed-out command\n")   # would desync a naive re-read
+
+    started = {"n": 0}
+
+    def _fake_start():
+        started["n"] += 1
+        raise LeanBridgeError("start() called — restarting rather than reading the stale queue")
+
+    srv.start = _fake_start  # type: ignore[method-assign]
+    # audit() sees proc is None -> RESTARTS via start() (not a silent re-read of the stale queue).
+    with pytest.raises(LeanBridgeError):
+        srv.audit("proof", "thm")
+    assert started["n"] == 1
+    assert not srv._q.empty()  # the stale line was NEVER consumed by audit (start intercepted first)
 
 
 def test_close_waits_and_kills_and_closes_streams():

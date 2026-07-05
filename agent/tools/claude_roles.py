@@ -123,8 +123,10 @@ class ClaudeReviewer:
             return ReviewVerdict(useful=False, elementary=False,
                                  notes=["reviewer output was not parseable JSON"])
         return ReviewVerdict(
-            useful=bool(obj.get("useful", False)),
-            elementary=bool(obj.get("elementary", False)),
+            # Strict `is True`: JSON `true` -> Python True, but a model emitting the STRING "true"/
+            # "false" (bool("false") == True) must fail closed. Any non-True value => False.
+            useful=(obj.get("useful") is True),
+            elementary=(obj.get("elementary") is True),
             notes=list(obj.get("notes", []) or []),
         )
 
@@ -186,7 +188,7 @@ class _ClaudeFaithJudge:
         obj = _extract_json_object(raw)
         if obj is None:
             return SingleVerdict(lens=lens, faithful=False, issues=["unparseable judge output"])
-        return SingleVerdict(lens=lens, faithful=bool(obj.get("faithful", False)),
+        return SingleVerdict(lens=lens, faithful=(obj.get("faithful") is True),
                              issues=list(obj.get("issues", []) or []))
 
 

@@ -27,7 +27,9 @@ Status: **Phase-1 + much of Phase-2 implemented.**
 - `dag.py` (LEAP AND-OR DAG + **deep-hash goal cache / memoization** + acyclicity guard),
   `ralph.py` (the AlphaProof_Nexus per-node Ralph loop), and `dag_driver.py` (the
   direct→decompose→review→recurse `DagDriver` with DFS/backtracking).
-- The focused prover is **Codex / GPT-5.5-xHigh** ([`../tools/codex_prover.py`](../tools/codex_prover.py)),
-  substituting for AlphaProof. See [`../../research/docs/codex_harness.md`](../../research/docs/codex_harness.md).
-
-Still design-only: the incumbent tournament, retrieval, and the population/Elo search layer.
+- The prover role **defaults to Claude/opus** via the role registry (`registry.py`); **Codex /
+  GPT-5.5-xHigh** ([`../tools/codex_prover.py`](../tools/codex_prover.py)) is the optional provider,
+  selectable per-role in the `RunProfile`. See [`../../research/docs/codex_harness.md`](../../research/docs/codex_harness.md).
+- Also built and wired (no longer design-only): the incumbent tournament (`tournament.py`, the
+  `refiner` role), retrieval, and the population/Elo search layer
+  (`dag_driver._prove_via_population` + `population.py`, enabled by `stages.population > 0`).

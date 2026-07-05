@@ -4,6 +4,7 @@ from hypothesis import given, strategies as st
 
 from agent.tools import numeric
 from agent.tools.numeric import (
+    check_witness_spec,
     find_integer_solutions,
     verify_solution_set,
     verify_residue_cover,
@@ -46,6 +47,48 @@ def test_verify_solution_set_finds_counterexample():
                               {"x": (-50, 50), "y": (-10, 10)}, claimed=[])
     assert not res.ok
     assert {"x": 0, "y": 1} in res.counterexamples
+
+
+# --- FIX 1: verify_solution_set must validate claimed assignments are genuine integers.
+#     A non-integer / malformed claim raises NumericError (an UNREPRESENTABLE spec — the same
+#     taxonomy as verify_residue_cover and the REJECTED witness controls: check_witness_spec records
+#     it as a spec-level error row, a HARD failure fitness must not reward), never a silent
+#     int()-truncation onto a real root. ---
+
+def test_verify_solution_set_rejects_float_claim():
+    # {"x": 2.4} previously int()-truncated to the root x=2 and VERIFIED — the reward hack.
+    with pytest.raises(NumericError, match="must be integers"):
+        verify_solution_set("x - 2", ["x"], {"x": (0, 5)}, claimed=[{"x": 2.4}])
+
+
+def test_verify_solution_set_rejects_bool_claim():
+    # bool subclasses int; it must be rejected exactly like verify_residue_cover's guard.
+    with pytest.raises(NumericError, match="must be integers"):
+        verify_solution_set("x - 1", ["x"], {"x": (0, 5)}, claimed=[{"x": True}])
+
+
+def test_verify_solution_set_rejects_missing_variable_claim():
+    # A claim missing a declared variable is a typed NumericError, never a raw KeyError through _key.
+    with pytest.raises(NumericError, match="missing variable"):
+        verify_solution_set("x + y", ["x", "y"], {"x": (0, 2), "y": (-2, 0)}, claimed=[{"x": 0}])
+
+
+def test_check_witness_spec_records_nonint_claim_as_error_row():
+    # End-to-end taxonomy pin: a solution_set spec whose claim carries type-garbage (float) is an
+    # ERROR row (ok=False, error set) — the same recorded-rejection shape as the shipped
+    # tensor_rank_444_REJECTED control (string "2+3i" claim) — not a spurious-claim pass-through.
+    spec = {"kind": "solution_set", "expression": "x - 2", "variables": ["x"],
+            "bounds": {"x": [0, 5]}, "claimed": [{"x": 2.4}]}
+    res = check_witness_spec(spec)
+    assert res.ok is False
+    assert res.error is not None and "integers" in res.error
+
+
+def test_verify_solution_set_integer_claim_still_ok():
+    # The legitimate integer path is unchanged: the exact root as an int still verifies.
+    res = verify_solution_set("x - 2", ["x"], {"x": (0, 5)}, claimed=[{"x": 2}])
+    assert res.ok is True
+    assert not res.spurious_claims and not res.counterexamples
 
 
 def test_residue_cover_complete():

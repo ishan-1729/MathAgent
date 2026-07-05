@@ -94,14 +94,17 @@ def _refute_denylist_prose(ledger: Ledger, toolkit: Toolkit) -> list[Refutation]
     """A step whose prose names a denylisted non-elementary method (not explained by allow-context)."""
     out: list[Refutation] = []
     terms = toolkit.prose_terms
-    allow = toolkit.allow_context_terms
+    # allow_context_terms are enforced by CONSTRUCTION (see scanner.scan_prose): prose_terms are
+    # multi-word phrases disjoint from the single-word allow vocabulary, so no bare allow word can
+    # suppress a hit. The prior `not any(term in ctx or ctx == term for ctx in allow)` guard compared
+    # a multi-word phrase against short allow words, so it could never fire; it was dead and is removed.
     for s in ledger.steps:
         texts = [s.claim]
         if s.method_ref:
             texts.append(s.method_ref)
         low = "   ".join(texts).lower()
         for term in terms:
-            if term in low and not any(term in ctx or ctx == term for ctx in allow):
+            if term in low:
                 out.append(Refutation("denylist_prose",
                                       f"step prose names non-elementary method {term!r}", s.id))
                 break

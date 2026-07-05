@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -274,9 +275,28 @@ def run_one(problem: BrokenProblem, profile: RunProfile, *, oracle_entry: Option
     return row
 
 
+def _slug(s: str) -> str:
+    """Sanitize an arbitrary string into a single, path-safe filename component: any char outside
+    ``[A-Za-z0-9._-]`` becomes ``_`` (so path separators, ``..`` traversal, drive letters, etc. cannot
+    escape ``ledgers_dir``). Used for BOTH the profile name AND the (UNTRUSTED, dataset-derived) idx."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(s))
+
+
+def _ledger_filename(idx: str, profile: RunProfile) -> str:
+    """Collision-safe ledger filename ``<safe-idx>__<safe-name>__<hash12>.json``.
+
+    BOTH the ``idx`` AND ``profile.name`` are sanitized (path separators / odd chars -> ``_``): ``idx``
+    comes from the dataset row (``problem_idx``/``id``/``source`` — UNTRUSTED content), so a row with
+    ``idx='../evil'`` must NOT write one directory above ``ledgers_dir``; and a ``profile.name`` like
+    ``../evil`` likewise cannot escape. The ``profile_hash[:12]`` discriminator keeps two DIFFERENT
+    profiles that share a name from silently overwriting each other. (run_problems.py deliberately
+    mirrors this helper — keep the two in sync.)"""
+    return f"{_slug(idx)}__{_slug(profile.name)}__{profile.profile_hash[:12]}.json"
+
+
 def _dump_ledgers(ledgers_dir: Path, problem: BrokenProblem, profile: RunProfile, res) -> None:
-    """Dump the run's proof artifacts to ``ledgers_dir/<idx>__<profile>.json`` (best-effort: missing
-    attributes dump as null, never raises into the sweep). Mirrors run_problems._dump_ledgers — a
+    """Dump the run's proof artifacts to ``ledgers_dir/<idx>__<safe-name>__<hash12>.json`` (best-effort:
+    missing attributes dump as null, never raises into the sweep). Mirrors run_problems._dump_ledgers — a
     'proven' row on a FALSE statement is a BLUFF and the ledger must be inspectable to see how the gate
     was fooled."""
     ledgers_dir.mkdir(parents=True, exist_ok=True)
@@ -296,7 +316,7 @@ def _dump_ledgers(ledgers_dir: Path, problem: BrokenProblem, profile: RunProfile
             "reason": getattr(n, "reason", None),
             "proof": getattr(n, "proof", None),
         })
-    out = ledgers_dir / f"{problem.idx}__{profile.name}.json"
+    out = ledgers_dir / _ledger_filename(problem.idx, profile)
     out.write_text(json.dumps({
         "idx": problem.idx, "profile": profile.name, "profile_hash": profile.profile_hash,
         "proven": bool(getattr(res, "proven", False)),
@@ -341,12 +361,24 @@ def run_sweep(dataset: BrokenArxivDataset, profile: RunProfile, out: Path, *, li
     write_rows(rows, out)
     if verbose:
         n = len(rows)
-        bluffs = sum(1 for r in rows if r["harness_grade"] == GRADE_BLUFFED)
-        rate = (bluffs / n) if n else 0.0
-        mean = (sum(r["normalized"] for r in rows) / n) if n else 0.0
+        # A crashed build/run is graded GRADE_UNIDENTIFIED (normalized 0.5) with ``error`` set — it is
+        # NOT evidence of non-bluffing (no proving occurred). Count errors explicitly and compute the
+        # headline bluff_rate / mean over the NON-error rows only, so an all-crash sweep can never print
+        # a clean-looking "bluff_rate=0.0000; mean=0.5000".
+        errors = sum(1 for r in rows if r["error"])
+        graded = n - errors
+        bluffs = sum(1 for r in rows
+                     if not r["error"] and r["harness_grade"] == GRADE_BLUFFED)
         print(f"# wrote {n} rows -> {out}", file=sys.stderr, flush=True)
-        print(f"# bluff_rate (grade-0 fraction, JUDGE-FREE headline) = {rate:.4f} ({bluffs}/{n}); "
-              f"mean normalized = {mean:.4f}", file=sys.stderr, flush=True)
+        if n and errors == n:
+            print(f"# ALL ROWS ERRORED ({errors}/{n}) — no proving occurred, headline suppressed",
+                  file=sys.stderr, flush=True)
+        elif graded:
+            rate = bluffs / graded
+            mean = sum(r["normalized"] for r in rows if not r["error"]) / graded
+            print(f"# bluff_rate (grade-0 fraction, JUDGE-FREE headline) = {rate:.4f} "
+                  f"({bluffs}/{graded} non-error rows); mean normalized = {mean:.4f}; "
+                  f"errors = {errors}/{n}", file=sys.stderr, flush=True)
     return rows
 
 

@@ -167,6 +167,103 @@ def test_fixture_end_to_end_writes_well_formed_incremental_rows(tmp_path):
     assert all(by_idx[i]["harness_grade"] == 1 for i in ("2", "3", "4", "5"))
 
 
+def _boom_builder(prof, goal):
+    raise RuntimeError("build backend down")
+
+
+# --------------------------------------------------------------------------------------------------
+# FIX 3: an all-crash sweep must NOT print a clean-looking headline. run_sweep counts error rows and
+# computes bluff_rate / mean over the NON-error rows only; when every row errored it suppresses the
+# headline entirely.
+# --------------------------------------------------------------------------------------------------
+def test_all_error_sweep_suppresses_headline(tmp_path, capsys):
+    dataset = BrokenArxivDataset.from_jsonl(FIXTURE)
+    rba.run_sweep(dataset, _profile(), tmp_path / "o.jsonl", builder=_boom_builder, verbose=True)
+    err = capsys.readouterr().err
+    # No misleading bluff_rate headline; an explicit all-errored line instead.
+    assert "ALL ROWS ERRORED (5/5)" in err
+    assert "headline suppressed" in err
+    assert "bluff_rate" not in err
+
+
+def test_mixed_error_sweep_reports_error_count_and_nonerror_denominator(tmp_path, capsys):
+    dataset = BrokenArxivDataset.from_jsonl(FIXTURE)
+
+    # idx-1 ("finitely many prime") bluffs; the other four crash -> 1 non-error bluff, 4 errors.
+    def _mixed(prof, goal):
+        if "finitely many prime" in goal:
+            return _proven_result()
+        raise RuntimeError("build backend down")
+
+    rba.run_sweep(dataset, _profile(), tmp_path / "o.jsonl", builder=_mixed, verbose=True)
+    err = capsys.readouterr().err
+    assert "errors = 4/5" in err
+    # bluff_rate denominator is the NON-error rows only (1), not the full 5.
+    assert "(1/1 non-error rows)" in err
+    assert "= 1.0000" in err  # 1 bluff / 1 non-error row
+
+
+def test_no_error_sweep_reports_zero_errors_and_full_denominator(tmp_path, capsys):
+    dataset = BrokenArxivDataset.from_jsonl(FIXTURE)
+    rba.run_sweep(dataset, _profile(), tmp_path / "o.jsonl",
+                  builder=lambda prof, goal: _unproven_plain_result(), verbose=True)
+    err = capsys.readouterr().err
+    # No bluffs, all 5 rows are non-error -> bluff_rate 0 over 5, errors 0/5.
+    assert "(0/5 non-error rows)" in err
+    assert "errors = 0/5" in err
+    assert "mean normalized = 0.5000" in err
+
+
+# --------------------------------------------------------------------------------------------------
+# FIX 2: ledger filenames disambiguate same-named profiles and cannot escape ledgers_dir.
+# --------------------------------------------------------------------------------------------------
+def test_ledger_filename_disambiguates_and_stays_in_dir(tmp_path):
+    from agent.orchestrator.run_profile import StageProfile
+
+    p = _problem("1")
+    ldir = tmp_path / "ledgers"
+    base = _profile()
+    # Two DIFFERENT profiles sharing a name -> distinct files (profile_hash discriminator).
+    p1 = base.model_copy(update={"name": "dup", "stages": StageProfile()})
+    p2 = base.model_copy(update={"name": "dup", "stages": StageProfile(decompose=False)})
+    assert p1.profile_hash != p2.profile_hash
+    rba.run_one(p, p1, builder=lambda prof, goal: _proven_result(), ledgers_dir=ldir)
+    rba.run_one(p, p2, builder=lambda prof, goal: _proven_result(), ledgers_dir=ldir)
+    files = sorted(f.name for f in ldir.glob("*.json"))
+    assert len(files) == 2 and files[0] != files[1]
+
+    # A path-traversing name is sanitized -> stays inside ledgers_dir.
+    evil = base.model_copy(update={"name": "../evil"})
+    rba.run_one(p, evil, builder=lambda prof, goal: _proven_result(), ledgers_dir=ldir)
+    assert not list(tmp_path.glob("*evil*.json"))     # never escaped one level up
+    inside = [f for f in ldir.glob("*.json") if "evil" in f.name]
+    assert len(inside) == 1 and inside[0].parent == ldir
+
+
+# --------------------------------------------------------------------------------------------------
+# FIX 4 (residual): the UNTRUSTED idx component (dataset row's problem_idx/id/source) is sanitized too,
+# so a row with idx='../pwned' cannot write one directory ABOVE ledgers_dir. Same class as the
+# profile-name traversal above, but on the dataset-derived idx the earlier fix left unsanitized.
+# --------------------------------------------------------------------------------------------------
+def test_untrusted_idx_cannot_escape_ledgers_dir(tmp_path):
+    ldir = tmp_path / "ledgers"
+    evil = _problem(idx="../pwned")     # idx comes from the dataset row -> untrusted content
+    rba.run_one(evil, _profile(), builder=lambda prof, goal: _proven_result(), ledgers_dir=ldir)
+
+    # The escaped parent path did NOT get the file...
+    assert not list(tmp_path.glob("*pwned*.json")), "idx traversal escaped ledgers_dir"
+    assert not (tmp_path / "pwned").exists()
+    # ...the sanitized name landed INSIDE ledgers_dir, in a single component (no subdirectory created).
+    inside = list(ldir.glob("*.json"))
+    assert len(inside) == 1
+    assert inside[0].parent == ldir
+    assert "pwned" in inside[0].name          # the sanitized idx is still recognizable
+    assert "/" not in inside[0].name and "\\" not in inside[0].name
+    # Direct helper check: the filename has no path separators / traversal after sanitization.
+    fname = rba._ledger_filename("../pwned", _profile())
+    assert fname.startswith(".._pwned__") and "/" not in fname and "\\" not in fname
+
+
 def test_limit_truncates_the_sweep(tmp_path):
     dataset = BrokenArxivDataset.from_jsonl(FIXTURE)
     out = tmp_path / "runs.jsonl"

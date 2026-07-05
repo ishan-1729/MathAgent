@@ -7,6 +7,14 @@
 #                          NOT flag these on their own.
 # - `lean_denylist_decls`: Layer-4 (Lean) content-bearing declarations/namespaces that are
 #                          dispositive on appearance in a proof-term dependency closure.
+#                          TWO MATCHING MODES (agent/gates/lean_audit.py):
+#                            * decl-name entries (bare `EllipticCurve` or dotted `Real.cos`) match the
+#                              declaration NAME (bare = any dotted component; dotted = prefix-anchored);
+#                            * `Mathlib.*`-prefixed entries are MODULE-FAMILY bans — they match the
+#                              DECLARING MODULE by dotted prefix (Lean decl names never start with
+#                              `Mathlib.`, so these entries can only bind via the report's `module`
+#                              field; reports from an older extractor without `module` fall back to
+#                              decl-name matching only, where these entries are inert).
 # - `lean_infrastructure_allowlist`: plumbing always permitted (so the closure audit does not
 #                          over-reject — see PLAN.md Section 5 Layer 4).
 
@@ -174,6 +182,50 @@ lean_denylist_decls:
   - Complex.cos
   - Complex.sin
   - Mathlib.Analysis.SpecialFunctions.Trigonometric
+  # SIBLING-DECL SWEEP (2026-07-04 audit): the entries above under-matched sibling Mathlib decls that
+  # reach the same real-analytic machinery — `Real.Angle.cos` is NOT matched by the prefix-anchored
+  # `Real.cos`, `Complex.tan` was missing entirely, and the hyperbolic / inverse-hyperbolic / Gamma
+  # families had no coverage. Decl-name entries are belt-and-braces alongside the (now live)
+  # module-family ban on Mathlib.Analysis.SpecialFunctions.Trigonometric: Gamma does NOT live under
+  # the Trigonometric module, and older reports without a `module` field only see decl names.
+  # (`Real.Angle` is a dotted prefix, so it bans the whole Angle API in one entry.)
+  - Real.Angle
+  - Complex.tan
+  - Real.cosh
+  - Real.sinh
+  - Real.tanh
+  - Real.arsinh
+  - Real.arcosh
+  - Real.artanh
+  - Real.Gamma
+  - Complex.Gamma
+  # ANALYTIC-TRANSCENDENTAL SIBLING SWEEP (2026-07-04 audit): the entries above still MISSED sibling
+  # analytic transcendentals whose DECLARING MODULES sit OUTSIDE Mathlib.Analysis.SpecialFunctions.
+  # Trigonometric (so the module-family ban never touched them) and which had NO decl-name entry —
+  # confirmed live via audit_report that each PASSED. `Real.rpow` is x^y = exp(y·log x) (module
+  # Mathlib.Analysis.SpecialFunctions.Pow.Real): exactly the banned exp/log class through a different
+  # decl. `Real.logb` (Mathlib.Analysis.SpecialFunctions.Logb) is log_b = log x / log b; `Complex.log`
+  # (Mathlib.Analysis.SpecialFunctions.Complex.Log) is the complex analytic logarithm; the complex
+  # hyperbolic / inverse-trig siblings complete the family. DELIBERATE CARVE-OUT (restated): `Complex.exp`
+  # stays ALLOWED — it is the roots-of-unity filter's ζ = exp(2πi/n) (PLAN §2.1), an allowed elementary
+  # tool; these dotted entries scope to exactly those decls and do NOT touch `Complex.exp`.
+  - Real.rpow
+  - Real.logb
+  - Complex.log
+  - Complex.sinh
+  - Complex.cosh
+  - Complex.tanh
+  - Complex.arcsin
+  - Complex.arccos
+  - Complex.arctan
+  # MISSING-FAMILY SWEEP (2026-07-04 audit): the `Mathlib.*` module entries for these families were
+  # inert until module matching landed, and NO decl-name entry covered them at all — a modular-forms
+  # or class-group proof-term closure matched nothing. Bare decl tokens close the gap independently
+  # of the module field.
+  - ModularForm
+  - CuspForm
+  - SlashInvariantForm
+  - ClassGroup
 
 lean_infrastructure_allowlist:
   - WellFounded.fix

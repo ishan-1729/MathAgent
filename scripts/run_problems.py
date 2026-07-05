@@ -105,8 +105,15 @@ def _read_frontmatter(path: Path) -> dict[str, str]:
 
     Matches scripts/check_repo_skeleton.py's reader (line-based, ``#`` comments skipped) so the two agree
     on what the frontmatter says. Quotes around a value are stripped so ``statement: "..."`` yields the
-    inner string. Returns {} when there is no frontmatter block."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    inner string. Returns {} when there is no frontmatter block.
+
+    A non-UTF-8 file is a per-folder :class:`ProblemLoadError` (routed to an error ROW), NEVER a raw
+    UnicodeDecodeError escaping to abort the whole sweep (it is a ValueError subclass that would slip
+    past ``discover_problems``'s ProblemLoadError guard and hit main's ``except (ValueError, OSError)``)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as e:
+        raise ProblemLoadError(f"{path.parent.name}/{path.name}: not valid UTF-8 ({e})") from e
     if not lines or lines[0].strip() != "---":
         return {}
     end = None
@@ -141,7 +148,13 @@ def _parse_allowed_inputs_note(folder: Path) -> Optional[str]:
     ai = folder / "allowed_inputs.md"
     if not ai.is_file():
         return None
-    lines = ai.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = ai.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as e:
+        # Same fail-closed-to-a-row policy as _read_frontmatter: a non-UTF-8 allowed_inputs.md is a
+        # per-folder ProblemLoadError (this runs inside load_problem, whose caller discover_problems
+        # catches ProblemLoadError into an error ROW), never a UnicodeDecodeError that aborts the sweep.
+        raise ProblemLoadError(f"{folder.name}/{ai.name}: not valid UTF-8 ({e})") from e
 
     def _is_section_header(s: str) -> bool:
         """A real section header in these files is a non-bullet line that ENDS with ':' (e.g.
@@ -330,9 +343,10 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None,
         dag = getattr(res, "dag", None)
         if dag is not None and getattr(dag, "nodes", None) is not None:
             row["nodes"] = len(dag.nodes)
-            row["proven_nodes"] = sum(1 for n in dag.nodes.values()
-                                      if getattr(getattr(n, "state", None), "name", "") in
-                                      ("PROVEN", "LEAN_VERIFIED"))
+            # Node.proven already == state.is_success (soft PROVEN OR hard LEAN_VERIFIED; see
+            # agent/orchestrator/dag.py Node.proven / state.py NodeState.is_success), so read it
+            # directly instead of re-deriving the success set by string-matching enum NAMES.
+            row["proven_nodes"] = sum(1 for n in dag.nodes.values() if getattr(n, "proven", False))
         if ledgers_dir is not None:
             _dump_ledgers(ledgers_dir, problem, profile, res)
     except Exception as e:  # noqa: BLE001 — one bad (problem, profile) must not abort the sweep.
@@ -343,8 +357,27 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None,
     return row
 
 
+def _slug(s: str) -> str:
+    """Sanitize an arbitrary string into a single, path-safe filename component: any char outside
+    ``[A-Za-z0-9._-]`` becomes ``_`` (so path separators / ``..`` traversal cannot escape
+    ``ledgers_dir``). Applied to BOTH the folder slug and the profile name."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(s))
+
+
+def _ledger_filename(slug: str, profile: RunProfile) -> str:
+    """Collision-safe ledger filename ``<safe-slug>__<safe-name>__<hash12>.json``.
+
+    BOTH the ``slug`` AND ``profile.name`` are sanitized (path separators / odd chars -> ``_``) so a
+    name like ``../evil`` cannot escape ``ledgers_dir``. The folder ``slug`` (``folder.name``) is not
+    attacker-injected today, but it is sanitized for defense-in-depth and to stay in sync with
+    run_brokenarxiv.py, whose ``idx`` component IS untrusted dataset content. The ``profile_hash[:12]``
+    discriminator keeps two DIFFERENT profiles that happen to share a name from silently overwriting
+    each other's ledger. (run_brokenarxiv.py deliberately mirrors this helper — keep the two in sync.)"""
+    return f"{_slug(slug)}__{_slug(profile.name)}__{profile.profile_hash[:12]}.json"
+
+
 def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res) -> None:
-    """Dump the run's proof artifacts to ``ledgers_dir/<slug>__<profile>.json`` (best-effort:
+    """Dump the run's proof artifacts to ``ledgers_dir/<slug>__<safe-name>__<hash12>.json`` (best-effort:
     missing attributes dump as null — never raises into the sweep)."""
     ledgers_dir.mkdir(parents=True, exist_ok=True)
     tree = None
@@ -375,7 +408,7 @@ def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res)
             }
     except Exception:  # noqa: BLE001 — artifact capture must never break the sweep
         terminal = None
-    out = ledgers_dir / f"{problem.slug}__{profile.name}.json"
+    out = ledgers_dir / _ledger_filename(problem.slug, profile)
     out.write_text(json.dumps({
         "problem": problem.slug, "profile": profile.name,
         "profile_hash": profile.profile_hash,

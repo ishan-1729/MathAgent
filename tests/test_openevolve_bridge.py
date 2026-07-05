@@ -358,6 +358,47 @@ def test_decompose_extracts_children_via_stub(monkeypatch, toolkit):
     assert children == children_from_sketch(sketch)  # consistent with the shared helper
 
 
+# ---- FIX 6: decomposer feedback is threaded into evolution (was silently dropped) --------------
+
+def test_feedback_block_formats_bounded_rejection():
+    from agent.tools.openevolve_bridge import _feedback_block
+    assert _feedback_block(None) == ""
+    assert _feedback_block([]) == ""
+    block = _feedback_block(["fix the descent bound", "bind the conclusion to the goal"])
+    assert "previous attempt was rejected" in block.lower()
+    assert "fix the descent bound" in block and "bind the conclusion to the goal" in block
+    # Capped at 12 items so a long rejection list cannot balloon the prompt.
+    capped = _feedback_block([f"issue {i}" for i in range(30)])
+    assert "issue 11" in capped and "issue 12" not in capped
+
+
+def test_decompose_threads_feedback_into_evolve_sketches(monkeypatch, toolkit):
+    # OpenEvolveBackend.decompose(goal, feedback=...) must forward feedback to evolve_sketches
+    # (offline: spy on evolve_sketches, no evolution run, no openevolve/Claude touched).
+    import agent.tools.openevolve_bridge as oe
+    seen = {}
+
+    def _spy(goal, tk, **kw):
+        seen.update(kw)
+        return ("{}", 0.0, {})
+
+    monkeypatch.setattr(oe, "evolve_sketches", _spy)
+    OpenEvolveBackend(toolkit).decompose("A goal.", feedback=["rejected: off goal"])
+    assert seen["feedback"] == ["rejected: off goal"]
+
+
+def test_build_config_folds_feedback_into_system_prompt(toolkit):
+    # The feedback reaches the CONSTRUCTED prompt: it is appended to the mutation LLM's system
+    # message. (Requires the optional package to build a real Config.)
+    pytest.importorskip("openevolve")
+    config = build_evolve_config(feedback=["bind the conclusion to the goal"])
+    assert "bind the conclusion to the goal" in config.prompt.system_message
+    assert "previous attempt was rejected" in config.prompt.system_message.lower()
+    # With no feedback the system prompt is NOT extended with a rejection block.
+    base = build_evolve_config()
+    assert "previous attempt was rejected" not in (base.prompt.system_message or "").lower()
+
+
 # ---- availability probe is honest about the optional dependency -------------------------------
 
 def test_available_matches_find_spec():

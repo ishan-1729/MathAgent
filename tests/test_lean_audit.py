@@ -445,6 +445,179 @@ def test_theorem_name_omitted_keeps_old_behavior():
     assert audit_report(rep, TOOLKIT).passed
 
 
+# ---- MODULE-FAMILY matching (2026-07-04 audit): `Mathlib.*`-prefixed denylist entries were INERT —
+#      matching ran over decl NAMES only, and Lean decl names never start with `Mathlib.` (the
+#      extractor now stamps each constant's declaring module; `Mathlib.*` entries ban by module
+#      prefix). These pin the revived entries and the sibling-decl gap they close. ----
+
+def test_module_family_ban_rejects_sibling_decl():
+    """THE imo_1963_p5 SIBLING GAP: `Real.Angle.cos` is not matched by the prefix-anchored
+    `Real.cos` decl entry, but its declaring module falls under the (previously inert)
+    Mathlib.Analysis.SpecialFunctions.Trigonometric module entry — module matching must reject it."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"),
+        ConstDep("Real.Angle.toReal", "definition",
+                 module="Mathlib.Analysis.SpecialFunctions.Trigonometric.Angle")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "denylisted_dependency" in _codes(res)
+
+
+def test_module_family_ban_covers_modular_forms_and_class_group():
+    """Modular forms / class groups had NO live decl-name coverage at all — both the bare decl
+    tokens and the module-family ban must now reject them (independently)."""
+    for name, kind, module in (
+        ("ModularForm", "inductive", None),                          # bare decl token, no module
+        ("CuspForm", "inductive", None),
+        ("SlashInvariantForm", "inductive", None),
+        ("ClassGroup", "definition", None),
+        ("SomeHelper.lemma", "theorem", "Mathlib.NumberTheory.ModularForms.Basic"),  # module-only
+        ("AnotherHelper", "definition", "Mathlib.RingTheory.ClassGroup"),
+    ):
+        rep = DependencyReport("thm", axioms=[], constants=[
+            ConstDep("Nat.add"), ConstDep(name, kind, module=module)])
+        res = audit_report(rep, TOOLKIT)
+        assert not res.passed, (name, module)
+        assert "denylisted_dependency" in _codes(res), (name, module)
+
+
+@pytest.mark.parametrize("const", [
+    "Real.Angle", "Real.Angle.cos", "Complex.tan", "Real.cosh", "Real.sinh", "Real.tanh",
+    "Real.arsinh", "Real.arcosh", "Real.artanh", "Real.Gamma", "Complex.Gamma",
+])
+def test_analysis_sibling_decl_names_rejected(const):
+    """Belt-and-braces decl-name entries for the analytic siblings reject even on a legacy report
+    WITHOUT a module field (Gamma does not live under the Trigonometric module, so the module ban
+    alone would miss it)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, const
+    assert "denylisted_dependency" in _codes(res), const
+
+
+# ---- ANALYTIC-TRANSCENDENTAL SIBLING SWEEP (2026-07-04 audit): same class as the 2026-07-03 trig fix.
+#      The trig/exp/log entries under-matched sibling analytic transcendentals whose DECLARING MODULES
+#      sit OUTSIDE Mathlib.Analysis.SpecialFunctions.Trigonometric and which had NO decl-name entry, so
+#      each PASSED live. Real.rpow (x^y = exp(y·log x)), Real.logb, Complex.log + the complex
+#      hyperbolic/inverse-trig siblings must now REJECT — while the DELIBERATE Complex.exp carve-out
+#      (roots-of-unity filter, PLAN §2.1) is preserved (no collateral ban). ----
+
+@pytest.mark.parametrize("const", [
+    "Real.rpow", "Real.logb", "Complex.log",
+    "Complex.sinh", "Complex.cosh", "Complex.tanh",
+    "Complex.arcsin", "Complex.arccos", "Complex.arctan",
+])
+def test_analytic_transcendental_sibling_decls_rejected(const):
+    """A synthetic report whose closure reaches an analytic-transcendental sibling (Real.rpow /
+    Real.logb / Complex.log / the complex hyperbolic + inverse-trig family) is REJECTED by the SHIPPED
+    denylist even on a legacy report with NO module field (the decl-name entry is load-bearing —
+    these decls' modules are outside the Trigonometric module-family ban). Each fails against the
+    pre-change denylist (these siblings were a live GAP that PASSED)."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, const
+    assert "denylisted_dependency" in _codes(res), const
+
+
+def test_analytic_transcendental_rpow_closure_rejected():
+    """Real.rpow IS exp(y·log x) — exactly the banned analytic-transcendental class reached through a
+    different decl name. A closure containing it (plus elementary infra) must REJECT."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Real.rpow", "definition"),
+        ConstDep("Nat.add"), ConstDep("Int.add"),
+        ConstDep("WellFounded.fix"), ConstDep("Nat.rec", "recursor"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "denylisted_dependency" in _codes(res)
+
+
+def test_complex_exp_only_closure_still_passes_after_sibling_sweep():
+    """NO-REGRESSION for the DELIBERATE carve-out: a closure containing ONLY `Complex.exp` plus
+    infrastructure STILL PASSES after the analytic-transcendental sibling additions — banning the
+    real transcendentals + complex log/hyperbolic siblings must not collaterally ban `Complex.exp`
+    (the roots-of-unity filter ζ = exp(2πi/n), PLAN §2.1). The sibling entries are dotted, so they
+    scope to exactly those decls and do NOT touch `Complex.exp`."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Complex.exp", "definition"),
+        ConstDep("Nat.add"), ConstDep("Int.add"),
+        ConstDep("WellFounded.fix"), ConstDep("Nat.rec", "recursor"),
+        ConstDep("Decidable"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
+def test_module_family_ban_exempts_anchored_allowlist():
+    """An elementary-by-fiat API stays permitted even if declared inside a banned module family
+    (name-anchored allowlist exemption on the module path — mirrors _dominating_allow's anchoring)."""
+    tk = Toolkit(
+        justifications={"conclusion": Justification("conclusion")},
+        lean_denylist_decls=["Mathlib.NumberTheory.ClassNumber"],
+        lean_infrastructure_allowlist=[],
+        lean_elementary_by_fiat=["Nat.gcd"],
+        lean_axiom_whitelist=["propext", "Classical.choice", "Quot.sound"],
+    )
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.gcd", "definition", module="Mathlib.NumberTheory.ClassNumber.Weird")])
+    res = audit_report(rep, tk)
+    assert res.passed
+    assert "denylist_exempted" in {f.code for f in res.findings if f.severity is Severity.INFO}
+
+
+def test_module_field_absent_keeps_legacy_behavior():
+    """A report from an older extractor (no module field) must behave exactly as before: no module
+    hit, decl-name matching only — an innocuous name passes, a denylisted name rejects."""
+    ok = DependencyReport("thm", axioms=[], constants=[ConstDep("Nat.add")])
+    assert audit_report(ok, TOOLKIT).passed
+    bad = DependencyReport("thm", axioms=[], constants=[ConstDep("Real.cos", "definition")])
+    assert not audit_report(bad, TOOLKIT).passed
+
+
+def test_module_ban_does_not_overreject_elementary_modules():
+    """Constants declared in NON-denylisted Mathlib modules (the certified elementary reach:
+    Nat/Int/gcd/ZMod bridge homes) still pass with modules stamped — the module ban must scope to
+    exactly the denylisted families."""
+    rep = DependencyReport("thm", axioms=["propext", "Classical.choice", "Quot.sound"], constants=[
+        ConstDep("Nat.add", module="Init.Prelude"),
+        ConstDep("Nat.gcd", "definition", module="Mathlib.Data.Nat.GCD.Basic"),
+        ConstDep("Nat.Prime", "definition", module="Mathlib.Data.Nat.Prime.Basic"),
+        ConstDep("legendreSym", "definition", module="Mathlib.NumberTheory.LegendreSymbol.Basic"),
+        ConstDep("ZMod.intCast_zmod_eq_zero_iff_dvd", module="Mathlib.Data.ZMod.Basic"),
+    ])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
+
+
+# ---- anti-vacuity (2026-07-04 audit): a report with NEITHER axioms NOR constants audited nothing ----
+
+def test_vacuous_report_rejected():
+    """A report carrying no axioms and no constants would previously PASS on zero evidence (a real
+    compiled proof always closes over at least the audited theorem itself). Fails CLOSED now."""
+    rep = DependencyReport("thm", axioms=[], constants=[])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "vacuous_report" in _codes(res)
+
+
+def test_vacuous_report_rejected_via_json_missing_keys():
+    payload = json.dumps({"theorem": "thm"})   # no axioms/constants keys at all
+    res = audit_json(payload, TOOLKIT, theorem_name="thm")
+    assert not res.passed
+    assert "vacuous_report" in _codes(res)
+
+
+def test_constants_only_report_still_passes():
+    """Axioms may legitimately be empty when constants are present (and vice versa) — the vacuity
+    gate must only fire when BOTH are absent."""
+    rep = DependencyReport("thm", axioms=[], constants=[ConstDep("Nat.add")])
+    assert audit_report(rep, TOOLKIT).passed
+    rep2 = DependencyReport("thm", axioms=["propext"], constants=[])
+    assert audit_report(rep2, TOOLKIT).passed
+
+
 # ---- parsing ----
 
 def test_from_dict_and_json():

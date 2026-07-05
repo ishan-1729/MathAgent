@@ -33,15 +33,19 @@ def _texts(ledger: Ledger):
 def scan_prose(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
     findings: list[Finding] = []
     terms = toolkit.prose_terms
-    allow = toolkit.allow_context_terms
+    # NOTE: toolkit.allow_context_terms ("order", "unit", "norm", ...) are documented in denylist.yaml
+    # as overloaded words the scanner must NOT flag on their own — but that suppression is enforced by
+    # CONSTRUCTION, not by a runtime check: every prose_term is a MULTI-WORD phrase ("class group",
+    # "elliptic curve", ...) disjoint from the single-word allow vocabulary, so a bare allow word can
+    # never equal or be contained in a prose_term and thus never produces a hit to suppress. (The prior
+    # `if any(term in ctx or ctx == term for ctx in allow)` suppression clause compared a multi-word
+    # phrase against short allow words, so it could never fire and never referenced the scanned prose;
+    # it was dead and is removed.)
 
     for step_id, text in _texts(ledger):
         low = text.lower()
         for term in terms:
             if term in low:
-                # If the hit is wholly explained by an allow-context word, skip it.
-                if any(term in ctx or ctx == term for ctx in allow):
-                    continue
                 findings.append(Finding(
                     LAYER_SCAN, Severity.REVIEW, "denylist_term",
                     f"prose mentions denylisted term {term!r}; route to adversarial review",

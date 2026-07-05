@@ -33,6 +33,9 @@ desktop.ini
 *.swo
 *~
 
+# Claude Code local settings (personal, not team-wide)
+.claude/settings.local.json
+
 # Temporary experiment logs
 tmp/
 temp/

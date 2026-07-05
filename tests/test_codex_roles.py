@@ -2,8 +2,10 @@
 
 No Codex is invoked — these assert the roles satisfy the tournament Protocols and that
 `make_codex_refiner` wires a real RevisionController (so the harness is not stub-only)."""
+import agent.tools.codex_prover as cp
 from agent.tools.codex_prover import (
     CodexConfig, CodexCritic, CodexAuthor, CodexSynthesizer, CodexSolutionComparator,
+    CodexReviewer, _CodexFaithJudge,
     make_codex_refiner, _json_array, _extract_json, _extract_json_object, _last_balanced,
 )
 from agent.orchestrator.population import Comparator
@@ -12,6 +14,34 @@ from agent.orchestrator.tournament import (
 )
 
 CFG = CodexConfig(model="gpt-5.5", reasoning_effort="xhigh")
+
+
+class _FakeToolkit:
+    def allowed_keys(self):
+        return {"algebra", "congruence"}
+
+
+# --- FIX 1: model-returned STRING booleans must fail closed (bool("false") == True was fail-open) --
+
+def test_codex_reviewer_stringified_bools_fail_closed(monkeypatch):
+    # STRING "true"/"false" (not JSON booleans) must NOT be trusted: any non-True value => False.
+    monkeypatch.setattr(cp, "_run_codex",
+                        lambda p, c: '{"useful": "true", "elementary": "false", "notes": []}')
+    v = CodexReviewer(_FakeToolkit(), CFG).review("G", "sketch", ["c1"])
+    assert v.useful is False and v.elementary is False and v.ok is False
+
+
+def test_codex_reviewer_genuine_bools_still_work(monkeypatch):
+    monkeypatch.setattr(cp, "_run_codex",
+                        lambda p, c: '{"useful": true, "elementary": true, "notes": []}')
+    v = CodexReviewer(_FakeToolkit(), CFG).review("G", "sketch", ["c1"])
+    assert v.useful is True and v.elementary is True
+
+
+def test_codex_faith_stringified_bool_fails_closed(monkeypatch):
+    monkeypatch.setattr(cp, "_run_codex", lambda p, c: '{"faithful": "true", "issues": []}')
+    v = _CodexFaithJudge(CFG)("claim", "theorem t : True", "t", "vacuity")
+    assert v.faithful is False
 
 
 def test_codex_roles_satisfy_tournament_protocols():

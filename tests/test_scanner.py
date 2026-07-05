@@ -55,3 +55,34 @@ def test_overloaded_word_order_not_flagged(toolkit):
         {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
     ])
     assert scan_prose(led, toolkit) == []
+
+
+# --- FIX 5: deleting the vestigial allow-context suppression must not change scan behavior ---
+
+def test_denylist_term_flags_even_with_allow_word_nearby(toolkit):
+    # A real prose_term ("class group") STILL flags REVIEW even when an allow word ("order", "unit")
+    # sits right next to it — pinning that removing the dead allow-context clause changed nothing.
+    led = _ledger([
+        {"id": "s1", "claim": "Consider the class group and the order of the unit modulo p.",
+         "justification": "algebra", "depends_on": []},
+        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+    ])
+    findings = scan_prose(led, toolkit)
+    assert any(f.code == "denylist_term" and f.severity is Severity.REVIEW for f in findings)
+
+
+def test_verifier_denylist_prose_flags_with_allow_word_nearby(toolkit):
+    # The elementary_verifier's parallel deletion: a denylist prose hit still refutes even with an
+    # allow word nearby (the removed suppression clause could never fire anyway).
+    from agent.orchestrator.elementary_verifier import refute_elementary
+    src = {
+        "problem": "p", "claim": "G",
+        "steps": [
+            {"id": "s1", "claim": "By the class group and the order of the unit.",
+             "justification": "algebra", "depends_on": []},
+            {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    }
+    vr = refute_elementary(src, toolkit, goal="G")
+    assert vr.refuted
+    assert any(r.code == "denylist_prose" for r in vr.refutations)

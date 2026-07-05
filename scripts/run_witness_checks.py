@@ -46,12 +46,16 @@ def check_spec_file(path: Path) -> dict:
     result = check_witness_spec(text)
     # score_witness_spec re-runs the same checker but yields the shared combined_score (parity with the
     # in-harness Mode-B fitness); it never eval/exec's either. Guard it too so a scoring hiccup is a row.
+    # A scorer-ONLY failure must NOT mutate result.error: valid_schema/error/confirmed stay driven purely
+    # by the CHECKER (mutating result.error here made a schema-valid spec report valid_schema=False while
+    # confirmed stayed True — a self-contradictory row). The scorer failure is recorded in its own field
+    # and the score falls back to the checker's own ok verdict.
+    scorer_error = None
     try:
         score = float(score_witness_spec(text).get("combined_score", 0.0))
     except Exception as e:  # noqa: BLE001
         score = 1.0 if result.ok else 0.0
-        if result.error is None:
-            result.error = f"scorer error: {e}"
+        scorer_error = f"scorer error: {e}"
 
     return {
         "spec": path.name,
@@ -59,6 +63,7 @@ def check_spec_file(path: Path) -> dict:
         "confirmed": bool(result.ok),             # the checker CONFIRMED the exact-integer obligation
         "score": score,
         "error": result.error,                    # set iff the spec was malformed/unrepresentable
+        "scorer_error": scorer_error,             # set iff score_witness_spec itself raised (score fell back)
     }
 
 

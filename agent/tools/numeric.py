@@ -291,6 +291,22 @@ def verify_solution_set(
         for pt in _iter_box(bounds, variables)
         if f(*pt) == 0
     ]
+    # Validate each claimed assignment BEFORE keying it (mirrors verify_residue_cover's int guard):
+    # every variable must be present with a genuine int value — bool is excluded (it subclasses int)
+    # and float is rejected, so a claimed {"x": 2.4} cannot int()-truncate to the root x=2 and
+    # silently verify (the witness-evolution reward hack), and a missing key cannot leak a raw
+    # KeyError through _key. A non-integer / malformed claim is an UNREPRESENTABLE spec ->
+    # NumericError (fail closed), exactly like the residue path: check_witness_spec records it as a
+    # spec-level error (the REJECTED-control taxonomy — type-garbage is an error row and a HARD
+    # failure callers must not reward, distinct from a well-typed-but-wrong SPURIOUS claim).
+    for c in claimed_list:
+        if not isinstance(c, dict):
+            raise NumericError(f"claimed entry must be a variable->int object; got {c!r}")
+        for v in variables:
+            if v not in c:
+                raise NumericError(f"claimed entry {c!r} is missing variable {v!r}")
+            if not isinstance(c[v], int) or isinstance(c[v], bool):
+                raise NumericError(f"claimed values must be integers; got {v}={c[v]!r}")
     claimed_keys = {_key(c, variables) for c in claimed_list}
     counter = [s for s in actual if _key(s, variables) not in claimed_keys]
     spurious = [c for c in claimed_list if f(*_key(c, variables)) != 0]

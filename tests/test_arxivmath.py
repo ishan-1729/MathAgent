@@ -92,3 +92,19 @@ def test_per_item_solver_error_is_recorded_not_fatal():
     assert report.n_errors == 1
     assert report.results[0].error is True
     assert report.results[0].correct is False
+
+
+def test_grader_exception_does_not_abort_run(monkeypatch):
+    # FIX 3: a grader (answers_equivalent) exception on one item must NOT kill the whole run.
+    # It is now caught per-item -> that item is scored incorrect, the run completes, and because the
+    # SOLVER did not fail, n_errors stays 0.
+    import agent.benchmarks.arxivmath as am
+
+    def _boom(pred, gold, *, atol=1e-9):
+        raise ValueError("grader blew up on a malformed answer")
+
+    monkeypatch.setattr(am, "answers_equivalent", _boom)
+    report = run_benchmark(_dataset(), ScriptedSolver({}, default="anything"))
+    assert report.total == 5
+    assert all(r.correct is False for r in report.results)
+    assert report.n_errors == 0     # a grader failure is not a solver error

@@ -1,6 +1,7 @@
 """Tests for the final-answer equivalence grader (SymPy-based)."""
 import io
 import contextlib
+import time
 
 import pytest
 
@@ -100,6 +101,38 @@ def test_pm_is_not_equivalent_to_a_single_value():
     assert answers_equivalent(r"\pm 1", r"\pm 1")
 
 
+# --- FIX 2: DoS guard on the untrusted-answer parse (deterministic, no timeout machinery) ---
+
+def test_power_tower_answer_declines_fast_without_oom():
+    # "2**(2**40)" would build a ~137 GB integer if evaluated; the Pow-exponent magnitude guard
+    # must decline it (return None) in well under a second, never materializing the value.
+    from agent.tools.answer_check import _to_expr
+    t = time.perf_counter()
+    assert _to_expr("2**(2**40)") is None
+    assert answers_equivalent("2**(2**40)", "4") is False
+    assert time.perf_counter() - t < 1.0
+
+
+def test_factorial_answer_declines_fast_without_oom():
+    # "factorial(100000000)" would hang/OOM if factorial were callable; it is rebound to an inert
+    # Symbol and _to_expr declines any surviving banned-callable name -> None, fast.
+    from agent.tools.answer_check import _to_expr
+    t = time.perf_counter()
+    assert _to_expr("factorial(100000000)") is None
+    assert answers_equivalent("factorial(100000000)", "4") is False
+    assert _to_expr("gamma(10**8)") is None
+    assert time.perf_counter() - t < 1.0
+
+
+def test_normal_answers_still_grade_after_dos_guard():
+    # The DoS guard must not disturb ordinary answers: they parse and grade exactly as before.
+    from agent.tools.answer_check import _to_expr
+    assert _to_expr("2**10") is not None and answers_equivalent("2**10", "1024")
+    assert answers_equivalent("1/2", "0.5")
+    assert answers_equivalent(r"\frac{1}{2}", "0.5")
+    assert _to_expr("sqrt(2)") is not None and answers_equivalent("sqrt(2)", r"\sqrt{2}")
+
+
 def test_unsupported_latex_command_declines_rather_than_dropping():
     from agent.tools.answer_check import _to_expr
     # \pm survives the known substitutions, so _to_expr declines (returns None) instead of parsing
@@ -109,3 +142,69 @@ def test_unsupported_latex_command_declines_rather_than_dropping():
     assert _to_expr(r"\frac{1}{2}") is not None
     assert _to_expr(r"\pi") is not None
     assert _to_expr(r"2\sqrt{2}") is not None
+
+
+# --- FIX 2 (residual): construction-based materialization bound over the evaluate=False parse tree.
+# The old enumeration blocklist was fundamentally incomplete against `from sympy import *` (fibonacci,
+# bernoulli, catalan, harmonic, primepi, prime, ... were all live+unbanned) and a product-of-powers each
+# under the per-Pow cap still materialized a huge integer. The bound caps materialization by TREE
+# STRUCTURE (Pow exponents + function-argument magnitude), name-agnostically, so no callable can starve
+# it. All DoS cases must decline FAST (well under a second); legit answers must still grade. ---
+
+@pytest.mark.parametrize("payload", [
+    "fibonacci(10**8)",          # NOT on any old name list; eager-eval hang without the inert rebind
+    "fibonacci(100000000)",      # bare-integer arg: hangs at PARSE without the inert Function rebind
+    "bernoulli(10**8)",
+    "catalan(10**8)",
+    "harmonic(99999999)",
+    "primepi(10**8)",
+    "loggamma(10**8)",
+])
+def test_unbanned_combinatorial_callables_decline_fast(payload):
+    # Each names a star-imported SymPy Function that the old enumeration blocklist did NOT cover; the
+    # construction bound (big numeric function argument) declines it in well under a second, never
+    # materializing a giant integer, never hanging at parse.
+    from agent.tools.answer_check import _to_expr
+    t = time.perf_counter()
+    assert _to_expr(payload) is None
+    assert answers_equivalent(payload, "4") is False
+    assert time.perf_counter() - t < 1.0, f"{payload!r} did not decline fast"
+
+
+def test_product_of_powers_under_per_pow_cap_declines_fast():
+    # ~20 powers, each exponent (9999) UNDER the per-Pow cap (10**4), but the PRODUCT of (|exp|+1)
+    # blows past the materialization budget (10**6) -> the product-of-powers channel the old per-Pow-only
+    # check missed. Must decline fast, without materializing the (astronomically large) product.
+    from agent.tools.answer_check import _to_expr
+    expr = "*".join(f"{2 + i}**9999" for i in range(20))
+    t = time.perf_counter()
+    assert _to_expr(expr) is None
+    assert time.perf_counter() - t < 1.0
+    # A single power at exactly the same per-Pow exponent is still fine on its own if it fits the budget.
+    assert _to_expr("2**9999") is not None
+
+
+def test_construction_bound_declines_fast_overall():
+    # Belt: the whole DoS battery returns in well under a second in aggregate (no per-case timeout
+    # machinery in the grader; the bound is purely structural/deterministic).
+    from agent.tools.answer_check import _to_expr
+    t = time.perf_counter()
+    for s in ("fibonacci(10**8)", "catalan(100000000)", "bernoulli(10**8)",
+              "*".join("2**9999" for _ in range(30)), "2**(2**40)"):
+        assert _to_expr(s) is None
+    assert time.perf_counter() - t < 1.0
+
+
+def test_legit_answers_unaffected_by_construction_bound():
+    # The bound must not disturb ordinary final answers: small integers, a reasonable power (2**32),
+    # fractions, sqrt, sets, tuples, and a normal equality all grade exactly as before.
+    from agent.tools.answer_check import _to_expr
+    assert _to_expr("2**32") is not None and answers_equivalent("2**32", "4294967296")
+    assert answers_equivalent("2**10", "1024")
+    assert answers_equivalent("1/2", "0.5")
+    assert answers_equivalent(r"\frac{1}{2}", "0.5")
+    assert answers_equivalent("sqrt(2)", r"\sqrt{2}")
+    assert answers_equivalent("{1, 2, 3}", "{3, 2, 1}")
+    assert answers_equivalent("(1, 2)", "(1, 2)")
+    assert answers_equivalent("x+1", "1+x")
+    assert not answers_equivalent("1", "2")

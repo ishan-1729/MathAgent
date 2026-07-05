@@ -86,6 +86,24 @@ def test_runner_writes_well_formed_rows(tmp_path):
         assert by_name[name]["confirmed"] is False and isinstance(by_name[name]["error"], str)
 
 
+def test_scorer_failure_does_not_corrupt_valid_schema_or_error(monkeypatch):
+    """FIX 4: a scorer-only failure on a SCHEMA-VALID spec must NOT flip valid_schema to False or set
+    ``error`` (those stay driven purely by the checker). The scorer failure is recorded separately in
+    ``scorer_error`` and the score falls back to the checker's own ok verdict."""
+    def _boom(_text):
+        raise RuntimeError("scorer backend down")
+    monkeypatch.setattr(RUNNER, "score_witness_spec", _boom)
+
+    row = RUNNER.check_spec_file(SPECS_DIR / "amc12_2000_p1_solution_set.json")
+    # The checker still confirmed the (valid) spec; the scorer crash never touched these.
+    assert row["valid_schema"] is True
+    assert row["confirmed"] is True
+    assert row["error"] is None
+    # The scorer failure is recorded on its own field; the score falls back to the checker's ok verdict.
+    assert row["scorer_error"] is not None and "scorer backend down" in row["scorer_error"]
+    assert row["score"] == 1.0
+
+
 def test_runner_never_crashes_on_a_rejected_spec_directory(tmp_path):
     """A directory containing ONLY rejected controls still produces recorded rows (no exception)."""
     d = tmp_path / "only_rejected"

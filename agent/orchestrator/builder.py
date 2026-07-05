@@ -252,7 +252,14 @@ def build_and_run(profile: RunProfile, goal: str, *, context: Optional[str] = No
     keyword-only with a None default, so every existing positional caller (e.g. ``builder(profile,
     goal)`` in ablate.py / tests) is unchanged."""
     driver = build_driver(profile, toolkit=toolkit, trace=trace)
-    return driver.run(goal, context=context)
+    # ONE-SHOT ownership: build_and_run warmed (via build_driver) exactly one LeanServer and owns it for
+    # this single run, so it must close it — otherwise every build_and_run leaks an orphaned repl.exe
+    # holding Mathlib. close() runs on BOTH success and a raising run() (try/finally) and never raises;
+    # the multi-goal build_driver path keeps its warm server (it does not go through here).
+    try:
+        return driver.run(goal, context=context)
+    finally:
+        driver.close()
 
 
 __all__ = ["build_driver", "build_and_run"]

@@ -38,6 +38,29 @@ def test_parse_garbage_raises():
         parse_ledger("not a proof at all")
 
 
+def test_parse_prefers_last_fenced_block_over_decoy(example_ledger_dict):
+    # FIX 4: a DECOY json fence before the real ledger must not win; the LAST parseable fence does.
+    import json
+    decoy = '```json\n{"note": "ignore me"}\n```'
+    real = "```json\n" + json.dumps(example_ledger_dict) + "\n```"
+    led = parse_ledger(decoy + "\nsome prose in between\n" + real)
+    assert led.problem == "squares_mod4"
+    assert len(led.steps) == 5
+
+
+def test_parse_single_fenced_block_still_works(example_ledger_dict):
+    # A single valid fence is unchanged by the last-block selection.
+    import json
+    led = parse_ledger("```json\n" + json.dumps(example_ledger_dict) + "\n```")
+    assert led.problem == "squares_mod4"
+
+
+def test_parse_no_fenced_block_still_errors():
+    # No fence and no parseable JSON -> the same LedgerError as before (error path preserved).
+    with pytest.raises(LedgerError, match="could not parse ledger JSON"):
+        parse_ledger("no json here at all")
+
+
 def test_parse_schema_violation_missing_steps():
     with pytest.raises(LedgerError, match="schema"):
         parse_ledger({"problem": "p", "claim": "c"})

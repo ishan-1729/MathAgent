@@ -298,6 +298,64 @@ def test_build_and_run_proves_with_a_goal_bound_scripted_prover(monkeypatch):
     assert res.dag.get(res.dag.get_or_create("G").key).proof_kind == "direct"
 
 
+class _StubServer:
+    """A warm-LeanServer stand-in that records how many times it was closed (FIX 2 leak test)."""
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def test_build_and_run_closes_warm_lean_server_once(monkeypatch):
+    """FIX 2: build_and_run OWNS the one LeanServer it warmed and must close it exactly once (a
+    try/finally driver.close()), else every build_and_run leaks an orphaned repl.exe holding Mathlib.
+    We thread a stub server through the builder's warm path and assert it is closed once after run()."""
+    import agent.orchestrator.builder as builder_mod
+    stub = _StubServer()
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: stub)
+    res = build_and_run(_authoritative_offline(server=True), "G")
+    assert isinstance(res, DagResult)
+    assert stub.closed == 1                    # the warmed server was released exactly once
+
+
+def test_build_and_run_closes_warm_lean_server_even_when_run_raises(monkeypatch):
+    """FIX 2: the close() runs in a finally, so a RAISING run() still releases the warmed server (the
+    exception propagates, but no repl.exe leaks)."""
+    import agent.orchestrator.builder as builder_mod
+    stub = _StubServer()
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: stub)
+
+    def _boom(self, goal, *, context=None):
+        raise RuntimeError("run blew up")
+
+    monkeypatch.setattr(DagDriver, "run", _boom)
+    with pytest.raises(RuntimeError):
+        build_and_run(_authoritative_offline(server=True), "G")
+    assert stub.closed == 1                    # finally released the server despite run() raising
+
+
+def test_driver_close_is_idempotent_and_never_raises(monkeypatch):
+    """DagDriver.close() guards a None server, swallows a raising close(), and is safe to call twice."""
+    class _RaisingServer:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+            raise RuntimeError("close blew up")
+
+    import agent.orchestrator.builder as builder_mod
+    srv = _RaisingServer()
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: srv)
+    d = build_driver(_authoritative_offline(server=True))
+    assert d.lean_server is srv
+    d.close()                                  # a raising server.close() must NOT propagate
+    assert srv.closed == 1 and d.lean_server is None
+    d.close()                                  # second close is a no-op (server already None)
+    assert srv.closed == 1
+
+
 def test_build_and_run_forwards_toolkit_and_trace(monkeypatch):
     """item 7: build_and_run forwards the optional toolkit/trace to build_driver (previously dropped),
     so a caller can share one toolkit + trace across the build_and_run call."""

@@ -4,7 +4,13 @@ MathAgent Layer-4 extractor.
 Defines a `#audit <decl>` command that prints, to stdout, a one-line JSON dependency report for a
 compiled declaration:
 
-    MATHAGENT_AUDIT_JSON {"theorem":"...","axioms":[...],"constants":[{"name":...,"kind":...}, ...]}
+    MATHAGENT_AUDIT_JSON {"theorem":"...","axioms":[...],
+                          "constants":[{"name":...,"kind":...,"module":...}, ...]}
+
+`module` is the constant's DECLARING module (e.g. `Mathlib.Analysis.SpecialFunctions.Trigonometric.
+Angle`), or `""` for a declaration with no module index (declared in the audited file itself). It
+lets the Python auditor enforce `Mathlib.*` MODULE-FAMILY denylist entries — decl names never start
+with `Mathlib.`, so without the module those entries could never bind.
 
 The Python auditor (`agent/gates/lean_audit.py`) consumes that JSON and decides elementarity
 (axiom whitelist + content denylist over the transitive closure). This file is self-contained
@@ -54,7 +60,14 @@ def auditJson (declName : Name) : CoreM String := do
   let closed := (closure env [declName] {}).toList
   let consts : Array Json := (closed.filterMap (fun n =>
     match env.find? n with
-    | some ci => some <| Json.mkObj [("name", Json.str n.toString), ("kind", Json.str (constKind ci))]
+    | some ci =>
+      -- Declaring module: lets the Python auditor enforce `Mathlib.*` module-family denylist
+      -- entries. "" for decls with no module index (declared in the audited source itself).
+      let mod : String := match env.getModuleIdxFor? n with
+        | some idx => ((env.header.moduleNames[idx.toNat]?).map Name.toString).getD ""
+        | none     => ""
+      some <| Json.mkObj [("name", Json.str n.toString), ("kind", Json.str (constKind ci)),
+                          ("module", Json.str mod)]
     | none    => none)).toArray
   let axArr : Array Json := (axioms.toList.map (fun a => Json.str a.toString)).toArray
   let tc := (← IO.getEnv "MATHAGENT_TOOLCHAIN").getD ""

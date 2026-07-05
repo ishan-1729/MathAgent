@@ -53,7 +53,7 @@ class DependencyReport:
                 consts.append(ConstDep(name=c))
             else:
                 consts.append(ConstDep(name=c["name"], kind=c.get("kind", "theorem"),
-                                       module=c.get("module")))
+                                       module=c.get("module") or None))  # "" (no module) -> None
         return DependencyReport(
             theorem=d["theorem"],
             axioms=list(d.get("axioms", [])),
@@ -149,6 +149,31 @@ def _dominating_allow(name: str, deny_span: tuple[int, int],
     return None
 
 
+def _module_matches(module: Optional[str], pattern: str) -> bool:
+    """Module-FAMILY ban: a ``Mathlib.*``-prefixed denylist entry matches the DECLARING MODULE by
+    dotted prefix.
+
+    Lean declaration names never start with ``Mathlib.`` (module names do), so these entries can only
+    ever bind via the report's per-constant ``module`` field — before module matching existed they
+    were inert. Scoped to ``Mathlib.``-prefixed patterns ONLY so no currently-live decl-name entry
+    (bare or dotted) changes meaning. Reports without a ``module`` field (older extractor) simply
+    never match here — decl-name entries remain the backstop."""
+    if not module or not pattern.startswith("Mathlib."):
+        return False
+    return module == pattern or module.startswith(pattern + ".")
+
+
+def _anchored_allow(name: str, patterns: list[str]) -> Optional[str]:
+    """An allowlist pattern anchored at the START of `name`, or None. Used to exempt a module-family
+    hit: an elementary-by-fiat API (e.g. ``Nat.gcd``) stays permitted even if it is declared inside a
+    banned module family. Fails CLOSED (no anchor -> no exemption)."""
+    for p in patterns:
+        span = _match_span(name, p)
+        if span is not None and span[0] == 0:
+            return p
+    return None
+
+
 def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
                  theorem_name: Optional[str] = None) -> LeanAuditResult:
     """Audit a dependency report. Deterministic; REJECT findings are authoritative.
@@ -188,16 +213,39 @@ def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
     allow = toolkit.lean_infrastructure_allowlist + toolkit.lean_elementary_by_fiat
     for c in report.constants:
         hit = _best_deny_span(c.name, deny)
-        if hit is None:
+        if hit is not None:
+            hit_pat, deny_span = hit
+            exempt = _dominating_allow(c.name, deny_span, allow)
+            if exempt is not None:
+                findings.append(Finding(LAYER_LEAN, Severity.INFO, "denylist_exempted",
+                                        f"{c.name} matches denylist {hit_pat!r} but is allowlisted ({exempt!r})"))
+                continue
+            findings.append(Finding(LAYER_LEAN, Severity.REJECT, "denylisted_dependency",
+                                    f"non-elementary dependency {c.name!r} ({c.kind}) matches denylist {hit_pat!r}"))
             continue
-        hit_pat, deny_span = hit
-        exempt = _dominating_allow(c.name, deny_span, allow)
+        # Module-family ban: a `Mathlib.*` entry matches the constant's DECLARING MODULE by prefix,
+        # catching whole families (e.g. every decl in Mathlib.Analysis.SpecialFunctions.Trigonometric.*)
+        # so sibling decls the per-name entries missed cannot slip through. Name-anchored allowlist
+        # entries still exempt (by-fiat APIs keep working wherever they are declared). Fails CLOSED.
+        mod_pat = next((p for p in deny if _module_matches(c.module, p)), None)
+        if mod_pat is None:
+            continue
+        exempt = _anchored_allow(c.name, allow)
         if exempt is not None:
             findings.append(Finding(LAYER_LEAN, Severity.INFO, "denylist_exempted",
-                                    f"{c.name} matches denylist {hit_pat!r} but is allowlisted ({exempt!r})"))
+                                    f"{c.name} (module {c.module}) matches denylist {mod_pat!r} "
+                                    f"but is allowlisted ({exempt!r})"))
             continue
         findings.append(Finding(LAYER_LEAN, Severity.REJECT, "denylisted_dependency",
-                                f"non-elementary dependency {c.name!r} ({c.kind}) matches denylist {hit_pat!r}"))
+                                f"non-elementary dependency {c.name!r} ({c.kind}) declared in banned "
+                                f"module {c.module!r} matches denylist {mod_pat!r}"))
+
+    # 3. Anti-vacuity: a report carrying NEITHER axioms NOR constants audited nothing — a real
+    #    compiled proof always has a non-empty closure (it contains at least the audited theorem
+    #    itself). Passing such a report would certify on zero evidence; fail CLOSED instead.
+    if not report.constants and not report.axioms:
+        findings.append(Finding(LAYER_LEAN, Severity.REJECT, "vacuous_report",
+                                "report has no axioms and no constants — nothing was audited"))
 
     verdict = LeanVerdict.REJECT if any(f.severity is Severity.REJECT for f in findings) else LeanVerdict.PASS
     return LeanAuditResult(verdict=verdict, findings=findings, report=report)
@@ -208,5 +256,10 @@ def audit_json(text: str, toolkit: Optional[Toolkit] = None,
     return audit_report(DependencyReport.from_json(text), toolkit, theorem_name=theorem_name)
 
 
-def audit_file(path: str | Path, toolkit: Optional[Toolkit] = None) -> LeanAuditResult:
-    return audit_json(Path(path).read_text(encoding="utf-8"), toolkit)
+def audit_file(path: str | Path, toolkit: Optional[Toolkit] = None,
+               theorem_name: Optional[str] = None) -> LeanAuditResult:
+    """TEST/TOOLING ONLY — audits a report file with no nonce provenance. The production path is
+    ``lean_bridge.audit_lean_source`` / ``LeanServer.audit``, which compile with a nonce-guarded
+    ``#audit`` command and always pass ``theorem_name``. Pass ``theorem_name`` here too when the
+    expected declaration is known."""
+    return audit_json(Path(path).read_text(encoding="utf-8"), toolkit, theorem_name=theorem_name)

@@ -25,7 +25,7 @@ GATE_PY = ROOT / "agent" / "gates" / "gate.py"
 
 # The exact top-level keys + constant sub-keys the Python parser reads (lean_audit.DependencyReport).
 _PARSER_TOP_KEYS = {"theorem", "toolchain", "axioms", "constants"}
-_PARSER_CONST_KEYS = {"name", "kind"}
+_PARSER_CONST_KEYS = {"name", "kind", "module"}
 
 
 def _emitted_json_keys() -> set[str]:

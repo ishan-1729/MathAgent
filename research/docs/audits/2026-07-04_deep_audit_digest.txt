@@ -1,0 +1,464 @@
+========================================================================================================
+FABLE INDEPENDENT VERIFICATION — 2026-07-04 (adjudication pass, separate from the remediation session)
+========================================================================================================
+I re-read the eight highest-stakes fixes directly against the current (uncommitted) working tree and
+confirm each is PRESENT and CORRECT — not merely claimed:
+  1. bool()→`is True` fail-open: all SIX sites fixed, incl. the three in claude_roles.py (the DEFAULT
+     provider path, so the default authoritative pipeline is covered, not only Codex runs) —
+     codex_prover.py:264/265/325, claude_roles.py:128/129/191.
+  2. Denylist structural fix: Audit.lean stamps each constant's declaring `module` (Audit.lean:64-70);
+     lean_audit._module_matches binds `Mathlib.*` entries by module prefix (lean_audit.py:152-163, used
+     at :230). PRECISION (corrected after the adversarial pass): a report with NO module field does not
+     REJECT on the module dimension — _module_matches returns False, i.e. the module-family ban is
+     SKIPPED and coverage falls back to the decl-name entries + the axiom whitelist. So the module bans
+     are fail-OPEN-then-backstopped, NOT independently fail-closed; they are safe only because the
+     recompiled extractor always stamps a real module for Mathlib decls (now LIVE-CONFIRMED — see below).
+     The 11 formerly-inert entries are now live and well-scoped (ClassGroup, DedekindDomain, NumberField,
+     EllipticCurve, ModularForms, Cyclotomic, Catalan, AlgebraicGeometry, Zsqrtd, Trigonometric); none is
+     an over-broad prefix. Unit-tested both directions; and now LIVE-tested (below). RESIDUAL GAP the
+     adversarial pass found: analytic-transcendental SIBLINGS outside the one banned analysis module and
+     with no decl-name entry still PASS — Real.rpow (=exp(y·log x)), Real.logb, Complex.log, Complex
+     hyperbolics — a real same-class false-certificate gap; fix applied (decl-name entries added).
+  3. Empty-report anti-vacuity REJECT (lean_audit.py:246-248). 4. Injection charset gate:
+     ^[A-Za-z0-9._-]+$ fullmatch in ClaudeConfig/CodexConfig.__post_init__. 5. verify_solution_set
+     rejects non-int `claimed` → NumericError (numeric.py). 6. LeanServer leak: DagDriver.close()
+     (dag_driver.py:334) called from build_and_run's finally (builder.py:262) — correctly NOT from
+     run(), so multi-goal build_driver callers keep their warm REPL. 7. Population memo-poisoning:
+     _prove_via_population returns (ok, reason); budget-starved → retryable mark_exhausted
+     (dag_driver.py:516/521/569-572). 8. run_problems UnicodeDecodeError guards at both read sites.
+
+FULL SUITE (Fable-run, this machine, 2026-07-04): 1317 passed, 11 skipped, 0 failed (616s);
+`make check`: PASS. Confirms the remediation is green independently of the session that wrote it.
+
+LIVE VALIDATION — NOW CLOSED (2026-07-04, both directions, against the RECOMPILED module-stamping
+Audit.lean under profiles/authoritative.yaml):
+  * OVER-REJECTION check — `∀n, n² ≡ 0 or 1 (mod 4)`: state=lean_verified, terminal Layer-4 gate
+    formalize+compile OK, lean-audit PASS (0 rejects), faithfulness 4/4, authoritative_elementary=TRUE.
+    → the module-family bans do NOT over-reject the standard ZMod/Int elementary proof.
+  * REGRESSION check — the imo_1963_p5 trig negative control: proven=False, authoritative_elementary=
+    False, status=rejected (3 calls). → the fix still rejects the out-of-domain trig proof live.
+  So the structural module fix is now LIVE-PROVEN end-to-end in both directions, not merely
+  synthetic-test-proven. RESIDUAL (documented, not blindly patched): a legitimate elementary proof that
+  invokes Mathlib's `legendreSym.quadratic_reciprocity` (Gauss-sum internal closure touching a now-live
+  banned module family, e.g. Cyclotomic.*) could OVER-reject — the by-fiat exemption is name-anchored
+  and does not cover internal helper lemmas. Needs a live legendreSym/QR audit before relying on
+  QR-by-fiat; the common ZMod/Int case is proven safe above.
+
+VERDICT: the findings are real and correctly diagnosed; the fixes make sense and are correctly
+implemented; no fix introduces a new soundness hole (the closes-in-build_and_run and retryable-EXHAUST
+decisions are the right ones). Report is accurate as written.
+--------------------------------------------------------------------------------------------------------
+
+========================================================================================================
+ADVERSARIAL RE-VERIFICATION OF THE REMEDIATION — 2026-07-04 (Fable-orchestrated, 15 fresh Opus agents)
+========================================================================================================
+After the fixes were applied, a 9-lane adversarial workflow (+ a second-opinion pass) tried to BREAK
+each fix rather than confirm it — hunting reachable bypasses, missed second sites, regressions the fix
+introduced, and vacuous pinning tests. Result: 39 SOLID, 0 overturned, 6 real residual gaps (all
+same-class INCOMPLETENESS, none a broken fix; the pinning tests were checked non-vacuous, driving real
+production paths). Each of the top 8 fixes was independently re-read and holds. The 6 gaps:
+
+  [FIXED] (1) SOUNDNESS — the analysis/trig denylist missed analytic-transcendental SIBLINGS whose
+      declaring module is outside the one banned analysis module and which have no decl-name entry:
+      Real.rpow (=exp(y·log x)), Real.logb, Complex.log, Complex.sinh/cosh/tanh, Complex.arcsin/
+      arccos/arctan — all PASSED (false-certificate). Fixed: decl-name entries added (Complex.exp
+      DELIBERATELY still allowed for roots-of-unity, PLAN §2.1); regression + carve-out tests added.
+  [FIXED] (2) HIGH DoS — answer_check's _BANNED_CALLABLES enumeration is unclosable against
+      `from sympy import *` (fibonacci/bernoulli/catalan/… unbanned) and product-of-powers each under
+      the per-Pow cap still materializes huge ints. Replaced with a CONSTRUCTION bound: inert
+      UndefinedFunction rebinding (kills eager-eval parse hang) + a preorder-traversal materialization
+      budget (per-Pow |exp|≤1e4, ∏(|exp|+1)≤1e6, function numeric-arg |a|≤1e4). Name-agnostic, can't
+      be starved by an unlisted callable; tests pin the DoS cases decline fast + legit answers grade.
+  [FIXED] (3) MED — 2nd LeanServer-leak site: prove.py --profile built a driver via build_driver
+      (which warms a server) but never called driver.close(). Fixed: try/finally driver.close() on the
+      --profile branch; tests assert close() on success AND on a raising run().
+  [FIXED] (4) MED — 2nd path-traversal site: run_brokenarxiv ledger filename used the UNTRUSTED dataset
+      idx unsanitized ('../evil' escaped ledgers_dir). Fixed: _slug() sanitizes idx (and the run_problems
+      slug) too; test asserts an escaping idx stays in-dir.
+  [DOCUMENTED] (5) MED — the now-live Mathlib.* module-family bans COULD over-reject a legitimate
+      elementary proof that invokes Mathlib's legendreSym.quadratic_reciprocity (Gauss-sum internal
+      closure touching e.g. Cyclotomic.*); the by-fiat exemption is name-anchored and misses internal
+      helpers. NOT patched blind — the common ZMod/Int case is LIVE-PROVEN safe (n²mod4 certified);
+      a live legendreSym/QR audit is the check to run before relying on QR-by-fiat.
+  [FIXED] (6) LOW — a wording imprecision in THIS report's Fable-verification block ("fails closed on a
+      no-module report"): corrected above — the module ban is SKIPPED for a no-module constant,
+      backstopped by decl-name entries.
+
+POST-REMEDIATION SUITE (Fable arbiter, 2026-07-04): 1342 passed, 11 skipped, 0 failed; make check PASS
+(1317 before the 4 residual fixes → 1342 with their +25 pinning tests). LIVE module-fix validation:
+CLOSED both directions (see the LIVE VALIDATION block above). NET: the remediation is sound; the
+adversarial pass improved it (2 real soundness/DoS gaps closed that the first fix wave missed) and left
+one documented, non-blocking over-rejection tension for the QR-by-fiat shape.
+--------------------------------------------------------------------------------------------------------
+
+REVISED 2026-07-04 — every finding independently re-verified (Fable direct reads for the 15 CONFIRMED /
+4 PARTIAL originals; two fresh-context Opus verifier agents for the 16 previously-unverified lows).
+Changes from v1: denylist finding UPGRADED to high and substantially strengthened (all Mathlib.*-prefix
+entries are inert; the v1 fix hint was wrong — Audit.lean emits NO module field); the bool()-coercion
+fail-open EXPANDED to six sites (three previously-unknown ones in claude_roles.py); test_dag.py:225
+REFUTED; the two "fail-open" scanner findings are real but fail-CLOSED (direction was mislabeled);
+lean_audit.py:211 largely defused (audit_file is test-only) with one real residual anti-vacuity gap.
+
+==== CONFIRMED (15) ====
+[high] agent/orchestrator/dag_driver.py:499 (orch-logic) v=CONFIRMED-2x
+  SUMMARY: The population decomposition branch in _decompose never propagates the failing reason, so a
+  population-path node that fails purely due to budget starvation is terminally marked FAILED_GAP
+  instead of EXHAUSTED, poisoning the split-keyed memo.
+  RE-VERIFIED: _prove_via_population returns bare bool; dag_driver.py:1380 explicitly discards the
+  `_reason` from _try_decomposition (`ok, _notes, _reason = ...`). The non-population branch threads it
+  (dag_driver.py:521-525); the population branch does not — the asymmetry is real. REACHABILITY NUANCE:
+  the loop-top budget check (496-498) sets budget_starved on the NEXT iteration, so the bug bites only
+  when the starved population attempt is the LAST attempt (e.g. max_decomp_attempts=1, or starvation on
+  the final replan) — still fully reachable, and the memo poisoning (provable goal permanently
+  FAILED_GAP) justifies high.
+  FIX: Make _prove_via_population return (ok, reason) — thread the `_reason` currently discarded at
+  :1380 (the machinery already exists: _try_decomposition returns it, and _failing_child_reason at
+  :1189 classifies EXHAUSTED children as budget_starved). Set last_reason from it in the population
+  branch of _decompose.
+
+[high] agent/orchestrator/builder.py:177 (resources) v=CONFIRMED-2x
+  SUMMARY: build_driver/build_and_run warm a persistent LeanServer (repl.exe under `lake env`) and hand
+  it to the DagDriver, but nothing on the builder path ever closes it — one live Mathlib REPL process
+  leaks per run.
+  RE-VERIFIED: _warm_lean_server (builder.py:70-82) → server = _warm_lean_server() (:177) → threaded
+  into DagDriver (:204). Zero close() calls in builder.py or dag_driver.py (grepped). LeanServer.close()
+  exists and is correct (lean_server.py:193-217).
+  FIX (amended from v1): do NOT close inside DagDriver.run()'s finally — build_driver callers may run
+  multiple goals on one driver, and re-warming Mathlib costs minutes. Instead: give DagDriver a close()
+  that closes self.lean_server if set, and call it in build_and_run's try/finally (build_and_run owns
+  the one-shot lifecycle; it is what every sweep calls). This is safe even for reused drivers because
+  LeanServer.audit() lazily restarts a closed server (lean_server.py:168-169).
+
+[high] scripts/run_problems.py:317 (resources) v=CONFIRMED-2x
+  SUMMARY: run_problems.run_one/run_sweep, ablate.run_profile_row, and run_brokenarxiv call
+  build_and_run per (problem,profile) and never close the warm LeanServer; each Lean-server-profile
+  pair orphans one repl.exe holding loaded Mathlib, so a long sweep accumulates orphans and exhausts
+  memory. Only Lean-server profiles (e.g. profiles/authoritative.yaml) leak; non-Lean profiles leak
+  nothing.
+  RE-VERIFIED: run_one calls builder(profile, statement, ...) (:317) with builder defaulting to
+  build_and_run; no close anywhere on the caller side.
+  FIX: falls out of the builder.py fix above (build_and_run closes in finally) — no per-caller change
+  needed once that lands.
+
+[high] agent/tools/codex_prover.py:275 + 5 more sites (layer4-edge) v=CONFIRMED-2x, EXPANDED
+  SUMMARY: Model-returned JSON booleans are coerced with bool(), so a stringified "false" from the
+  model becomes True — a fail-OPEN in the faithfulness wall that gates authoritative_elementary, and in
+  the decomposition reviewer's useful/elementary verdicts.
+  RE-VERIFIED + EXPANDED: v1 cited only codex_prover.py:275 (faithful) and listed :215 as an
+  unverified low. Full sweep found SIX sites, including three in the CLAUDE roles (the DEFAULT
+  provider, so the default pipeline is affected, not just Codex runs):
+    - agent/tools/codex_prover.py:214 (useful), :215 (elementary), :275 (faithful)
+    - agent/tools/claude_roles.py:126 (useful), :127 (elementary), :189 (faithful)
+  A bare JSON false parses to Python False and is handled correctly; the flip needs the model to emit
+  the string "false"/"no"/"0" — plausible under drift, and the faithfulness panel is the wrong-statement
+  wall for authoritative_elementary, so fail-open there is certificate-relevant.
+  FIX: `field is True` semantics at all six sites, e.g. faithful=(obj.get("faithful") is True); same
+  for useful/elementary. One shared helper is fine but not required. Ship with a test pinning the
+  stringified-"false" case.
+
+[high] agent/gates/denylist.yaml:165 + agent/gates/lean_audit.py:190 (layer4-edge)
+       v=CONFIRMED-2x, UPGRADED medium→high, STRENGTHENED
+  SUMMARY (v1): trig/analysis entries under-match sibling decls (Real.Angle.cos/sin/tan, Complex.tan,
+  Real.cosh/sinh/tanh, Real.arsinh, Real.Gamma not caught), re-opening the imo_1963_p5 false-certificate
+  hole via a sibling decl.
+  STRENGTHENED (this is worse than v1 said): audit_report matches denylist patterns against the decl
+  NAME only (lean_audit.py:190, c.name), and Audit.lean emits ONLY {"name","kind"} per constant
+  (Audit.lean:57) — there is NO module field in the report. Lean decl names never start with
+  "Mathlib.", so EVERY Mathlib.*-prefixed entry in lean_denylist_decls is INERT DEAD WEIGHT (11
+  entries: ClassNumber, ClassGroup, DedekindDomain, NumberField, EllipticCurve, ModularForms,
+  Cyclotomic, Catalan, AlgebraicGeometry, Zsqrtd, Analysis.SpecialFunctions.Trigonometric). Coverage
+  rests entirely on bare/dotted decl-name entries, which leaves ADDITIONAL live gaps beyond v1's trig
+  list: ModularForm / CuspForm / SlashInvariantForm (no decl-name entry for modular forms at all),
+  ClassGroup (only the inert module entry), AlgebraicGeometry.Scheme. The repo already hit this
+  per-token (denylist.yaml:112-114 notes the dotted NumberField entries "never matched" the bare
+  typeclass) but never generalized. v1's FIX HINT WAS WRONG: the report does NOT "already carry module
+  per ConstDep" — the Python dataclass has an optional module field (lean_audit.py:37) the Lean side
+  never fills.
+  FIX (two stages):
+   (a) immediate, yaml-only: add decl-name entries — Real.Angle (dotted prefix, catches the whole
+       Angle API), Complex.tan, Real.cosh, Real.sinh, Real.tanh, Real.arsinh, Real.arcosh, Real.artanh,
+       Real.Gamma, Complex.Gamma, ModularForm, CuspForm, SlashInvariantForm, ClassGroup. Re-run the
+       imo_1963_p5 negative control plus the certified elementary battery (over-rejection check).
+   (b) structural, closes the class: extend Audit.lean to stamp each constant's module (the
+       environment knows it) and add module-prefix matching in audit_report, which turns the 11 inert
+       Mathlib.* entries into live family-wide bans and ends the sibling-decl whack-a-mole.
+
+[high] agent/tools/codex_prover.py:92 (security) v=CONFIRMED-2x
+  SUMMARY: Windows command injection (BatBadBut class): an unvalidated model string flows through
+  `cmd.exe /c codex.cmd ... -c model={cfg.model}`; cmd.exe re-parses the line, so a crafted model value
+  (embedded `"` + `&`) breaks out of Python's argument quoting and executes arbitrary commands.
+  RE-VERIFIED: argv = [COMSPEC, "/c", launcher, *flags] (codex_prover.py:91-92) with
+  f"model={cfg.model}" (:87). The comment at :82-83 addresses TOML quoting only, not cmd metacharacters.
+  Reachability confirmed end-to-end: prove.py --model has NO validation (prove.py:285 default only) →
+  CodexConfig(model=args.model) (:408); the local UI passes /run?model=... straight to --model
+  (ui/server.py:64). RunProfile RoleSpec.model from profile YAML is a third path.
+  FIX: charset-validate every model value at construction — reject unless ^[A-Za-z0-9._-]+$ — in
+  CodexConfig/ClaudeConfig (single chokepoint covers CLI, UI, and profile paths). Optionally also stop
+  routing .cmd launchers through cmd.exe (resolve the shim target), but the charset gate is the
+  necessary fix.
+
+[medium] agent/tools/claude_cli.py:85 (security) v=CONFIRMED-2x
+  SUMMARY: Same cmd.exe injection sink on the Claude CLI path: unvalidated model reaches
+  `cmd.exe /c claude.cmd --model <cfg.model>` (claude_cli.py:80,84-85). Reachable via RunProfile
+  RoleSpec.model (profile YAML). Same fix as codex_prover (validate in ClaudeConfig).
+
+[medium] agent/tools/claude_cli.py:90 (resources) v=CONFIRMED-2x
+  SUMMARY: On timeout, subprocess.run kills only the direct child; with a .cmd shim run via
+  `cmd.exe /c`, the real node/claude grandchild is orphaned on Windows (no process-tree kill). Same
+  pattern in codex_prover.py:97. Repeated timeouts across a sweep accumulate orphans.
+  RE-VERIFIED + FIX SHARPENED: no existing tree-kill precedent in the repo (no taskkill /
+  CREATE_NEW_PROCESS_GROUP / psutil anywhere; psutil is NOT a dependency — pyproject lists only
+  pyyaml/sympy/jsonschema/pydantic). Minimal stdlib fix: switch both _run_* to Popen with
+  creationflags=CREATE_NEW_PROCESS_GROUP on Windows (start_new_session=True on POSIX); on timeout run
+  `taskkill /F /T /PID <pid>` (Windows) / os.killpg (POSIX) before raising the typed error.
+
+[medium] agent/tools/numeric.py:271 (gates-edge) v=CONFIRMED-2x
+  SUMMARY: verify_solution_set truncates claimed points via int() in _key (numeric.py:271-272) and
+  never validates that claimed assignments are integers, so a non-integer claimed point (a JSON float
+  in an evolved witness spec) is accepted whenever it truncates onto an actual root — making the
+  'solution_set' fitness in witness_spec_evaluator reward-hackable, contradicting evolve_witnesses'
+  NON-GAMEABLE docstring. Scoped to the witness-evolution fitness signal, NOT the Layer-4 audit.
+  RE-VERIFIED: _key does tuple(int(a[v])...) (:271-272); spurious-check evaluates f at the TRUNCATED
+  key (:296), so {'x': 2.4} against root x=2 yields ok=True. verify_residue_cover already has exactly
+  the right guard shape (isinstance int, not bool — :308-315); verify_solution_set has none.
+  FIX: in verify_solution_set, reject any claimed value that is not a bool-excluded int (raise
+  NumericError, or mark the entry spurious so fitness stays 0) before _key is ever applied — mirror
+  the verify_residue_cover guard.
+
+[medium] agent/gates/lean_bridge.py:47 (layer4-edge) v=CONFIRMED-2x
+  SUMMARY: _FORBIDDEN_PROOF_RE omits `run_cmd`/`run_elab`, and the `.` inside the lookbehind's negated
+  class lets dot-qualified calls (Lean.logInfo, Lean.logInfoAt) through — eroding the FIRST guard layer
+  the docstring (lean_bridge.py:39-46, 90-97) claims. NOT a false certificate: the unpredictable nonce,
+  the >1-bare-sentinel count (:79), and the literal-#audit/sentinel checks (:104-113) still block
+  forgery. Same regex reused by lean_server.py:170. No test pins run_cmd or dotted logInfo.
+  RE-VERIFIED: regex at :47-57 — `run_cmd` absent; lookbehind (?<![A-Za-z0-9_.]) fails at the `.` in
+  `Lean.logInfo`, so no match.
+  FIX (amended from v1): add `run_cmd` and `run_elab` to the alternation. For the dotted bypass, do
+  NOT blanket-drop `.` from the lookbehind — that would newly match legit decl components (e.g.
+  List.prefix_append hits the `prefix` token) and over-reject. Instead allow optional dotted
+  qualification on the emit/command family only, e.g. prefix the log*/run_cmd/run_elab alternates with
+  (?:[A-Za-z_][A-Za-z0-9_]*\.)* or a literal (?:Lean\.)?. Add tests for `run_cmd Lean.logInfo "hi"`
+  and `Lean.logInfoAt`.
+
+[medium] agent/tools/answer_check.py:83 (scripts-misc) v=CONFIRMED-2x
+  SUMMARY: The SymPy answer grader evaluates untrusted model answers via parse_expr(evaluate=True)
+  with the full sympy namespace (factorial/gamma/** included) and no CPU/memory/time bound; grading at
+  agent/benchmarks/arxivmath.py:182 runs OUTSIDE the per-item try/except (which wraps only
+  solver.solve, :178-181), so `FINAL ANSWER: 2**(2**40)` or factorial(10**8) hangs/OOMs the whole
+  benchmark process. DoS, not RCE (__builtins__ is emptied at answer_check.py:30).
+  RE-VERIFIED: _SAFE_GLOBALS is literally `from sympy import *` (:27-28) — factorial and gamma are in
+  scope; evaluate=True at :84.
+  FIX: bound the evaluation (subprocess/thread wall-clock guard around _to_expr, or parse with
+  evaluate=False + a count_ops/size gate before any evalf), drop factorial/gamma from the answer
+  namespace (final answers never legitimately need them unevaluated), and move the grading call inside
+  the per-item try so one pathological answer costs one item, not the run.
+
+[medium] scripts/run_brokenarxiv.py:346 (new-code) v=CONFIRMED-2x
+  SUMMARY: run_sweep's final summary (:342-349) computes bluff_rate and mean over ALL rows and never
+  counts rows with error set; run_one's except block (:266-271) grades any build/run crash
+  GRADE_UNIDENTIFIED=1 → normalized 0.5, so an all-crash sweep prints "bluff_rate = 0.0000 (0/50);
+  mean normalized = 0.5000" — reads as a clean do-not-prove result when zero proving occurred. (Per-row
+  errors ARE visible live on stderr and persisted in the JSONL; only the aggregate headline conflates.)
+  FIX: errors = sum(1 for r in rows if r["error"]); print it in the summary line; exclude error rows
+  from the bluff_rate/mean denominators (or refuse the headline when errors > some fraction).
+
+[medium] agent/orchestrator/README.md:33 (doc-drift) v=CONFIRMED-2x
+  SUMMARY: README declares the incumbent tournament, retrieval, and the population/Elo search layer
+  "Still design-only", but all three are built and wired (refiner tournament: builder.py:156-158;
+  population/Elo: dag_driver._prove_via_population + EloPopulation; retrieval: live per PLAN §4.1).
+  FIX: replace line 33 with the built status; fold into the same edit as the :30 prover-drift fix below.
+
+[high] scripts/run_problems.py:109 (consistency) v=CONFIRMED-2x
+  SUMMARY: _read_frontmatter reads problem.md as UTF-8 with NO UnicodeDecodeError guard (unlike the
+  check_repo_skeleton reader it claims to match, :106) — one cp1252 problem.md aborts the ENTIRE sweep.
+  RE-VERIFIED mechanism: discover_problems catches only ProblemLoadError (:249); UnicodeDecodeError IS
+  a ValueError subclass, so it escapes to main's except (ValueError, OSError) at :532 → one generic
+  ERROR line → return 2 → every other valid problem silently never runs.
+  FIX: try/except UnicodeDecodeError in _read_frontmatter raising ProblemLoadError (so the folder
+  yields an error ROW), or add UnicodeDecodeError explicitly to discover_problems' caught types.
+
+[high] scripts/run_problems.py:144 (consistency) v=CONFIRMED-2x
+  SUMMARY: Same class, second site: _parse_allowed_inputs_note reads allowed_inputs.md unguarded
+  (:144); a non-UTF-8 allowed_inputs.md aborts the whole sweep even when problem.md is valid.
+  FIX: same guard (return None or raise ProblemLoadError on UnicodeDecodeError).
+
+==== PARTIAL (4) ====
+[medium] agent/gates/lean_server.py:139 (resources) v=PARTIAL (re-verified; v1 verifier's re-scope stands)
+  SUMMARY: After an audit timeout, _drain_queue empties the queue but the still-running REPL's
+  late-but-valid response is enqueued AFTER the drain by the pump thread; timeout raises without
+  tearing down the server (only EOF/dead-stdin close()), so the persistent server runs one-behind for
+  the rest of the sweep. Nonce+theorem cross-check rejects each stale reply, so soundness holds (no
+  false certificate); the harm is that every following node in that warm-server run silently loses its
+  Layer-4 Lean certification (LeanBridgeError → lean_verified=False, soft path continues) until restart.
+  RE-VERIFIED FIX SAFETY: audit() lazily restarts a closed server (:168-169), so closing on timeout is
+  safe and cheap to wire.
+  FIX: call self.close() in BOTH timeout branches of _read_response (:137-140 and :143-145), exactly
+  like the EOF branch (:146-149) — a desynced persistent REPL is never safely reusable.
+
+[low] scripts/ablate.py:202 (win-encoding) v=PARTIAL (re-verified; still unfixed in working tree)
+  SUMMARY: ablate.py lacks the stdout/stderr UTF-8 reconfigure its three siblings have
+  (prove.py, run_benchmark.py, run_brokenarxiv.py), so goal/ledger-derived non-ASCII (ℤ/→/≤) in
+  progress/error lines prints as backslashreplace mojibake on a cp1252 console. NOT a crash — Python's
+  stderr errors='backslashreplace' means no UnicodeEncodeError, no aborted sweep (v1's high-severity
+  crash mechanism refuted by the original verifier; concur). Checked 2026-07-04: the working-tree
+  ablate.py still has no reconfigure call.
+  FIX: copy the two-line reconfigure guard from run_benchmark.py:25-27.
+
+[low] agent/orchestrator/README.md:30 (doc-drift) v=PARTIAL (re-verified verbatim)
+  SUMMARY: ":30-31 states 'The focused prover is Codex / GPT-5.5-xHigh' as current fact, but the
+  default is Claude/opus (registry.py:11 - DEFAULT provider claude; profiles/default.yaml) and Codex is
+  the optional provider. No runtime impact; CLAUDE.md and the registry docstring state the real default.
+  FIX: reword to "prover role defaults to Claude/opus via the registry; Codex/GPT-5.5 is the optional
+  provider (../tools/codex_prover.py)". Do together with the :33 fix and PLAN.md:158 below.
+
+[low] scripts/run_problems.py:378 (new-code) v=PARTIAL (re-verified)
+  SUMMARY: Ledger dump filename keyed on profile.name only (:378; same at run_brokenarxiv.py:299) —
+  two swept profiles sharing a `name:` but differing in profile_hash silently overwrite each other's
+  ledgers (the proof_tree/nodes artifact exists ONLY in the ledger). Latent footgun: all 18 shipped
+  profiles have distinct names; JSONL rows stay correct per profile_hash.
+  FIX: f"{slug}__{profile.name}__{profile.profile_hash[:12]}.json" at both sites (combine with the
+  name-sanitization fix below — one helper, both problems).
+
+==== REFUTED (2) ====
+  scripts/run_problems.py:448 — claimed UnicodeEncodeError crash printing row["error"] to
+  un-reconfigured stderr. Structural premises true (no reconfigure) but the crash cannot occur:
+  stderr's errors='backslashreplace' never raises. Mojibake only. (Unchanged from v1.)
+
+  tests/test_dag.py:225 — claimed `dag.get("L" and goal_hash("L"))` silently discards "L" making the
+  assertion vacuous. REFUTED on re-verification: discarding "L" is CORRECT — ProofDAG.get takes a
+  goal_hash key (dag.py:313-314); `dag.get("L")` would be the bug (always None). The assertion is
+  meaningful as written; the `"L" and` prefix is merely confusing dead code. Cosmetic fix:
+  dag.get(goal_hash("L")).
+
+==== FORMERLY-UNVERIFIED LOWS — NOW RESOLVED (14 remaining; 2 moved above) ====
+Moved up: codex_prover.py:215 (merged into the six-site bool() finding, CONFIRMED);
+test_dag.py:225 (REFUTED, above).
+
+[low→CONFIRMED] agent/orchestrator/dag_driver.py:530 (orch-logic) — comment drift, not a logic hole.
+  Comments at :208, :530, :606 claim _try_decomposition enforces "strict-simpler-child"; the actual
+  gate (:933-1067) enforces goal-binding, acyclicity, sketch validity, conclusion binding, optional
+  reviewer, optional sketch-Lean, H0 — no simplicity/measure check exists. Termination rests on
+  acyclicity + max_depth; "simpler" is only the OPTIONAL soft ReviewVerdict.useful bit. Fail-closed
+  properties unaffected.
+  FIX: correct the three comments (or implement a real measure check if the guarantee is wanted).
+
+[low→PARTIAL] agent/orchestrator/elementary_verifier.py:104 (mislabeled fail-open; actually
+  fail-CLOSED) — the allow-context clause `term in ctx or ctx == term` is indeed inert (multi-word
+  denylist phrases vs single-word allow terms: substring direction wrong, equality impossible, and the
+  clause never references the prose being scanned). But an inert SUPPRESSION means MORE refutations →
+  over-reject, never admit. No soundness hole; negligible today since the vocabularies don't collide.
+  FIX: `not any(ctx in low and term in ctx for ctx in allow)` — or delete the dead allow-context logic.
+
+[low→PARTIAL] agent/gates/scanner.py:43 (same clause, Layer-1b; both v1 entries collapse to one) —
+  identical inert clause, and doubly harmless: scan_prose only emits Severity.REVIEW routings ("never
+  reject on its own", module docstring), so the worst case is extra review routing. Fail-CLOSED, low.
+  FIX: same as elementary_verifier (fix direction or delete), one shared shape.
+
+[low→CONFIRMED] agent/gates/ledger.py:100 (gates-edge) — _extract_json .search takes the FIRST fenced
+  ```json block, so a decoy fence before the real ledger wins. NOT a soundness hole: a schema-valid
+  decoy with a different claim dies at goal-binding (dag_driver:106-111 / elementary_verifier:143-155);
+  a malformed one raises LedgerError → failed episode with feedback. Liveness annoyance (wasted
+  episodes).
+  FIX: prefer the LAST fenced block, or the first block that parses+schema-validates.
+
+[low→PARTIAL] agent/gates/lean_audit.py:211 (layer4-edge) — largely defused, one real residual gap.
+  audit_file does lack theorem_name/nonce (:211-212) BUT its sole caller is tests/test_layer4_sync.py —
+  the production path (lean_bridge.audit_lean_source) compiles with the nonce-guarded #audit command
+  and passes theorem_name to audit_json. Residual TRUE gap: a report {"theorem": <matching>} with NO
+  axioms/constants keys yields zero findings → PASS (from_dict defaults both to [] at :57-62; verdict
+  at :202) — vacuous-audit passes, inconsistent with the fail-loud ethic.
+  FIX: in audit_report, REJECT (or NEEDS_REVIEW) when report.constants AND report.axioms are both
+  empty ("nothing was audited"); annotate audit_file as test-only or add a theorem_name param.
+
+[medium→CONFIRMED] agent/tools/openevolve_bridge.py:1863 (was test-vacuity; really a liveness gap) —
+  OpenEvolveBackend.decompose(goal, feedback=None) drops feedback entirely: evolve_sketches
+  (:1629) has no feedback parameter and seed_sketches (:1641) is not populated from it, so Ralph-loop
+  lessons never reach the evolutionary fallback (unlike the Codex/Claude decomposers). Quality/liveness,
+  not soundness.
+  FIX: thread feedback into the evolve_sketches prompt (add the param), or map it into seed context;
+  if deliberately unsupported, remove the parameter so the dead contract is visible.
+
+[low→CONFIRMED] agent/gates/lean_server.py:111 (resources) — _pump_stderr appends unboundedly; only
+  reader is the last-20-lines join at :149.
+  FIX: self._stderr = collections.deque(maxlen=256) and join(list(...)[-20:]) at :149.
+
+[low→CONFIRMED] scripts/run_witness_checks.py:53 (new-code) — a score_witness_spec exception
+  overwrites result.error on a schema-valid spec (:49-54; SpecCheck is a mutable dataclass), so
+  valid_schema flips False (:58) while confirmed may stay True (:59) — an internally contradictory
+  report row. Eval-reporting only, no gate impact.
+  FIX: record scorer failures in a separate field (or ignore — score already falls back to result.ok);
+  never mutate the checker's error.
+
+[low→CONFIRMED] scripts/run_problems.py:378 (security) — profile.name is an unvalidated pydantic str
+  straight from YAML; a name with path separators/.. escapes ledgers_dir. Author-controlled config →
+  self-inflicted traversal, low. Same at run_brokenarxiv.py:299.
+  FIX: one slug helper re.sub(r"[^A-Za-z0-9._-]", "_", profile.name) at both sites — or a slug-regex
+  validator on RunProfile.name so every consumer is covered. Combine with the profile_hash-suffix fix.
+
+[low→CONFIRMED] agent/tools/answer_check.py:128 (scripts-misc) — `[1,2]` and `(1,2)` both classify as
+  ("tuple", ...) (:128) and grade equal. Mechanism real; for arxivmath it is a theoretical corner (the
+  dataset's answers are scalars/sets — no interval-valued answers found in fixtures/manifest). Not
+  worth a behavior change now.
+  FIX (only if analysis-style answers arrive): distinct interval kind for [a,b]; else a code comment.
+
+[low→CONFIRMED] agent/PLAN.md:158 (doc-drift) — PLAN §4.1 presents Codex/GPT-5.5-xHigh as THE focused
+  prover with no qualifier; registry default is Claude/opus (registry.py:11,:134,:138; Codex optional
+  at :203).
+  FIX: one clause on the §4.1 row: "(default provider: Claude/opus via registry.py; Codex optional
+  per-role via RunProfile)". Do together with orchestrator/README:30/:33.
+
+[low→CONFIRMED] agent/tools/README.md:13 (doc-drift) — Retrieval labeled 'v1' and Lean bridge 'later
+  (advisory)'; both are built and live (PLAN.md:169,:171), and the Lean bridge is load-bearing in the
+  authoritative Layer-4 path — 'advisory' is the misleading part.
+  FIX: update the two phase cells to match PLAN §4.1.
+
+[low→CONFIRMED] scripts/run_problems.py:333 (consistency) — proven_nodes string-matches enum NAMES
+  ('PROVEN','LEAN_VERIFIED'); the set exactly matches NodeState.is_success today (state.py:14-21,
+  :34-37) so nothing is miscounted — pure duplication with future-drift risk (a new success state
+  updates is_success but not this literal set).
+  FIX: sum(1 for n in dag.nodes.values() if getattr(n, "proven", False)).
+
+==== STATUS 2026-07-04: ALL FIXES APPLIED (working tree, uncommitted) ====
+Every actionable finding above is fixed, each with a pinning offline test; full suite + make check
+green. Notable implementation decisions beyond the fixes as written:
+- Denylist (b) landed structurally: Audit.lean now stamps each constant's declaring `module`
+  (compile-verified end-to-end on Lean 4.31 — module emitted, "" for local decls, PASS preserved),
+  and audit_report matches `Mathlib.*` entries against the module by prefix (name-anchored allowlist
+  exemption; fails closed) — all 11 formerly-inert entries are live. Decl-name belt-and-braces
+  entries added (Real.Angle, Complex.tan, cosh/sinh/tanh, arsinh/arcosh/artanh, Real.Gamma,
+  Complex.Gamma, ModularForm, CuspForm, SlashInvariantForm, ClassGroup). test_layer4_sync updated
+  ("module" is a parsed const key). FOLLOW-UP still open: re-run the imo_1963_p5 negative control +
+  certified elementary battery live against Mathlib.
+- numeric.py: a non-int/malformed claimed entry RAISES NumericError (spec-level error row) rather
+  than marking spurious — matches verify_residue_cover and the REJECTED-control taxonomy pinned by
+  tests/test_witness_checks.py (tensor_rank_444_REJECTED stays an error row).
+- Injection fix: charset gate (fullmatch ^[A-Za-z0-9._-]+$) in ClaudeConfig.__post_init__ (model)
+  and CodexConfig.__post_init__ (model, reasoning_effort, sandbox) — covers CLI/UI/profile paths.
+- Tree-kill: Popen + communicate(timeout); on timeout taskkill /F /T (Windows) / killpg with
+  start_new_session (POSIX); stdlib only.
+- Lean-server: close() on BOTH read-timeout branches (audit() lazily restarts); _stderr is a
+  deque(maxlen=256).
+- Leak fix shape: DagDriver.close() (never raises, idempotent) called from build_and_run's finally —
+  NOT from run(), so multi-goal build_driver callers keep their warm server.
+- ledger.py: last PARSEABLE fenced block wins (decoy-resistant; goal-binding remains the backstop).
+- scanner/elementary_verifier: dead allow-context clause DELETED (enforced by construction —
+  documented in-place); behavior unchanged.
+- answer_check DoS: factorial/gamma-family rebound to inert Symbols + declined; evaluate=False
+  pre-parse with inner-first Pow-exponent cap 10^6 + 2000-char cap; deterministic, no timeouts.
+- arxivmath grading moved inside a per-item try (grader failure = that item incorrect, run continues).
+- Docs: orchestrator/README (:30/:33), PLAN.md §4.1 prover row, tools/README rows, dag_driver
+  strict-simpler-child comments all corrected.
+
+==== SUGGESTED FIX ORDER ====
+1. Soundness/certificate surface first: denylist decl-name additions + negative-control re-run (a);
+   the six bool()→`is True` sites; numeric.py int-guard; lean_bridge run_cmd/dotted-log tokens;
+   lean_audit empty-report anti-vacuity. Then the structural denylist module-matching (b).
+2. Security: model-string charset validation in CodexConfig/ClaudeConfig (covers CLI+UI+profiles).
+3. Resource/liveness: build_and_run closes the warm LeanServer (+ DagDriver.close);
+   lean_server close-on-timeout; process-tree kill on timeout; population-branch reason threading;
+   run_problems UnicodeDecodeError guards (x2).
+4. Reporting/eval: brokenarxiv error-aware headline; ledger filename hash-suffix + name sanitization;
+   answer_check eval bound; run_witness_checks error separation; stderr deque; ablate reconfigure.
+5. Docs/comments batch: orchestrator/README:30+:33, PLAN.md:158, tools/README:13, dag_driver
+   strict-simpler-child comments, test_dag cosmetic.
+Every code fix ships with a pinning test (make test stays green, offline).

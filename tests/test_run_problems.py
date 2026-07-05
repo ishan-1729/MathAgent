@@ -48,6 +48,7 @@ class _StubNode:
     class _State:
         name = "PROVEN"
     state = _State()
+    proven = True   # Node.proven == state.is_success; run_one now counts proven_nodes via this attr.
 
 
 class _StubDag:
@@ -243,6 +244,97 @@ def test_malformed_folder_produces_error_row_not_crash(tmp_path):
     assert by_problem["good"]["proven"] is True
 
 
+def _write_ready_folder(pdir: Path, name: str) -> Path:
+    """A minimal well-formed READY problem folder (helper for the UTF-8 tests)."""
+    folder = pdir / name
+    folder.mkdir(parents=True)
+    (folder / "problem.md").write_text(
+        '---\nname: G\ntype: problem\nstatus: ready\ntier: T1\n'
+        'statement: "Prove 1 = 1."\n---\n# G\n', encoding="utf-8")
+    return folder
+
+
+def test_non_utf8_problem_md_is_error_row_not_sweep_abort(tmp_path):
+    """FIX 1: a single non-UTF-8 problem.md becomes a per-folder ERROR ROW (UnicodeDecodeError caught and
+    re-raised as ProblemLoadError), never a whole-sweep abort — the valid folder alongside still loads."""
+    pdir = tmp_path / "problems"
+    _write_ready_folder(pdir, "good")
+    bad = pdir / "bad"
+    bad.mkdir(parents=True)
+    # A cp1252 right-single-quote byte (0x92) is not valid UTF-8.
+    (bad / "problem.md").write_bytes(
+        b'---\nname: B\nstatus: ready\ntier: T1\nstatement: "don\x92t"\n---\n')
+
+    discovered = rp.discover_problems(pdir)
+    by_slug = {slug: (prob, err) for slug, prob, err in discovered}
+    # The bad folder is an error row (problem is None, error mentions the file); the good one loaded.
+    assert by_slug["bad"][0] is None
+    assert by_slug["bad"][1] is not None and "UTF-8" in by_slug["bad"][1]
+    assert "problem.md" in by_slug["bad"][1]
+    assert by_slug["good"][0] is not None and by_slug["good"][0].is_ready
+
+
+def test_non_utf8_allowed_inputs_md_is_error_row_not_sweep_abort(tmp_path):
+    """FIX 1: a non-UTF-8 allowed_inputs.md (read from inside load_problem) also routes to an ERROR ROW,
+    not an abort. The sibling valid folder still loads."""
+    pdir = tmp_path / "problems"
+    _write_ready_folder(pdir, "good")
+    bad = _write_ready_folder(pdir, "bad")
+    (bad / "allowed_inputs.md").write_bytes(b"Per-problem whitelist:\n- Ljunggren\x92s quartic\n")
+
+    discovered = rp.discover_problems(pdir)
+    by_slug = {slug: (prob, err) for slug, prob, err in discovered}
+    assert by_slug["bad"][0] is None
+    assert by_slug["bad"][1] is not None and "UTF-8" in by_slug["bad"][1]
+    assert "allowed_inputs.md" in by_slug["bad"][1]
+    assert by_slug["good"][0] is not None
+
+
+def test_ledger_filename_disambiguates_same_named_profiles_and_stays_in_dir(tmp_path):
+    """FIX 2: two DIFFERENT profiles that share a name dump to DISTINCT ledger files (profile_hash
+    discriminator), and a profile named ``../evil`` is sanitized so the file stays inside ledgers_dir."""
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    ldir = tmp_path / "ledgers"
+
+    # Same name, different content -> different profile_hash -> two distinct files.
+    p1 = _scripted_profile("dup", stages=StageProfile())
+    p2 = _scripted_profile("dup", stages=StageProfile(decompose=False))
+    assert p1.profile_hash != p2.profile_hash
+    rp.run_one(imo, p1, builder=lambda p, g, **kw: _StubResult(proven=True), ledgers_dir=ldir)
+    rp.run_one(imo, p2, builder=lambda p, g, **kw: _StubResult(proven=True), ledgers_dir=ldir)
+    files = sorted(f.name for f in ldir.glob("*.json"))
+    assert len(files) == 2, files
+    assert files[0] != files[1]
+
+    # A path-traversing name is sanitized: the file lands inside ledgers_dir, not a parent.
+    evil = _scripted_profile("../evil")
+    rp.run_one(imo, evil, builder=lambda p, g, **kw: _StubResult(proven=True), ledgers_dir=ldir)
+    escaped = list(tmp_path.glob("*evil*.json"))  # would exist if the name escaped one level up
+    assert not escaped
+    inside = [f for f in ldir.glob("*.json") if "evil" in f.name]
+    assert len(inside) == 1
+    assert inside[0].parent == ldir
+
+
+def test_ledger_filename_slug_is_sanitized_and_stays_in_dir(tmp_path):
+    """FIX 4 (defense-in-depth): the folder SLUG is sanitized too (mirroring run_brokenarxiv.py's
+    UNTRUSTED idx). A slug containing path-traversal cannot escape ledgers_dir even though today the
+    slug is not attacker-injected — keeps the two mirrored helpers consistent."""
+    ldir = tmp_path / "ledgers"
+    evil = rp.Problem(slug="../pwned", statement="x", tier=None, status="ready",
+                      allowed_inputs_note=None, source_folder=tmp_path)
+    prof = _scripted_profile("ok")
+    rp.run_one(evil, prof, builder=lambda p, g, **kw: _StubResult(proven=True), ledgers_dir=ldir)
+
+    assert not list(tmp_path.glob("*pwned*.json")), "slug traversal escaped ledgers_dir"
+    assert not (tmp_path / "pwned").exists()
+    inside = list(ldir.glob("*.json"))
+    assert len(inside) == 1 and inside[0].parent == ldir
+    assert "pwned" in inside[0].name
+    fname = rp._ledger_filename("../pwned", prof)
+    assert fname.startswith(".._pwned__") and "/" not in fname and "\\" not in fname
+
+
 def test_bad_builder_run_is_error_row_and_sweep_continues(tmp_path):
     def builder(profile, goal, **kwargs):
         if profile.name == "boom":
@@ -275,7 +367,8 @@ def test_ledgers_dump_captures_terminal_gate_result(tmp_path):
     # A run whose terminal gate ran but did NOT certify elementary.
     rp.run_one(imo, prof, builder=lambda p, g, **kw: _StubResult(
         proven=True, authoritative=False, terminal=_Terminal()), ledgers_dir=ldir)
-    dumped = json.loads((ldir / f"{imo.slug}__dump.json").read_text(encoding="utf-8"))
+    fname = rp._ledger_filename(imo.slug, prof)
+    dumped = json.loads((ldir / fname).read_text(encoding="utf-8"))
     assert dumped["terminal"] is not None
     assert dumped["terminal"]["summary"] == "lean-audit: reject (rejects=1)"
     assert dumped["terminal"]["authoritative_elementary"] is False
@@ -283,7 +376,7 @@ def test_ledgers_dump_captures_terminal_gate_result(tmp_path):
     # A run with NO terminal gate -> terminal key is null, still no crash.
     rp.run_one(imo, prof, builder=lambda p, g, **kw: _StubResult(proven=True, terminal=None),
                ledgers_dir=ldir)
-    dumped2 = json.loads((ldir / f"{imo.slug}__dump.json").read_text(encoding="utf-8"))
+    dumped2 = json.loads((ldir / fname).read_text(encoding="utf-8"))
     assert dumped2["terminal"] is None
 
 

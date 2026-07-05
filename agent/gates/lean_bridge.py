@@ -36,19 +36,26 @@ _SENTINEL_RE = re.compile(re.escape(_SENTINEL))
 # (recoverable) warning like "declaration uses 'sorry'" (which the axiom gate catches separately).
 _ERROR_RE = re.compile(r":\s*error:")
 # Commands a proof body must not contain. Two threat classes:
-#   1. Output-emitting / reduction commands let untrusted source print its own forged sentinel (or
-#      otherwise smuggle output into the captured channel): #eval/#print/#reduce/#check, logInfo,
-#      logWarning, logError (any log* that reaches the message channel), IO.println/print, dbg_trace.
+#   1. Output-emitting / reduction / arbitrary-elaboration commands let untrusted source print its
+#      own forged sentinel (or otherwise smuggle output into the captured channel): #eval/#print/
+#      #reduce/#check, run_cmd/run_elab (run arbitrary CommandElabM/TermElabM code, incl. logInfo),
+#      logInfo, logWarning, logError (any log* that reaches the message channel), IO.println/print,
+#      dbg_trace. The emit family is matched with OPTIONAL dotted qualification (`Lean.logInfo`,
+#      `_root_.IO.println`) — a bare-name-only match was bypassable via the namespace-qualified form.
 #   2. Syntax/elaborator (re)definition lets untrusted source SHADOW the trusted `#audit` elaborator
 #      so the appended `#audit <thm> "<nonce>"` runs attacker code that emits ONE clean nonce-bearing
 #      sentinel (defeating both the >1-sentinel count and the nonce check). Ban elab/elab_rules/
 #      macro/macro_rules/syntax/notation/infix*/prefix/postfix so the proof cannot redefine `#audit`.
+#      These keyword tokens stay bare-name-only ON PURPOSE: allowing a dotted prefix there would
+#      false-positive on legitimate decl components (e.g. `List.prefix_append` hits `prefix`).
 # An elementary, sorry-free proof of a theorem never needs any of these, so we fail CLOSED on them.
 _FORBIDDEN_PROOF_RE = re.compile(
     r"(?<![A-Za-z0-9_.])("
     r"#eval|#print|#reduce|#check"
-    r"|logInfoAt|logInfo|logWarningAt|logWarning|logErrorAt|logError|logAt"
-    r"|IO\.println|IO\.print|dbg_trace"
+    r"|run_cmd|run_elab"
+    r"|(?:[A-Za-z_][A-Za-z0-9_]*\.)*"
+    r"(?:logInfoAt|logInfo|logWarningAt|logWarning|logErrorAt|logError|logAt"
+    r"|IO\.println|IO\.print|dbg_trace)"
     r"|elab_rules|elab"
     r"|macro_rules|macro"
     r"|syntax|notation"
@@ -88,7 +95,8 @@ def _reject_if_forbidden(proof_src: str) -> None:
     """Raise if the untrusted proof body could forge a report or shadow the trusted `#audit`.
 
     Three layers, all fail CLOSED:
-      1. No output/reduction command (#eval/logInfo/IO.println/...) — can't print a forged sentinel.
+      1. No output/reduction/arbitrary-elaboration command (#eval/run_cmd/logInfo/IO.println/...,
+         qualified or not) — can't print a forged sentinel.
       2. No syntax/elaborator (re)definition (elab/macro/syntax/notation/...) — can't SHADOW the
          appended `#audit <thm> "<nonce>"` so attacker code emits one clean nonce-bearing sentinel.
       3. No literal `#audit` command token and no literal sentinel string — defense in depth so the

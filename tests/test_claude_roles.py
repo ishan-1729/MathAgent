@@ -161,6 +161,28 @@ def test_faithfulness_panel_default_closed_on_unfaithful_lens(monkeypatch):
     assert v.n_unfaithful == 4
 
 
+# --- FIX 1: model-returned STRING booleans must fail closed (bool("false") == True was fail-open) --
+
+def test_reviewer_stringified_bools_fail_closed(monkeypatch):
+    # A model emitting the STRINGS "true"/"false" (not JSON booleans) must NOT be trusted: any
+    # non-True value maps to False. bool("false") == True previously admitted a rejected verdict.
+    _patch(monkeypatch, '{"useful": "true", "elementary": "false", "notes": []}')
+    v = ClaudeReviewer(FakeToolkit()).review("G", "sketch", [])
+    assert v.useful is False and v.elementary is False and v.ok is False
+
+
+def test_reviewer_genuine_bools_still_work(monkeypatch):
+    _patch(monkeypatch, '{"useful": true, "elementary": true, "notes": []}')
+    v = ClaudeReviewer(FakeToolkit()).review("G", "sketch", [])
+    assert v.useful is True and v.elementary is True
+
+
+def test_faithfulness_stringified_bool_fails_closed(monkeypatch):
+    _patch(monkeypatch, '{"faithful": "true", "issues": []}')
+    v = ClaudeFaithfulnessChecker().check("claim", "theorem t : True", "t")
+    assert v.faithful is False and v.n_unfaithful == 4
+
+
 # --- Refiner wiring (a real controller, not a stub) ---------------------------------------------
 
 def test_make_claude_refiner_builds_a_real_controller():

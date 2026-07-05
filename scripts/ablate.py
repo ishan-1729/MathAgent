@@ -30,6 +30,14 @@ from typing import Iterable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Goals/progress lines carry Unicode math (ℤ, →); make stdout/stderr UTF-8 so they don't render as
+# mojibake / crash on a legacy Windows codepage (cp1252). Mirrors scripts/run_benchmark.py.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
 from agent.orchestrator.run_profile import RunProfile, StageProfile
 
 # Reuse prove.py's CATEGORICAL reporting-status mapping (the single source of truth) by path-loading the
@@ -179,20 +187,32 @@ def write_rows(rows: list[dict], out: Path) -> None:
 
 def ablate(profiles: Iterable[RunProfile], goal: str, out: Path, *, builder=None,
            verbose: bool = True) -> list[dict]:
-    """Run every profile on ``goal``, write the rows to ``out``, and return them."""
+    """Run every profile on ``goal``, write the rows to ``out``, and return them.
+
+    Durability (mirrors scripts/run_problems.py): JSONL rows are APPENDED as each profile finishes —
+    a live sweep can run for hours and a process-level crash must not lose completed rows; the final
+    write_rows pass rewrites the complete ordered set. CSV stays end-only. Progress lines flush."""
     rows: list[dict] = []
+    incremental = out.suffix.lower() != ".csv"
+    if incremental:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("", encoding="utf-8")
     for prof in profiles:
         if verbose:
-            print(f"# ablate: {prof.name} (hash {prof.profile_hash[:12]})", file=sys.stderr)
+            print(f"# ablate: {prof.name} (hash {prof.profile_hash[:12]})", file=sys.stderr,
+                  flush=True)
         row = run_profile_row(prof, goal, builder=builder)
         rows.append(row)
+        if incremental:
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({k: row[k] for k in ROW_FIELDS}, sort_keys=True) + "\n")
         if verbose:
             tag = row["error"] or row["reporting_status"]
             print(f"#   -> proven={row['proven']} status={tag} wall={row['wall_s']}s",
-                  file=sys.stderr)
+                  file=sys.stderr, flush=True)
     write_rows(rows, out)
     if verbose:
-        print(f"# wrote {len(rows)} rows -> {out}", file=sys.stderr)
+        print(f"# wrote {len(rows)} rows -> {out}", file=sys.stderr, flush=True)
     return rows
 
 

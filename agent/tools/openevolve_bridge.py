@@ -1501,6 +1501,18 @@ def retrieval_seeds(goal: str, retriever) -> Optional[list[str]]:
     return [_exemplar_seed(goal, exemplars[:8])]
 
 
+def _feedback_block(feedback: Optional[list[str]]) -> str:
+    """A bounded 'previous attempt was rejected' block for the evolution prompt (mirrors
+    codex_prover._feedback_block). Empty string when there is no feedback. Capped at 12 items so a
+    long rejection list cannot balloon the prompt. The feedback is inert prose steering generation —
+    it is NEVER executed and does NOT touch any parsing/gating of the evolved artifact."""
+    if not feedback:
+        return ""
+    items = "\n".join(f"- {x}" for x in feedback[:12])
+    return ("\n\nThe previous attempt was rejected. Fix exactly these issues and re-emit the WHOLE "
+            f"ledger:\n{items}\n")
+
+
 def build_evolve_config(
     *,
     llm=None,
@@ -1514,6 +1526,7 @@ def build_evolve_config(
     num_islands: int = 2,
     feature_bins: int = 5,
     feature_dimensions: Optional[list[str]] = None,
+    feedback: Optional[list[str]] = None,
 ):
     """Build the OpenEvolve ``Config`` for the proof-sketch search (no evolution run here).
 
@@ -1592,6 +1605,13 @@ def build_evolve_config(
     config.database.migration_interval = max(1, iterations // 4)  # cross-pollinate islands within a run
     config.evaluator.cascade_evaluation = False  # no evaluate_stage1/2/3 defined
     config.evaluator.parallel_evaluations = 1    # in-process evaluator, but never executes the ledger
+    # SEED CONTEXT (decomposer feedback): thread a bounded rejection block into the mutation LLM's
+    # system prompt so a re-decomposition sees WHY the prior attempt was rejected (parity with the
+    # Codex/Claude decomposers, which fold feedback into their prompts). Inert prose: it steers
+    # generation only and never affects parsing/gating of the evolved artifact.
+    block = _feedback_block(feedback)
+    if block:
+        config.prompt.system_message = (config.prompt.system_message or "") + block
     return config
 
 
@@ -1643,6 +1663,7 @@ def evolve_sketches(
     output_dir: Optional[str] = None,
     num_islands: int = 2,
     feature_bins: int = 5,
+    feedback: Optional[list[str]] = None,
 ) -> tuple[str, float, dict]:
     """Evolve a proof-sketch ledger population for ``goal`` and return the best candidate.
 
@@ -1666,6 +1687,7 @@ def evolve_sketches(
         breadth_model=breadth_model, depth_model=depth_model,
         breadth_weight=breadth_weight, depth_weight=depth_weight, rank_signal=rank_signal,
         iterations=iterations, num_islands=num_islands, feature_bins=feature_bins,
+        feedback=feedback,
     )
 
     # Retrieval-seeded islands (OpenEvolve P2): seed from a RETRIEVED elementary exemplar ledger
@@ -1861,12 +1883,14 @@ class OpenEvolveBackend:
         return available()
 
     def decompose(self, goal: str, feedback: Optional[list[str]] = None) -> tuple[str, list[str]]:
+        # Thread feedback through so a re-decomposition seeds from WHY the prior attempt was rejected
+        # (parity with the Codex/Claude decomposers). Previously feedback was silently dropped here.
         sketch, _fitness, _metrics = evolve_sketches(
             goal, self.toolkit, llm=self.llm, claude_cfg=self.claude_cfg,
             breadth_model=self.breadth_model, depth_model=self.depth_model,
             breadth_weight=self.breadth_weight, depth_weight=self.depth_weight,
             rank_signal=self.rank_signal, retriever=self.retriever,
-            iterations=self.generations,
+            iterations=self.generations, feedback=feedback,
         )
         return sketch, children_from_sketch(sketch)
 
