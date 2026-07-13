@@ -9,16 +9,16 @@ Design:
 
 * ``PROVIDERS`` is a dict keyed ``(Role, ProviderKey) -> factory``. A ``@register(role, provider)``
   decorator populates it. The DEFAULT provider is :attr:`ProviderKey.claude`.
-* ``resolve(role, spec, deps)`` looks up ``PROVIDERS[(role, spec.provider)]`` and calls the factory
-  with ``(spec, deps)``. ``deps`` is a small :class:`Deps` bundle (the shared toolkit + optional
-  budget/trace) the live factories need; the scripted factories ignore it.
+* ``resolve(role, spec, deps)`` selects the first reachable provider in the declared
+  ``primary -> fallback`` chain, then calls its factory. ``deps`` is a small :class:`Deps` bundle
+  (the shared toolkit + optional budget/trace) the live factories need; scripted factories ignore it.
 * claude factories construct the classes in :mod:`agent.tools.claude_roles` (the DEFAULT backend).
 * codex factories WRAP the existing :mod:`agent.tools.codex_prover` / :mod:`agent.tools.formalizer`
   classes verbatim (an OPTIONAL provider — the maintainer's default is Claude).
 * scripted factories return deterministic stubs (this module, below) for offline tests.
 
 Each resolved component conforms to the EXISTING Protocol the DAG/tournament expect for that role:
-Prover (prover), Decomposer (decomposer), Reviewer (reviewer), Comparator (comparator & judge),
+Prover (prover), Decomposer (decomposer), Reviewer (reviewer), Comparator (comparator), Judge (judge),
 Formalizer (formalizer), a faithfulness checker (faithfulness), RevisionController (refiner).
 
 SAFETY: nothing here ``exec``/``eval``/``import``s model output; factories only build objects. The
@@ -32,6 +32,7 @@ from typing import Callable, Optional
 
 from agent.gates.toolkit import Toolkit, load_toolkit
 from agent.orchestrator.dag_driver import ReviewVerdict
+from agent.orchestrator.driver import JudgeVerdict
 from agent.orchestrator.faithfulness import (
     FaithfulnessVerdict,
     ScriptedFaithfulnessChecker,
@@ -85,6 +86,18 @@ class Deps:
 Factory = Callable[[RoleSpec, Deps], object]
 
 PROVIDERS: dict[tuple[Role, ProviderKey], Factory] = {}
+_RESOLUTION_ATTR = "_mathagent_resolution"
+
+
+def resolution_of(component: object | None) -> Optional[dict[str, object]]:
+    """Return a defensive copy of provider provenance attached by :func:`resolve`, if available."""
+    if component is None:
+        return None
+    try:
+        value = getattr(component, _RESOLUTION_ATTR, None)
+    except Exception:
+        return None
+    return dict(value) if isinstance(value, dict) else None
 
 
 def register(role: Role, provider: ProviderKey) -> Callable[[Factory], Factory]:
@@ -101,19 +114,62 @@ def register(role: Role, provider: ProviderKey) -> Callable[[Factory], Factory]:
 
 
 def resolve(role: Role, spec: RoleSpec, deps: Optional[Deps] = None) -> object:
-    """Resolve ``role`` via ``spec.provider`` into a component behind that role's Protocol.
+    """Resolve ``role`` through its primary/fallback provider chain.
 
     Pure construction: builds and returns an object, performing no model/Lean call. Raises
-    :class:`RegistryError` if no factory is registered for the ``(role, provider)`` pair.
+    :class:`RegistryError` if no reachable/registered provider can supply the role. Availability is
+    probed only when a fallback is declared; without one, historical construction semantics remain
+    unchanged and the supervisor is responsible for the preflight capability check.
     """
     deps = deps or Deps()
-    key = (role, spec.provider)
+    provider = spec.provider
+    if spec.fallback is not None:
+        # Local import avoids a module cycle and keeps import-time behavior side-effect free. These are
+        # cheap launcher-discovery probes, never model calls.
+        from agent.orchestrator.supervisor import _provider_available
+
+        if not _provider_available(provider):
+            if _provider_available(spec.fallback):
+                provider = spec.fallback
+            else:
+                raise RegistryError(
+                    f"no reachable provider for role={role.value}: "
+                    f"{spec.provider.value} -> {spec.fallback.value}"
+                )
+    effective = (spec if provider is spec.provider else
+                 spec.model_copy(update={"provider": provider, "fallback": None}))
+    key = (role, provider)
     factory = PROVIDERS.get(key)
     if factory is None:
         raise RegistryError(
-            f"no provider registered for role={role.value} provider={spec.provider.value}"
+            f"no provider registered for role={role.value} provider={provider.value}"
         )
-    return factory(spec, deps)
+    component = factory(effective, deps)
+    cfg = getattr(component, "cfg", None)
+    if cfg is None:
+        # Composite roles (notably RevisionController/refiner) retain their live provider config on
+        # the critic/author rather than the controller itself. Record the config that will actually
+        # make calls instead of emitting null model/effort fields for an active role.
+        cfg = getattr(getattr(component, "critic", None), "cfg", None)
+    model = getattr(cfg, "model", effective.model)
+    effort = getattr(cfg, "reasoning_effort", effective.effort)
+    timeout_s = getattr(cfg, "timeout_s", effective.timeout_s)
+    provenance: dict[str, object] = {
+        "role": role.value,
+        "provider": provider.value,
+        "model": model if isinstance(model, str) else None,
+        "effort": effort if isinstance(effort, str) else None,
+        "timeout_s": (timeout_s if isinstance(timeout_s, int)
+                      and not isinstance(timeout_s, bool) else None),
+        "fallback_selected": provider is not spec.provider,
+    }
+    try:
+        setattr(component, _RESOLUTION_ATTR, provenance)
+    except Exception as exc:
+        raise RegistryError(
+            f"resolved role={role.value} provider={provider.value} cannot retain provenance"
+        ) from exc
+    return component
 
 
 # ==================================================================================================
@@ -161,9 +217,9 @@ def _claude_comparator(spec: RoleSpec, deps: Deps) -> object:
 
 @register(Role.judge, ProviderKey.claude)
 def _claude_judge(spec: RoleSpec, deps: Deps) -> object:
-    from agent.tools.claude_roles import ClaudeJudge
+    from agent.tools.claude_roles import ClaudeLedgerJudge
 
-    return ClaudeJudge(_claude_cfg(spec, "sonnet"))
+    return ClaudeLedgerJudge(_claude_cfg(spec, "sonnet"))
 
 
 @register(Role.formalizer, ProviderKey.claude)
@@ -246,9 +302,9 @@ def _codex_comparator(spec: RoleSpec, deps: Deps) -> object:
 
 @register(Role.judge, ProviderKey.codex)
 def _codex_judge(spec: RoleSpec, deps: Deps) -> object:
-    from agent.tools.codex_prover import CodexSolutionComparator
+    from agent.tools.codex_prover import CodexLedgerJudge
 
-    return CodexSolutionComparator(_codex_cfg(spec))
+    return CodexLedgerJudge(_codex_cfg(spec))
 
 
 @register(Role.formalizer, ProviderKey.codex)
@@ -319,13 +375,31 @@ class ScriptedReviewer:
 
 
 class ScriptedComparator:
-    """Returns a fixed pairwise result for any pair (default: tie). Serves comparator AND judge."""
+    """Returns a fixed pairwise result for any pair (default: tie)."""
 
     def __init__(self, result: int = 0):
         self.result = result
 
     def compare(self, a: Candidate, b: Candidate) -> int:
         return self.result
+
+
+class ScriptedLedgerJudge:
+    """Deterministic proof-ledger judge for offline profiles (accepts by default)."""
+
+    name = "scripted-ledger-judge"
+
+    def __init__(self, *, elementary: bool = True, no_gaps: bool = True,
+                 notes: Optional[list[str]] = None):
+        self._verdict = JudgeVerdict(
+            judge=self.name,
+            elementary=elementary,
+            no_gaps=no_gaps,
+            notes=list(notes or []),
+        )
+
+    def review(self, ledger: object) -> JudgeVerdict:
+        return self._verdict
 
 
 class _ScriptedCritic:
@@ -375,7 +449,7 @@ def _scripted_comparator(spec: RoleSpec, deps: Deps) -> object:
 
 @register(Role.judge, ProviderKey.scripted)
 def _scripted_judge(spec: RoleSpec, deps: Deps) -> object:
-    return ScriptedComparator()
+    return ScriptedLedgerJudge()
 
 
 @register(Role.formalizer, ProviderKey.scripted)
@@ -407,4 +481,5 @@ __all__ = [
     "ScriptedDecomposer",
     "ScriptedReviewer",
     "ScriptedComparator",
+    "ScriptedLedgerJudge",
 ]

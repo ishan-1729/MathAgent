@@ -11,7 +11,7 @@ import pytest
 
 from agent.gates.lean_audit import (
     ConstDep, DependencyReport, LeanVerdict, audit_report, audit_json, _name_matches,
-    _match_span, _dominating_allow,
+    _match_span, _dominating_allow, DERIVED_PROVENANCE_SCHEMA,
 )
 from agent.gates.report import Severity
 from agent.gates.toolkit import Toolkit, Justification, load_toolkit
@@ -44,6 +44,41 @@ def test_clean_proof_passes():
     rep = DependencyReport("thm", axioms=[], constants=[ConstDep("Nat.add"), ConstDep("Nat.rec", "recursor")])
     res = audit_report(rep, TOOLKIT)
     assert res.passed and res.verdict is LeanVerdict.PASS
+
+
+def test_content_pass_without_bridge_provenance_is_not_authoritative():
+    """A plausible caller-supplied toolchain string is reproducibility data, not trust evidence."""
+    rep = DependencyReport(
+        "thm", constants=[ConstDep("Nat.add")],
+        toolchain="leanprover/lean4:v4.30.0",
+        manifest="sha256:" + "a" * 64,
+        provenance=DERIVED_PROVENANCE_SCHEMA,
+    )
+    result = audit_report(rep, TOOLKIT)
+    assert result.passed is True
+    assert result.provenance_verified is False
+    assert result.authoritative is False
+
+
+def test_bridge_verified_complete_provenance_can_be_authoritative():
+    rep = DependencyReport(
+        "thm", constants=[ConstDep("Nat.add")],
+        toolchain="leanprover/lean4:v4.30.0",
+        manifest="sha256:" + "a" * 64,
+        provenance=DERIVED_PROVENANCE_SCHEMA,
+    )
+    result = audit_report(rep, TOOLKIT, provenance_verified=True)
+    assert result.passed is True
+    assert result.provenance_verified is True
+    assert result.authoritative is True
+
+
+def test_verified_flag_fails_closed_when_receipt_is_incomplete():
+    rep = DependencyReport("thm", constants=[ConstDep("Nat.add")])
+    result = audit_report(rep, TOOLKIT, provenance_verified=True)
+    assert result.passed is True  # content classification remains available to offline tooling
+    assert result.provenance_verified is False
+    assert result.authoritative is False
 
 
 def test_whitelisted_axioms_pass():
@@ -607,6 +642,49 @@ def test_vacuous_report_rejected_via_json_missing_keys():
     res = audit_json(payload, TOOLKIT, theorem_name="thm")
     assert not res.passed
     assert "vacuous_report" in _codes(res)
+
+
+# ---- M2 GALOIS THEORY / FIELD EXTENSIONS (2026-07-07 audit gap): the denylist had ZERO coverage of
+#      Galois groups, splitting fields, intermediate fields, or radical solvability, so an elementary NT
+#      statement reached via Galois theory certified authoritative_elementary. The new decl tokens +
+#      Mathlib.FieldTheory.* module-family bans must REJECT them, while the certified elementary reach
+#      (ZMod/intCast, Nat/Int arithmetic) must NOT be collateral-rejected. ----
+
+@pytest.mark.parametrize("const", [
+    "IsGalois", "Polynomial.Gal", "IntermediateField.mk", "IsSplittingField",
+    "SplittingField", "GaloisField", "solvableByRad", "IsSolvableByRad",
+])
+def test_galois_decl_token_rejected(const):
+    """A synthetic closure reaching a newly-denylisted Galois/field-extension decl is REJECTED by the
+    SHIPPED denylist (offline; no Lean needed). Each was a live GAP before the 2026-07-07 additions."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep(const, "definition")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed, const
+    assert "denylisted_dependency" in _codes(res), const
+
+
+def test_galois_module_family_ban_rejects_sibling_decl():
+    """A decl whose NAME matches nothing but whose DECLARING MODULE falls under
+    Mathlib.FieldTheory.Galois must be rejected via the module-family ban (the decl-name entries alone
+    would miss it), mirroring the analysis/trig module-family gap."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"),
+        ConstDep("Foo.someDecl", "definition", module="Mathlib.FieldTheory.Galois.Basic")])
+    res = audit_report(rep, TOOLKIT)
+    assert not res.passed
+    assert "denylisted_dependency" in _codes(res)
+
+
+def test_galois_additions_do_not_overreject_elementary():
+    """OVER-REJECTION GUARD: the certified ZMod/intCast + Nat/Int elementary reach STILL PASSES after
+    the Galois additions — none of the Galois tokens is a substring that falsely matches these
+    elementary decls."""
+    rep = DependencyReport("thm", axioms=[], constants=[
+        ConstDep("Nat.add"), ConstDep("Nat.rec", "recursor"),
+        ConstDep("ZMod.intCast_zmod_eq_zero_iff_dvd")])
+    res = audit_report(rep, TOOLKIT)
+    assert res.passed, [str(f) for f in res.rejects()]
 
 
 def test_constants_only_report_still_passes():

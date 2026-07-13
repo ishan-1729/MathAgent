@@ -316,3 +316,27 @@ def test_bounding_caret_still_catches_violated_and_malicious():
     assert any(f.code == "bounding_violated" for f in violated)
     malicious = _check_bounding("s1", {"bounding": {"inequality": '__import__("os") < 3', "strict": True}})
     assert any(f.code == "bounding_malformed" for f in malicious)
+
+
+def test_ledger_wide_obligation_work_budget_blocks_stacked_checks(monkeypatch, toolkit):
+    import agent.gates.obligations as obligations_mod
+
+    calls: list[int] = []
+
+    def fake_cover(modulus, residues):
+        calls.append(modulus)
+        return obligations_mod.numeric.CoverCheck(
+            ok=True, modulus=modulus, covered=list(residues), missing=[])
+
+    monkeypatch.setattr(obligations_mod, "MAX_TOTAL_OBLIGATION_WORK", 6)
+    monkeypatch.setattr(obligations_mod.numeric, "verify_residue_cover", fake_cover)
+    led = _ledger([
+        {"id": "s1", "claim": "split once", "justification": "case_split", "depends_on": [],
+         "obligations": {"case_cover": {"modulus": 3, "residues": [0, 1, 2]}}},
+        {"id": "s2", "claim": "split twice", "justification": "case_split", "depends_on": ["s1"],
+         "obligations": {"case_cover": {"modulus": 3, "residues": [0, 1, 2]}}},
+        {"id": "s3", "claim": "c", "justification": "conclusion", "depends_on": ["s2"]},
+    ])
+    findings = check_obligations(led, toolkit)
+    assert calls == [3]
+    assert "obligation_work_budget_exceeded" in _codes(findings)

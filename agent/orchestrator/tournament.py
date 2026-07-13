@@ -174,24 +174,28 @@ class RevisionController:
             # signal) plus the win matrix the population machinery uses for its own BT/PUCT bookkeeping.
             pool = [inc] + new_cands
             net, judged_fully = self._judge_round(pop, pool, inc)
-            pop.set_ratings_from_bradley_terry()      # population-search BT ratings (used ONLY to order
-                                                      # the iteration below; never the displacement test)
 
             # Displacement is decided by the PAIRWISE net-vote margin, NOT by the BT rating. The BT order
             # only breaks ties on WHICH qualifying challenger to promote first; a candidate is admitted
             # iff its net head-to-head vote vs the incumbent clears `margin`.
             displaced = False
-            for c in sorted(new_cands, key=lambda c: c.rating, reverse=True):
-                if net.get(c.id, 0) >= self.margin:
-                    inc = c
-                    displacements += 1
-                    displaced = True
-                    break
+            if judged_fully:
+                pop.set_ratings_from_bradley_terry()  # ordering only; never the displacement test
+                for c in sorted(new_cands, key=lambda c: c.rating, reverse=True):
+                    if net.get(c.id, 0) >= self.margin:
+                        inc = c
+                        displacements += 1
+                        displaced = True
+                        break
 
-            history.append({"pass": p, "challengers": len(new_cands), "displaced": displaced})
+            pass_record = {"pass": p, "challengers": len(new_cands), "displaced": displaced}
+            if not judged_fully:
+                pass_record["reason"] = "judge_panel_incomplete"
+            history.append(pass_record)
             if self.trace:
                 self.trace.emit("revise_pass", goal=goal[:80], passno=p,
-                                challengers=len(new_cands), displaced=displaced)
+                                challengers=len(new_cands), displaced=displaced,
+                                judged_fully=judged_fully)
 
             consec = 0 if displaced else consec + 1
             if consec >= self.k_stop or not judged_fully:
@@ -206,9 +210,19 @@ class RevisionController:
                      incumbent: Candidate) -> tuple[dict[str, int], bool]:
         """Round-robin pairwise judging by each judge (blind orientation). Records every comparison
         into `pop` (feeding BT + Elo + PUCT) and returns the net head-to-head votes of each candidate
-        against the incumbent. The bool is False if judging stopped early on the budget."""
+        against the incumbent.
+
+        The panel is atomic with respect to displacement: before the first comparison, the controller
+        verifies that the remaining budget covers every judge/pair call. If it does not, no comparison
+        runs and ``False`` is returned. The caller also refuses displacement on any incomplete result,
+        providing defense in depth if a future comparator path interrupts a preflighted round.
+        """
         net = {c.id: 0 for c in pool}
         pairs = list(itertools.combinations(pool, 2))
+        required_calls = len(self.judges) * len(pairs)
+        if (self.budget is not None
+                and self.budget.calls_spent + required_calls > self.budget.max_llm_calls):
+            return net, False
         for judge in self.judges:
             self._rng.shuffle(pairs)
             for a, b in pairs:

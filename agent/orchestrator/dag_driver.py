@@ -10,30 +10,56 @@ For each goal:
      any already-proven sub-lemma via the deep-hash goal cache (memoization).
 
 All model calls draw from one Budget and recursion is depth-bounded, so the search always terminates.
-The prover/decomposer/reviewer are Protocols, so the Codex (GPT-5.5-xHigh) implementations and the test
-stubs are interchangeable.
+The prover/decomposer/reviewer are provider-neutral Protocols, so supervised Claude, Codex, and
+scripted implementations are interchangeable.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, runtime_checkable
 
-from agent.gates.gate import Verdict, evaluate
+from agent.gates.gate import GateReport, Verdict, evaluate
 from agent.gates.ledger import parse_ledger, LedgerError
 from agent.gates.toolkit import Toolkit, load_toolkit
 from agent.orchestrator.dag import ProofDAG, goal_hash, proof_context_hash, CycleError
 from agent.orchestrator.dilworth import dilworth_width, upward_rank, CyclicPosetError
-from agent.orchestrator.driver import Prover, Judge
+from agent.orchestrator.driver import Prover, Judge, _validated_judge_verdict
 from agent.orchestrator.elementary_verifier import (
     refute_elementary, VacuousVerificationError, VerifierResult,
 )
 from agent.orchestrator.h0_consistency import check_children_consistency
+from agent.orchestrator.goal_binding import proves_goal as _proves_goal
 from agent.orchestrator.node_fsm import Action, NodeEvent, ReasonCode, node_transition
 from agent.orchestrator.population import Comparator, EloPopulation, Candidate
 from agent.orchestrator.ralph import RalphLoop, RalphResult
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.tournament import RevisionController
 from agent.orchestrator.trace import RunTrace
+
+
+_MAX_H0_ARTIFACTS = 2_000
+_MAX_H0_TOTAL_CHARS = 8 * 1024 * 1024
+
+
+def _component_policy_identity(component: object) -> dict[str, str]:
+    """Conservative in-process identity for an authority-bearing injected component.
+
+    Exact object identity deliberately invalidates memo receipts when a caller replaces a judge,
+    reviewer, or verifier with another instance of the same class. The per-run volatile-authority
+    epoch separately covers in-place mutation. No component configuration or credentials are
+    serialized into traces or hashes.
+    """
+    cls = type(component)
+    try:
+        name = getattr(component, "name", "")
+    except Exception:
+        name = ""
+    return {
+        "type": f"{cls.__module__}.{cls.__qualname__}",
+        "name": name if isinstance(name, str) else "",
+        "instance": f"{id(component):x}",
+    }
 
 
 @dataclass
@@ -44,7 +70,8 @@ class ReviewVerdict:
 
     @property
     def ok(self) -> bool:
-        return self.useful and self.elementary
+        """Fail closed when an injected/provider verdict contains malformed booleans."""
+        return self.useful is True and self.elementary is True
 
 
 @runtime_checkable
@@ -68,6 +95,9 @@ class DagResult:
     trace: RunTrace
     budget: Budget
     terminal: Optional[object] = None   # the terminal-gate result (e.g. FormalizeAuditResult)
+    candidate: Optional[str] = None  # last non-empty root ledger, even when it was not promoted
+    resolved_roles: dict[str, dict[str, object]] = field(default_factory=dict)
+    policy_digest: Optional[str] = None
 
     def proof_tree(self) -> dict:
         return self.dag.assemble(self.goal)
@@ -76,7 +106,8 @@ class DagResult:
     def authoritative_elementary(self) -> bool:
         """Proven AND the terminal Layer-4 gate (formalize -> audit -> faithfulness) accepted it."""
         return bool(self.proven and self.terminal is not None
-                    and getattr(self.terminal, "authoritative", False))
+                    and getattr(self.terminal, "authoritative", False) is True
+                    and getattr(self.terminal, "certification_trusted", False) is True)
 
 
 def _lemma_claims(sketch: str) -> Optional[set[str]]:
@@ -86,29 +117,6 @@ def _lemma_claims(sketch: str) -> Optional[set[str]]:
     except LedgerError:
         return None
     return {goal_hash(s.claim) for s in led.steps if s.justification == "lemma"}
-
-
-def _proves_goal(ledger: str, goal: str) -> bool:
-    """Does `ledger` actually conclude `goal`? Soundness binding (goal<->claim).
-
-    BOTH the ledger's stated `claim` AND its terminal `conclusion` step must deep-hash-equal the
-    requested goal. Checking the top-level claim alone is insufficient: a ledger may set `claim`
-    to the goal while its conclusion step proves a DIFFERENT statement (e.g. claim "G" but a
-    conclusion claiming "H"), and the deterministic gate admits such a ledger because it cannot
-    distinguish a genuinely-wrong conclusion from a placeholder restatement without knowing the
-    requested goal. The terminal conclusion is the operative statement actually proved, so it is
-    the authoritative binding to the goal. Returns False if it won't parse, has no single
-    conclusion, or either the claim or the conclusion proves something else."""
-    try:
-        led = parse_ledger(ledger)
-    except LedgerError:
-        return False
-    if goal_hash(led.claim) != goal_hash(goal):
-        return False
-    conclusions = [s for s in led.steps if s.justification == "conclusion"]
-    if len(conclusions) != 1:
-        return False
-    return goal_hash(conclusions[0].claim) == goal_hash(goal)
 
 
 def _conclusion_claim(sketch: str) -> Optional[str]:
@@ -158,6 +166,10 @@ class DagDriver:
         self.toolkit = toolkit or load_toolkit()
         self.budget = budget or Budget()
         self.trace = trace or RunTrace("dag-run")
+        # Filled by the profile builder. Directly constructed/legacy drivers retain explicit empty
+        # provenance rather than pretending a provider or policy was selected through the registry.
+        self.resolved_roles: dict[str, dict[str, object]] = {}
+        self.policy_digest: Optional[str] = None
         self.max_depth = max_depth
         self.max_decomp_attempts = max_decomp_attempts
         self.ralph_episodes = ralph_episodes
@@ -169,46 +181,46 @@ class DagDriver:
         self.population_rounds = population_rounds
         # Autoreason incumbent-tournament revision controller (agent/orchestrator/tournament.py). When
         # set, a directly-proven node's ledger is refined: a challenger must beat the incumbent on the
-        # blind judge panel AND clear the AUTHORITATIVE elementary admissibility gate (deterministic
-        # refutation + the Lean audit when a node_verifier is configured) to displace it. No-regression
-        # is RELATIVE to that panel + gate, not absolute — a single soft judge could still prefer a
-        # worse-but-admissible rewrite; see tournament.RevisionController and self._admissibility_gate.
+        # blind comparator panel, survive the same logical Judge.review policy as a direct proof, AND
+        # clear the authoritative elementary admissibility gate (deterministic refutation + the Lean
+        # audit when a node_verifier is configured). An unresolved NEEDS_REVIEW candidate is never a
+        # shortcut around Layer 2; see tournament.RevisionController and self._admissibility_gate.
         self.refiner = refiner
+        # A refinement challenger that already passed the configured per-node Lean verifier carries
+        # that exact result into the immediately-following leaf promotion.  This avoids charging the
+        # bounded verifier pool twice (and avoids a second nondeterministic formalization) while never
+        # treating a mere Boolean admission decision as a Lean certificate.
+        self._refinement_lean_receipts: dict[tuple[str, str], object] = {}
         # Terminal authoritative gate (PLAN.md §5 Layer 4): (root_goal, proof_text) -> result with an
         # `.authoritative` attribute. Runs once after the root is proven (formalize -> Lean audit ->
         # faithfulness). See agent/orchestrator/formalize_bridge.make_terminal_gate.
         self.terminal_gate = terminal_gate
-        # Split-keyed memo (T100 P1 item 4): the DAG is keyed on (semantic_goal_hash,
-        # proof_context_hash). A PROVEN minted under this toolkit/gate/denylist context is shared
-        # across branches; a context change invalidates a stale PROVEN. The context hash is computed
-        # ONCE from the loaded toolkit and stamped onto every certificate the DAG mints.
-        self.context_hash = proof_context_hash(self.toolkit)
         # MEMOIZATION toggle (StageProfile.memo). True (default) keeps the split-keyed goal cache; False
         # makes every node prove FRESH — the driver skips the proven-node READ short-circuit below and the
         # DAG counts no cache hits, so an identical repeated subgoal is re-attempted (two prove attempts).
         # The split-keyed memo module itself is untouched; only its READ is gated. Correctness is
         # unchanged (a fresh re-proof of the same goal yields the same verdict).
         self.memo = bool(memo)
-        self.dag = ProofDAG(context=self.context_hash, memo=self.memo)
-        # P2 (forge_relevance_study §7): the SAFE parallel fan-out CAP for proving committed AND
-        # children. The number of children proved in one wave is bounded by the Dilworth antichain
-        # WIDTH of the open, all-deps-met children (a deep chain -> width 1, never over-spawn) AND a
-        # budget-derived limit AND this operator ceiling. Scheduling-only: width-bounded rank-ordered
-        # waves yield the SAME proven/failed result as the old serial loop (order-independent).
+        # P2 (forge_relevance_study §7): the SERIAL wave-size cap for committed AND children. The
+        # current driver deliberately performs no concurrent calls because the DAG and Budget are
+        # shared mutable state. Dilworth width, remaining budget, and this ceiling partition the
+        # deterministic child order into bounded serial waves; they do not claim parallel execution.
         self.fanout_cap = max(1, int(fanout_cap))
         # H0 child-consistency gate (forge_relevance_study §4.3.4): before an AND-node is promoted by
         # composing its children, the children's assumption/binding/lemma signatures must agree on
         # overlaps (a 0-cocycle check). A sibling proven under a hypothesis that CONTRADICTS another's
         # is unsound to compose even though each child passed locally.
-        self.h0_consistency = h0_consistency
+        if h0_consistency is not True:
+            raise ValueError("H0 child-consistency is a mandatory logical-soundness gate")
+        self.h0_consistency = True
         # OpenEvolve FALLBACK decomposer (P3 / brief §9 #1, openevolve_stacking_brief §9 P2): fires ONLY
         # on STUCK nodes (after the normal direct + decomposer attempts have all failed). A flag-gated,
         # OPTIONAL Decomposer (typically OpenEvolveBackend). Its evolved blueprint is committed ONLY if
         # it is goal-bound and its obligations are discharged — reusing the SAME _try_decomposition gate
         # as a normal decomposition (goal-binding + obligation-discharge + acyclicity + sketch validity +
         # H0; no weaker gate). Simplification is NOT a deterministic check — only the OPTIONAL soft
-        # ReviewVerdict.useful signal, when a reviewer is configured, prefers a simpler child. None =>
-        # disabled (graceful no-op); also a no-op if the backend reports itself unavailable.
+        # ReviewVerdict.useful signal, when a reviewer is configured, prefers a simpler child. None
+        # disables the stage; a configured backend that becomes unavailable fails loudly.
         self.evolve_fallback = evolve_fallback
         # OPT-IN per-node Lean authority (P0/P2): a callable (node_goal, node_proof_text) -> verdict
         # (a FormalizeAuditResult, e.g. from formalize_bridge.make_node_gate). When set, a LEAF about to
@@ -250,17 +262,14 @@ class DagDriver:
         # the default offline path is byte-identical.
         self.lean_server = lean_server
         # ELEMENTARITY-ENFORCEMENT switch (W5; the builder maps elementarity='none' -> False). When True
-        # (the DEFAULT) every refute_elementary chokepoint runs the EXACT pre-feature logic — a
-        # denylist-prose / undischarged-elastic / goal-binding refutation all REJECT and a refuted
-        # NEEDS_REVIEW proof becomes FAILED_ELEMENTARY (the BYTE-IDENTICAL pre-flag path). When False the
-        # chokepoints ADMIT the ELEMENTARITY DIMENSION ONLY: a refutation whose code is purely
-        # elementarity (denylist_prose / undischarged_elastic) is dropped, so such a node is NOT marked
-        # FAILED_ELEMENTARY but proceeds to soft PROVEN (the contract's "FAILED_ELEMENTARY downgrades to
-        # soft PROVEN"). SOUNDNESS IS UNAFFECTED: the GOAL-BINDING refutation (code 'goal_binding') is
-        # ALWAYS kept (a non-goal-bound proof is still rejected), a VACUOUS inspection STILL fails loud
-        # (VacuousVerificationError propagates unchanged), and acyclicity / obligation-discharge / H0 /
-        # conclusion-binding live outside these chokepoints and are never relaxed. The flag only ever
-        # flips the elementarity dimension; it never touches goal<->claim soundness.
+        # (the DEFAULT) every refute_elementary chokepoint and model-review elementarity verdict is
+        # enforcing: denylist-prose / undischarged-elastic refutations reject, a Ralph judge's
+        # elementary=False rejects, and a decomposition reviewer's elementary=False rejects. When
+        # False, ONLY that elementarity dimension is admitted: purely-elementarity refutations are
+        # dropped and model-review elementary=False does not veto an otherwise sound candidate.
+        # SOUNDNESS IS UNAFFECTED: goal-binding refutations are kept, Ralph no_gaps=False and
+        # decomposition useful=False still reject, vacuous inspection still fails loud, and
+        # acyclicity / obligation-discharge / H0 / conclusion-binding are never relaxed.
         self.enforce_elementarity = bool(enforce_elementarity)
         # PER-RUN SEED CONTEXT (Fix 2): an optional prover-facing clause (e.g. a problem's per-problem
         # citable-inputs whitelist) stored for the whole run by `run(goal, context=...)`. It is threaded
@@ -270,6 +279,40 @@ class DagDriver:
         # SAME context is threaded into child RalphLoop calls too. It NEVER touches goal identity —
         # goal-binding always checks the pure goal string. None (the default) is byte-identical to before.
         self.context: Optional[str] = None
+        # Injected judges/reviewers/verifiers may be stateful callables whose policy changes in place.
+        # Object identity cannot detect that mutation. Until authority components expose a stable
+        # semantic fingerprint contract, conservatively put every later run involving one in a new
+        # receipt epoch so a stale PROVEN node cannot bypass re-review.
+        self._authority_epoch = 0
+        self._has_run = False
+        # Split-keyed memo (T100 P1 item 4): authority-bearing context includes toolkit rules, exact
+        # per-run permissions, AND the live review/verification policy.  A stricter flag or replacement
+        # authority component therefore resets the DAG before a stale PROVEN node can short-circuit.
+        self.policy_context = self._execution_policy_context()
+        self.context_hash = proof_context_hash(
+            self.toolkit, run_context=None, policy_context=self.policy_context)
+        self.dag = ProofDAG(context=self.context_hash, memo=self.memo)
+
+    def _execution_policy_context(self) -> str:
+        """Canonical receipt of every mutable authority-bearing execution-policy input."""
+        payload = {
+            "enforce_elementarity": self.enforce_elementarity,
+            "lean_strict": self.lean_strict,
+            "judges": [_component_policy_identity(judge) for judge in self.judges],
+            "reviewer": (_component_policy_identity(self.reviewer)
+                         if self.reviewer is not None else None),
+            "node_verifier": (_component_policy_identity(self.node_verifier)
+                              if self.node_verifier is not None else None),
+            "sketch_verifier": (_component_policy_identity(self.sketch_verifier)
+                                if self.sketch_verifier is not None else None),
+            "volatile_authority_epoch": self._authority_epoch,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def _has_volatile_authority(self) -> bool:
+        """Whether this run has an injected authority without a semantic fingerprint contract."""
+        return bool(self.judges or self.reviewer is not None
+                    or self.node_verifier is not None or self.sketch_verifier is not None)
 
     def _refute_for_enforcement(self, source, goal: Optional[str]):
         """Run the independent adversarial verifier, applying the ELEMENTARITY-ENFORCEMENT switch.
@@ -298,7 +341,26 @@ class DagDriver:
         prover-facing clause stored on the driver and threaded as a STANDING lesson into every RalphLoop
         invocation (root AND child subgoals) and the decomposer feedback. It NEVER changes goal identity
         (goal-binding checks the pure goal string); None is byte-identical to the pre-feature path."""
+        if self._has_run and self._has_volatile_authority():
+            self._authority_epoch += 1
+        self._has_run = True
+        policy_context = self._execution_policy_context()
+        run_context_hash = proof_context_hash(
+            self.toolkit, run_context=context, policy_context=policy_context)
+        if run_context_hash != self.context_hash:
+            # Per-run permissions are part of certificate identity. Start with a fresh DAG when that
+            # identity changes so neither successes nor cached failures from the prior permission set
+            # can short-circuit this run. Reusing the same context retains normal cross-run memo hits
+            # only when no volatile injected review/verifier authority requires a fresh receipt epoch.
+            self.context_hash = run_context_hash
+            self.policy_context = policy_context
+            self.dag = ProofDAG(context=self.context_hash, memo=self.memo)
+            self.trace.emit("memo_context_reset", goal=goal[:80])
+        else:
+            self.policy_context = policy_context
+            self.dag.context = self.context_hash
         self.context = context
+        self._root_candidate: Optional[str] = None
         proven = self._prove(goal, ancestors=set(), depth=0)
 
         # Terminal authoritative gate: formalize the assembled proof -> Lean Layer-4 audit -> faithfulness.
@@ -321,15 +383,26 @@ class DagDriver:
                                 error_type=type(e).__name__, detail=str(e)[:160],
                                 reason=ReasonCode.unknown_tool_error.value)
             else:
+                trusted_authority = (
+                    getattr(terminal, "authoritative", False) is True
+                    and getattr(terminal, "certification_trusted", False) is True
+                )
                 self.trace.emit("terminal_gate", goal=goal[:80],
-                                authoritative=bool(getattr(terminal, "authoritative", False)))
+                                authoritative=trusted_authority,
+                                certification_trusted=(
+                                    getattr(terminal, "certification_trusted", False) is True))
 
         stats = self.dag.stats()
         self.trace.emit("final", goal=goal[:80], proven=proven,
                         nodes=stats["nodes"], proven_nodes=stats["proven"],
                         cache_hits=stats["cache_hits"], **self.budget.snapshot())
-        return DagResult(goal=goal, proven=proven, dag=self.dag, trace=self.trace,
-                         budget=self.budget, terminal=terminal)
+        return DagResult(
+            goal=goal, proven=proven, dag=self.dag, trace=self.trace,
+            budget=self.budget, candidate=self._root_candidate, terminal=terminal,
+            resolved_roles={role: dict(metadata)
+                            for role, metadata in self.resolved_roles.items()},
+            policy_digest=self.policy_digest,
+        )
 
     def close(self) -> None:
         """Release the warm LeanServer this driver was handed (if any). Idempotent and NEVER raises —
@@ -409,9 +482,18 @@ class DagDriver:
         # (via `_prove_and_children`), so passing self.context here propagates the same standing lesson
         # to child nodes too (context is per-RUN, not per-node; a child may legitimately need the same
         # citable inputs). It is prover-facing only; goal-binding still checks the pure goal string.
-        ralph = RalphLoop(self.prover, toolkit=self.toolkit, budget=self.budget,
-                          trace=self.trace, max_episodes=self.ralph_episodes, judges=self.judges)
+        ralph = RalphLoop(
+            self.prover,
+            toolkit=self.toolkit,
+            budget=self.budget,
+            trace=self.trace,
+            max_episodes=self.ralph_episodes,
+            judges=self.judges,
+            enforce_elementarity=self.enforce_elementarity,
+        )
         res = ralph.run(goal, context=self.context)
+        if depth == 0 and isinstance(res.ledger, str) and res.ledger.strip():
+            self._root_candidate = res.ledger
         node.attempts += res.episodes
 
         # DECIDE the next move via the TOTAL FSM table; the orchestrator EXECUTES the returned Action.
@@ -437,7 +519,7 @@ class DagDriver:
         if action is Action.MARK_FAILED_GAP and event is NodeEvent.GoalClaimMismatch:
             # DEFENSE IN DEPTH (should be UNREACHABLE in normal operation): RalphLoop now pre-filters
             # goal-binding as a PER-EPISODE acceptance criterion (agent/orchestrator/ralph.py, reusing
-            # the duplicated `_proves_goal`), so a res.success=True ledger is already goal-bound and
+            # the shared `_proves_goal`), so a res.success=True ledger is already goal-bound and
             # `_direct_event` will not emit GoalClaimMismatch. This arm is kept as a backstop for
             # defense in depth: if it ever fires, Ralph's pre-filter regressed (a bug), not a
             # legitimate mismatch — the fix is a retry/decomposition via Ralph feedback, not this
@@ -550,7 +632,8 @@ class DagDriver:
         # ONLY through the SAME _try_decomposition gate (goal-binding + obligation-discharge + acyclicity
         # + sketch validity + H0; simplification is only the OPTIONAL soft ReviewVerdict.useful signal,
         # not a deterministic check) plus an explicit goal-bound + obligation-discharge pre-check, so a
-        # gameable blueprint can never be committed. Graceful no-op if the backend is unavailable.
+        # gameable blueprint can never be committed. A configured backend becoming unavailable is an
+        # execution error, not an implicit feature downgrade.
         if self._evolve_fallback_available() and self.budget.can_call():
             if self._try_evolve_fallback(goal, feedback, child_ancestors, depth):
                 return True
@@ -583,17 +666,19 @@ class DagDriver:
     def _evolve_fallback_available(self) -> bool:
         """True iff an OpenEvolve fallback decomposer is configured AND reports itself available.
 
-        Decoupled + graceful: a backend exposing ``available()`` that returns False (e.g. the optional
-        ``openevolve`` package is not installed) is treated as a no-op fallback, never an error."""
+        A configured backend is an explicit requested stage. If its capability disappears after
+        supervision, raise rather than silently downgrading the run to one without that stage."""
         fb = self.evolve_fallback
         if fb is None:
             return False
         avail = getattr(fb, "available", None)
         if callable(avail):
             try:
-                return bool(avail())
-            except Exception:
-                return False
+                is_available = bool(avail())
+            except Exception as exc:
+                raise RuntimeError("configured evolve fallback availability probe failed") from exc
+            if not is_available:
+                raise RuntimeError("configured evolve fallback became unavailable")
         return True
 
     def _blueprint_is_goal_bound_and_discharged(self, goal: str, sketch: str,
@@ -647,32 +732,59 @@ class DagDriver:
 
     def _refine(self, goal: str, ledger: str) -> str:
         """Optionally refine a proven champion via the AutoReason incumbent tournament. No-regression
-        RELATIVE TO THE ADMISSIBILITY GATE: a challenger must beat the incumbent on the blind judge
-        panel AND clear the AUTHORITATIVE elementary admissibility gate to displace it (see
-        `_admissibility_gate`). It is monotone only relative to that panel + gate, not in any absolute
-        sense — a possibly-single soft judge could still prefer a worse-but-elementary rewrite.
+        RELATIVE TO THE ADMISSIBILITY GATE: a challenger must beat the incumbent on the blind comparator
+        panel, clear the proof-judge soundness policy, AND clear the authoritative elementary gate to
+        displace it (see `_admissibility_gate`). It is monotone only relative to those checks, not in
+        any absolute sense — a possibly-single soft judge could still misclassify a logical rewrite.
 
         EXPLORE/EXPLOIT separation (P3 / brief §9 #6): this is the *exploit* stage that runs AFTER the
         *explore* stage (OpenEvolve/search produced the champion). The refined output is registered with
         the explore/exploit barrier so it can NEVER be fed back into the OpenEvolve evolutionary archive
         as a seed — the two stages stay strictly one-directional (explore -> exploit, never back)."""
+        self._refinement_lean_receipts = {}
         if self.refiner is None or not self.budget.can_call():
             return ledger
+        # A pairwise preference comparator cannot certify mathematical correctness.  Refinement is
+        # optional polish, so without an independent proof Judge capable of asserting ``no_gaps`` the
+        # only sound action is to retain the already-reviewed incumbent.
+        if not self.judges:
+            self.trace.emit("refine_skipped", goal=goal[:80], reason="proof_judge_absent")
+            return ledger
         try:
-            # GOAL-BOUND AUTHORITATIVE admissibility: a challenger must clear the authoritative
-            # elementary check (deterministic refutation + the Lean audit when configured) for THIS
-            # goal, not merely the soft gate. Bind the goal into the gate closure here so the refiner
-            # (which calls is_admissible(ledger) with only the ledger) routes every challenger through it.
-            result = self.refiner.refine(goal, ledger,
-                                         is_admissible=self._admissibility_gate(goal))
+            # Bind THIS goal into one memoizing predicate. Besides the elementary checks it applies the
+            # same Layer-2 logical review policy as Ralph; the memo lets the postcondition below verify
+            # the returned champion without paying for an already-reviewed candidate twice.
+            is_admissible = self._admissibility_gate(goal)
+            result = self.refiner.refine(goal, ledger, is_admissible=is_admissible)
         except Exception:
             return ledger
-        if result.changed:
-            self.trace.emit("refine", goal=goal[:80], passes=result.passes,
-                            displacements=result.displacements)
-            # Bar the refined (exploit-side) artifact from ever re-seeding the explore archive.
-            self._bar_from_archive(result.content)
-        return result.content
+        # Treat every controller result as untrusted data.  In particular, ``changed`` is advisory
+        # metadata: a malicious/custom controller can return different content while claiming False.
+        try:
+            returned = result.content
+        except Exception:
+            returned = None
+        if not isinstance(returned, str):
+            self.trace.emit("refine_postcondition_rejected", goal=goal[:80],
+                            reason="invalid_result")
+            return ledger
+        if returned == ledger:
+            return ledger
+        # Do not trust a custom/future RevisionController merely because it was handed a callback.
+        # The concrete controller checks challengers before insertion, but this final postcondition
+        # prevents an implementation that ignores or misroutes the callback from replacing a proof.
+        if not is_admissible(returned):
+            self.trace.emit("refine_postcondition_rejected", goal=goal[:80],
+                            reason="inadmissible_content")
+            return ledger
+        passes = getattr(result, "passes", 0)
+        displacements = getattr(result, "displacements", 0)
+        self.trace.emit("refine", goal=goal[:80],
+                        passes=passes if isinstance(passes, int) else 0,
+                        displacements=displacements if isinstance(displacements, int) else 0)
+        # Bar the refined (exploit-side) artifact from ever re-seeding the explore archive.
+        self._bar_from_archive(returned)
+        return returned
 
     def _bar_from_archive(self, refined: str) -> None:
         """Register an AutoReason-refined artifact with the explore/exploit barrier (one-directional).
@@ -685,16 +797,52 @@ class DagDriver:
             return
         explore_exploit_barrier().mark_refined(refined)
 
-    def _soft_gate_admits(self, ledger: str) -> bool:
-        """Necessary (NOT sufficient) admissibility: the deterministic + soft gate does not REJECT.
+    def _refinement_review_admits(self, report: GateReport) -> bool:
+        """Apply the direct-proof Layer-2 policy to one structurally admitted challenger.
 
-        By its own docstring (`agent/gates/gate.py`) passing this gate does NOT certify "elementary" —
-        it only rules out structural / obligation / denylist-prose REJECTs. It is a necessary first
-        filter; the authoritative elementarity decision is made by `_authoritative_elementary` below."""
-        try:
-            return not evaluate(ledger, self.toolkit).rejected
-        except Exception:
+        A comparator answers only "which candidate looks better"; it is not the proof judge's
+        ``no_gaps`` certificate. With no proof judges refinement is disabled: the deterministic gate
+        checks certificate structure and known obligations, not arbitrary mathematical truth. With
+        judges, the whole panel is budget-preflighted and every verdict must have no logical gap; the
+        elementarity dimension is required only when the active profile enforces it.
+        """
+        if report.ledger is None:
             return False
+        if not self.judges:
+            return False
+
+        required = len(self.judges)
+        if self.budget.calls_spent + required > self.budget.max_llm_calls:
+            self.trace.emit("refine_review_incomplete", required=required,
+                            remaining=self.budget.max_llm_calls - self.budget.calls_spent)
+            return False
+
+        admitted = True
+        for judge in self.judges:
+            self.budget.spend_call()
+            try:
+                raw_verdict = judge.review(report.ledger)
+                verdict = _validated_judge_verdict(
+                    raw_verdict, getattr(judge, "name", "unknown"))
+                effective_passed = (
+                    verdict.no_gaps is True
+                    and (verdict.elementary is True or not self.enforce_elementarity)
+                )
+                self.trace.emit(
+                    "refine_judge",
+                    judge=verdict.judge,
+                    passed=effective_passed,
+                    raw_passed=verdict.passed is True,
+                    elementary=verdict.elementary is True,
+                    no_gaps=verdict.no_gaps is True,
+                    elementarity_enforced=self.enforce_elementarity,
+                )
+                admitted = admitted and effective_passed
+            except Exception as exc:
+                admitted = False
+                self.trace.emit("refine_judge_error", judge=getattr(judge, "name", "unknown"),
+                                error_type=type(exc).__name__, detail=str(exc)[:160])
+        return admitted
 
     def _authoritative_elementary(self, goal: str, ledger: str) -> bool:
         """The AUTHORITATIVE elementarity decision for an AutoReason challenger (not the soft gate).
@@ -705,13 +853,11 @@ class DagDriver:
              a challenger it REFUTES (denylist-prose, undischarged elastic, goal-binding violation) is
              NOT elementary and is rejected. A vacuous inspection (empty/unparseable) FAILS LOUD -> not
              admissible (never a silent pass).
-          2. When a per-node Lean verifier is configured (`self.node_verifier is not None`), the Lean
-             audit: a challenger that COMPILES but the Lean audit REJECTS (`lean_compiled_but_rejected`:
-             sorry / denylist / non-whitelist axiom) REFUTES elementarity -> rejected. A non-compiling
-             or UNAVAILABLE Lean result does NOT block admission (Lean is used only to REFUTE here, never
-             to REQUIRE — mirroring the leaf path's fail-OPEN-on-inability-to-formalize), and a crashing
-             verifier never refutes (fail open). The Lean audit is only consulted at all when a verifier
-             is wired in; with no verifier this clause is inert (deterministic refutation only).
+          2. When a per-node Lean verifier is configured (`self.node_verifier is not None`), refinement
+             is admitted only by an `elementary_verified` result.  Optional polish fails closed on an
+             unavailable/crashing/non-compiling verifier and draws from the same bounded per-node pool
+             as leaf verification, while reserving one call for final incumbent promotion.  A successful
+             result is carried into that promotion so the winning ledger is not compiled twice.
 
         Returns True iff NOTHING authoritatively refuted the challenger's elementarity.
 
@@ -726,25 +872,63 @@ class DagDriver:
             return False
         if verdict.refuted:
             return False
-        # Optional Lean authority: only REFUTE (a compiled-but-rejected challenger), never REQUIRE.
+        # Optional Lean authority: optional refinement fails closed and cannot consume the last call
+        # needed to verify whichever incumbent is finally promoted.
         if self.node_verifier is not None:
+            cap = self.budget.max_node_verify_calls
+            if (not self.budget.can_verify_node()
+                    or (cap is not None and self.budget.node_verify_spent + 2 > cap)):
+                self.trace.emit("refine_node_lean", goal=goal[:80],
+                                outcome="node_verify_budget_reserved")
+                return False
+            self.budget.spend_verify_node()
             try:
                 lv = self.node_verifier(goal, ledger)
-            except Exception:
-                return True   # a crashing verifier never refutes a deterministically-clean challenger
-            if bool(getattr(lv, "lean_compiled_but_rejected", False)):
+            except Exception as exc:
+                self.trace.emit("refine_node_lean", goal=goal[:80], outcome="verifier_error",
+                                detail=str(exc)[:120])
                 return False
+            if getattr(lv, "elementary_verified", False) is not True:
+                if getattr(lv, "lean_unavailable", False) is True:
+                    outcome = "lean_unavailable"
+                elif getattr(lv, "lean_compiled_but_rejected", False) is True:
+                    outcome = "elementary_violation"
+                elif getattr(lv, "lean_provenance_unverified", False) is True:
+                    outcome = "lean_provenance_unverified"
+                else:
+                    outcome = "lean_could_not_formalize"
+                self.trace.emit("refine_node_lean", goal=goal[:80], outcome=outcome)
+                return False
+            self._refinement_lean_receipts[(goal, ledger)] = lv
+            self.trace.emit("refine_node_lean", goal=goal[:80], outcome="elementary_verified")
         return True
 
     def _admissibility_gate(self, goal: str) -> Callable[[str], bool]:
         """Build the goal-bound admissibility predicate the AutoReason refiner uses to ADMIT challengers.
 
-        A challenger is admissible iff it passes the soft gate (necessary first filter) AND clears the
-        AUTHORITATIVE elementary check (`_authoritative_elementary`). So a non-elementary challenger that
-        the SOFT GATE ALONE would have admitted is REJECTED here and can never displace the incumbent —
-        'stay elementary to displace' becomes ENFORCED, not asserted."""
+        A challenger is admissible iff it is structurally admitted, clears the authoritative elementary
+        check, and survives the same logical Layer-2 policy as a direct proof. Results are memoized within
+        one refinement run so duplicate author/synthesizer output and the final postcondition do not
+        repeat model or Lean calls.
+        """
+        cache: dict[str, bool] = {}
+
         def _ok(ledger: str) -> bool:
-            return self._soft_gate_admits(ledger) and self._authoritative_elementary(goal, ledger)
+            if not isinstance(ledger, str):
+                return False
+            if ledger in cache:
+                return cache[ledger]
+            try:
+                report = evaluate(ledger, self.toolkit)
+                admitted = (
+                    not report.rejected
+                    and self._authoritative_elementary(goal, ledger)
+                    and self._refinement_review_admits(report)
+                )
+            except Exception:
+                admitted = False
+            cache[ledger] = admitted
+            return admitted
         return _ok
 
     def _verify_or_downgrade(self, goal: str, res: RalphResult) -> bool:
@@ -794,7 +978,7 @@ class DagDriver:
         `self.node_verifier is not None`; the None default never reaches here (byte-identical path).
 
         Fail-CLOSED on the elementarity claim, fail-OPEN on inability to formalize:
-          (i)   PASS  (compiled AND audit.passed / .elementary_verified) -> mark_proven_direct AND
+          (i)   PASS  (compiled + audit/provenance authoritative / .elementary_verified) -> mark_proven_direct AND
                 set node.lean_verified=True. Lean CONFIRMED the leaf is elementary.
           (ii)  REJECT (compiled but the audit rejected: sorry / denylist / non-whitelist axiom) ->
                 this REFUTES elementarity -> mark_failed(elementary=True, elementary_violation)
@@ -806,43 +990,64 @@ class DagDriver:
                 budget_starved-equivalent 'lean_unavailable'); the leaf is re-attemptable when Lean is
                 back. NOT a terminal failure.
 
-        The verifier is independent; any unexpected exception in it is treated as fail-OPEN (soft
-        PROVEN) so a flaky verifier never poisons a goal that the informal gate already admitted.
+        The verifier is independent; by default an unexpected exception is fail-OPEN (soft PROVEN),
+        while ``lean_strict`` fails closed so strict mode never mints an unverified success.
 
         PER-NODE VERIFY SUB-CAP (P3): before invoking the verifier, check the budget's OPTIONAL
-        max_node_verify_calls sub-cap. If it is EXHAUSTED, SKIP per-node Lean for this leaf and fall
-        back to soft PROVEN (lean_verified=False, re-attemptable) — do NOT block the proof or crash, so
-        per-node Lean can never starve the prover/decomposer search. When the sub-cap is unlimited
-        (None, the default) can_verify_node() is always True and this is byte-identical to before."""
-        if not self.budget.can_verify_node():
-            # Sub-cap exhausted: do NOT spend a per-node Lean compile here. Fall back to the soft-PROVEN
-            # path the informal gate already justified (lean_verified stays False -> re-attemptable on a
-            # later run with more node-verify budget). Bounded + non-blocking by construction.
-            self.dag.mark_proven_direct(goal, ledger)
-            self.trace.emit("node_lean", goal=goal[:80], outcome="node_verify_budget_exhausted",
-                            lean_verified=False, reason=ReasonCode.budget_starved.value)
-            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
-            return True
-        self.budget.spend_verify_node()
-        try:
-            verdict = self.node_verifier(goal, ledger)
-        except Exception as e:
-            # A crashing verifier must not refute or starve: the informal gate already passed this leaf.
-            # Fail OPEN -> soft PROVEN (lean_verified=False), exactly as a non-compile outcome.
-            self.dag.mark_proven_direct(goal, ledger)
-            self.trace.emit("node_lean", goal=goal[:80], outcome="verifier_error",
-                            lean_verified=False, detail=str(e)[:120])
-            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
-            return True
+        max_node_verify_calls sub-cap. If it is EXHAUSTED, normal mode falls back to soft PROVEN;
+        ``lean_strict`` instead leaves the node non-proven. When the sub-cap is unlimited (None, the
+        default) can_verify_node() is always True and this is byte-identical to before."""
+        verdict = self._refinement_lean_receipts.pop((goal, ledger), None)
+        if verdict is None:
+            if not self.budget.can_verify_node():
+                if self.lean_strict:
+                    self.dag.mark_exhausted(goal, reason=ReasonCode.budget_starved.value)
+                    self.trace.emit(
+                        "node_lean", goal=goal[:80], outcome="node_verify_budget_exhausted_strict",
+                        lean_verified=False, reason=ReasonCode.budget_starved.value)
+                    return False
+                # Sub-cap exhausted: do NOT spend a per-node Lean compile here. Fall back to the
+                # soft-PROVEN path the informal gate already justified (lean_verified stays False ->
+                # re-attemptable on a later run with more node-verify budget).
+                self.dag.mark_proven_direct(goal, ledger)
+                self.trace.emit("node_lean", goal=goal[:80], outcome="node_verify_budget_exhausted",
+                                lean_verified=False, reason=ReasonCode.budget_starved.value)
+                self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+                return True
+            self.budget.spend_verify_node()
+            try:
+                verdict = self.node_verifier(goal, ledger)
+            except Exception as e:
+                if self.lean_strict:
+                    self.dag.mark_exhausted(goal, reason=ReasonCode.formalization_failed.value)
+                    self.trace.emit(
+                        "node_lean", goal=goal[:80], outcome="verifier_error_strict",
+                        lean_verified=False, detail=str(e)[:120],
+                        reason=ReasonCode.formalization_failed.value)
+                    return False
+                # Normal mode: a crashing verifier must not poison a goal the informal gate admitted.
+                self.dag.mark_proven_direct(goal, ledger)
+                self.trace.emit("node_lean", goal=goal[:80], outcome="verifier_error",
+                                lean_verified=False, detail=str(e)[:120])
+                self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+                return True
+        else:
+            self.trace.emit("node_lean", goal=goal[:80],
+                            outcome="reuse_refinement_verification", lean_verified=True)
 
-        unavailable = bool(getattr(verdict, "lean_unavailable", False))
-        elementary_verified = bool(getattr(verdict, "elementary_verified", False))
-        compiled = bool(getattr(verdict, "compiled", False))
+        unavailable = getattr(verdict, "lean_unavailable", False) is True
+        elementary_verified = getattr(verdict, "elementary_verified", False) is True
+        compiled = getattr(verdict, "compiled", False) is True
         audit = getattr(verdict, "audit", None)
         # 'compiled-but-rejected' is the hard refutation; prefer the read-only helper if the verdict
         # exposes it, else derive it from (compiled AND audit ran AND audit did not pass).
-        rejected = bool(getattr(verdict, "lean_compiled_but_rejected",
-                                compiled and audit is not None and not bool(getattr(audit, "passed", False))))
+        # The helper is only additive evidence. It may be absent or malformed on a duck-typed
+        # verifier result, but it must never override concrete compiled + failed-audit evidence.
+        derived_rejected = (
+            compiled and audit is not None and getattr(audit, "passed", False) is not True
+        )
+        rejected = (getattr(verdict, "lean_compiled_but_rejected", False) is True
+                    or derived_rejected)
 
         # (iv) UNAVAILABLE -> retryable EXHAUSTED (do NOT poison; re-attemptable when Lean is back).
         if unavailable:
@@ -875,6 +1080,23 @@ class DagDriver:
                             lean_verified=False, detail=detail,
                             reason=ReasonCode.elementary_violation.value)
             return False
+
+        # Content compilation passed, but the toolchain/manifest receipt is absent or unverified.
+        # This is not a mathematical refutation. Normal mode retains only the prior SOFT proof;
+        # strict mode fails closed without poisoning the goal as non-elementary.
+        if getattr(verdict, "lean_provenance_unverified", False) is True:
+            if self.lean_strict:
+                self.dag.mark_failed(goal, reason=ReasonCode.formalization_failed.value)
+                self.trace.emit(
+                    "node_lean", goal=goal[:80], outcome="lean_provenance_unverified_strict",
+                    lean_verified=False, reason=ReasonCode.formalization_failed.value)
+                return False
+            self.dag.mark_proven_direct(goal, ledger)
+            self.trace.emit(
+                "node_lean", goal=goal[:80], outcome="lean_provenance_unverified",
+                lean_verified=False)
+            self.trace.emit("prove_node", goal=goal[:80], proof_kind="direct")
+            return True
 
         # (iii) COULD-NOT-COMPILE (no Lean / compile error). DEFAULT: FAIL OPEN -> soft PROVEN,
         # re-attemptable (the informal gate already passed it). This is the gap-#1 fail-open the
@@ -913,13 +1135,18 @@ class DagDriver:
         is explicitly configured; the None default never reaches here (byte-identical path).
 
         PER-NODE VERIFY SUB-CAP (P3): before invoking the verifier, check the budget's OPTIONAL
-        max_node_verify_calls sub-cap. If it is EXHAUSTED, SKIP the per-node Lean composition check and
-        fall back to a SOFT COMMIT (committed=True, sketch_lean_verified=False) — the decomposition still
-        commits via the SAME reviewer/acyclicity/binding gates the default path uses, just without the
-        extra Lean composition authority, so per-node Lean can never starve the prover/decomposer
-        search. This does NOT loosen any deterministic gate; it only declines the OPT-IN Lean overlay.
-        When the sub-cap is unlimited (None, the default) can_verify_node() is always True."""
+        max_node_verify_calls sub-cap. If it is EXHAUSTED, normal mode falls back to a SOFT COMMIT;
+        ``lean_strict`` rejects the candidate because strict mode may not mint an unverified
+        composition. When the sub-cap is unlimited (None, the default) can_verify_node() is always
+        True."""
         if not self.budget.can_verify_node():
+            if self.lean_strict:
+                self.trace.emit(
+                    "sketch_lean", goal=goal[:80],
+                    outcome="node_verify_budget_exhausted_strict",
+                    sketch_lean_verified=False, children=len(children),
+                    reason=ReasonCode.budget_starved.value)
+                return False, False, ["strict Lean composition budget exhausted"]
             # Sub-cap exhausted: skip the Lean composition compile. Soft-commit (no sketch_lean stamp)
             # exactly as the byte-identical pre-P4 path would, so the proof is not blocked or crashed.
             self.trace.emit("sketch_lean", goal=goal[:80], outcome="node_verify_budget_exhausted",
@@ -934,7 +1161,7 @@ class DagDriver:
                             sketch_lean_verified=False, detail=str(e)[:120])
             return False, False, [f"sketch verifier error: {str(e)[:120]}"]
 
-        elementary_verified = bool(getattr(verdict, "elementary_verified", False))
+        elementary_verified = getattr(verdict, "elementary_verified", False) is True
         if elementary_verified:
             self.trace.emit("sketch_lean", goal=goal[:80], outcome="elementary_verified",
                             sketch_lean_verified=True, children=len(children))
@@ -942,10 +1169,15 @@ class DagDriver:
 
         # Not compiled+elementary -> never commit. Classify for the trace (unavailable vs rejected vs
         # non-compile) without changing the (uniform) reject decision.
-        if bool(getattr(verdict, "lean_unavailable", False)):
+        if getattr(verdict, "lean_unavailable", False) is True:
             outcome, note = "lean_unavailable", "lean toolchain unavailable for the composition check"
-        elif bool(getattr(verdict, "lean_compiled_but_rejected", False)):
+        elif getattr(verdict, "lean_compiled_but_rejected", False) is True:
             outcome, note = "elementary_violation", "composition compiled but the audit rejected it"
+        elif getattr(verdict, "lean_provenance_unverified", False) is True:
+            outcome, note = (
+                "lean_provenance_unverified",
+                "composition compiled but lacks verified toolchain/manifest provenance",
+            )
         else:
             outcome, note = "lean_could_not_formalize", "composition sketch did not compile"
         self.trace.emit("sketch_lean", goal=goal[:80], outcome=outcome,
@@ -985,10 +1217,25 @@ class DagDriver:
                                 reason=ReasonCode.unknown_tool_error.value)
                 return (False, [f"reviewer call failed ({type(e).__name__}): {str(e)[:160]}"],
                         ReasonCode.unknown_tool_error.value)
-            self.trace.emit("review", goal=goal[:80], useful=review.useful,
-                            elementary=review.elementary)
-            if not review.ok:
-                reason = (ReasonCode.elementary_violation.value if not review.elementary
+            # ReviewVerdict also has two orthogonal dimensions. Solution-only mode ignores ONLY the
+            # elementary preference; a decomposition that is not useful/simplifying is still a bad
+            # plan and is rejected. Keep ReviewVerdict.ok enforcement-agnostic for external callers
+            # and derive the run-specific decision at this policy chokepoint.
+            review_accepted = (
+                review.useful is True
+                and (review.elementary is True or not self.enforce_elementarity)
+            )
+            self.trace.emit(
+                "review",
+                goal=goal[:80],
+                useful=review.useful is True,
+                elementary=review.elementary is True,
+                accepted=review_accepted,
+                elementarity_enforced=self.enforce_elementarity,
+            )
+            if not review_accepted:
+                reason = (ReasonCode.elementary_violation.value
+                          if self.enforce_elementarity and review.elementary is not True
                           else ReasonCode.gap_found.value)
                 return False, review.notes, reason
 
@@ -1065,12 +1312,10 @@ class DagDriver:
         # back together with the rest of the commit if a child / H0 fails below.
         node.sketch_lean_verified = sketch_ok
 
-        # Prove the committed AND children in width-bounded waves ordered by upward_rank (deepest
-        # critical chain first), the Dilworth antichain width capping the parallel fan-out. This is
-        # SCHEDULING-ONLY and BEHAVIOR-PRESERVING: each `_prove` is idempotent (memoized), child
-        # results are order-independent, and we still short-circuit on the first failure exactly like
-        # the old serial for-loop -> the SAME proven/failed outcome, only the visitation order/grouping
-        # changes. (Used ONLY for committed AND children — never to pick among OR alternatives.)
+        # Prove committed AND children in width-bounded SERIAL waves ordered by upward_rank (deepest
+        # critical chain first). The driver does not launch concurrent calls: Budget and ProofDAG are
+        # shared mutable state. This planning is behavior-preserving and is used only for committed
+        # AND children, never to choose among OR alternatives.
         child_ok, child_reason = self._prove_and_children(goal, children, child_ancestors, depth)
         if not child_ok:
             self.trace.emit("backtrack", goal=goal[:80], child_reason=child_reason)
@@ -1090,17 +1335,19 @@ class DagDriver:
 
         # H0 child-consistency gate (0-cocycle / global-section check) BEFORE composing the children
         # into the parent's proof. Each child passed LOCALLY; this checks they agree on overlaps so the
-        # composition has a consistent global section. A contradiction (e.g. one child assumes `n is
-        # even`, a sibling `n is odd`) is unsound to compose -> do NOT promote: mark FAILED_ELEMENTARY.
+        # extracted signatures have no conflicting overlap. A detected contradiction (e.g. one child
+        # assumes `n is even`, a sibling `n is odd`) is unsound to compose -> do NOT promote. This is
+        # a LOGICAL GAP, not an elementarity-objective failure: the children do not establish one
+        # coherent proof.
         h0 = self._check_h0_consistency(goal, children)
         if h0 is not None and not h0.consistent:
             node.proof, node.proof_kind = prev_proof, prev_kind
             node.children, node.state = prev_children, prev_state
             node.sketch_lean_verified = prev_sketch_lean
             self.trace.emit("h0_violation", goal=goal[:80], overlap=h0.offending_overlap,
-                            detail=h0.summary(), reason=ReasonCode.elementary_violation.value)
+                            detail=h0.summary(), reason=ReasonCode.gap_found.value)
             return False, [str(c) for c in h0.conflicts] or [h0.summary()], \
-                ReasonCode.elementary_violation.value
+                ReasonCode.gap_found.value
 
         self.dag.mark_proven_via_children(goal)
         self.trace.emit("prove_node", goal=goal[:80], proof_kind="decomposition")
@@ -1173,7 +1420,7 @@ class DagDriver:
         critical lemma therefore always sorts ahead of a shallower one regardless of fan-in.
 
         Results are ORDER-INDEPENDENT (an AND-node needs EVERY child proven), so this only changes the
-        visitation order, never which goals prove — serial/parallel parity is preserved."""
+        visitation order, never which goals prove — serial scheduling parity is preserved."""
         if not keys:
             return []
         lev = self.leverage_over_dag(keys)
@@ -1189,7 +1436,7 @@ class DagDriver:
         decomposition edges) NEEDS child `u` — i.e. u is a sub-lemma of v in the current DAG, so u must
         prove before v. For a flat decomposition this is empty (the children are precedence-independent
         by construction -> the acyclicity guard) so the width is exactly the child count. A genuine
-        chain among shared sub-lemmas yields edges -> width collapses toward 1 (don't over-spawn)."""
+        chain among shared sub-lemmas yields edges -> the planned serial wave size collapses toward 1."""
         keys = {c: goal_hash(c) for c in children}
         edges: list[tuple[str, str]] = []
         for v in children:
@@ -1201,10 +1448,12 @@ class DagDriver:
                     edges.append((u, v))
         return edges
 
-    def _budget_fanout_limit(self) -> int:
-        """A budget-derived ceiling on concurrent child-proving: never schedule a wave wider than the
-        remaining LLM-call budget could service. Keeps budget/rate-limit caps as scheduler inputs
-        (forge_relevance_study §7) rather than only CPU cores. At least 1 so progress is always made."""
+    def _budget_wave_limit(self) -> int:
+        """A budget-derived SERIAL wave-size ceiling.
+
+        Wave boundaries are planning/observability metadata; child calls remain sequential because
+        they mutate one shared Budget and ProofDAG. At least one child is placed in each wave.
+        """
         remaining = self.budget.max_llm_calls - self.budget.calls_spent
         return max(1, remaining)
 
@@ -1231,9 +1480,11 @@ class DagDriver:
 
     def _prove_and_children(self, goal: str, children: list[str], child_ancestors: set[str],
                             depth: int) -> tuple[bool, Optional[str]]:
-        """Prove every committed AND child, scheduling them in width-bounded waves ordered DEPTH-FIRST
-        (the critical-path guard), the Dilworth antichain width capping the parallel fan-out. Returns
-        ``(all_proven, failing_reason)``: ``(True, None)`` iff ALL children proved; on the first failure
+        """Prove every committed AND child in width-bounded SERIAL waves ordered DEPTH-FIRST.
+
+        The Dilworth width caps each planned wave, but calls inside and across waves are sequential.
+        This is truth-in-labeling: no parallel execution is claimed while Budget/DAG mutation is shared.
+        Returns ``(all_proven, failing_reason)``: ``(True, None)`` iff ALL children proved; on first failure
         ``(False, <ReasonCode.value>)`` carrying the failing child's REAL reason (V1 propagation).
         Short-circuits on the first failure (same as the serial loop). Behavior-preserving on
         deterministic stubs (only the visitation order/grouping changes; results are order-independent).
@@ -1244,7 +1495,7 @@ class DagDriver:
         (critical-path depth + 1) ALONE still lets a shallow high-fan-in lemma out-rank a deeper chain;
         making critical-path DEPTH the primary key fixes that. Results are order-independent (an AND-node
         needs EVERY child proven), so this only changes the visitation order, never which goals prove —
-        serial/parallel parity is preserved."""
+        deterministic scheduling parity is preserved."""
         edges = self._and_child_precedence(children)
         try:
             width = dilworth_width(children, edges)
@@ -1254,7 +1505,7 @@ class DagDriver:
             width = 1
         ranks = upward_rank(children, edges)
         # Cap = min(antichain width, budget-derived limit, operator ceiling). A deep chain -> width 1.
-        cap = max(1, min(width, self._budget_fanout_limit(), self.fanout_cap))
+        cap = max(1, min(width, self._budget_wave_limit(), self.fanout_cap))
         # DEPTH-PRIMARY critical-path order (V5): protect the irreducible-sequential chain. Primary key
         # is the critical-path DEPTH over the committed DAG; leverage (fan-in x depth) breaks ties among
         # equal-depth children; within-decomposition upward_rank then goal text for a stable order.
@@ -1265,12 +1516,13 @@ class DagDriver:
         ordered = sorted(
             children,
             key=lambda c: (-depths.get(ckeys[c], 0), -lev.get(ckeys[c], 0), -ranks.get(c, 0), c))
-        self.trace.emit("and_fanout", goal=goal[:80], children=len(children),
-                        width=width, cap=cap, max_rank=max(ranks.values(), default=0),
+        self.trace.emit("and_serial_waves", goal=goal[:80], children=len(children),
+                        width=width, cap=cap, execution="serial",
+                        max_rank=max(ranks.values(), default=0),
                         max_leverage=max(lev.values(), default=0),
                         max_depth=max(depths.values(), default=0))
-        # Width-bounded waves. Proving is order-independent and idempotent, so grouping into waves of
-        # size <= cap yields the same result as proving them one-by-one; we short-circuit on first fail.
+        # Width-bounded serial waves. Grouping is explicit for observability; execution remains
+        # one-by-one and short-circuits on the first failing child.
         for start in range(0, len(ordered), cap):
             wave = ordered[start:start + cap]
             for child_goal in wave:
@@ -1279,20 +1531,80 @@ class DagDriver:
         return True, None
 
     def _child_proof_map(self, children: list[str]) -> dict[str, Optional[str]]:
-        """The proven artifact (direct ledger or decomposition sketch) of each child, for the H0 gate."""
+        """Every proven artifact in the transitive closure below ``children`` for H0.
+
+        Checking only each immediate child's winning artifact is unsound for a nested decomposition:
+        that artifact is merely its composition sketch, while the assumptions that discharged its
+        lemmas live in descendant leaf ledgers.  Two top-level siblings can therefore appear compatible
+        even when a grandchild assumes ``n is even`` and the other branch assumes ``n is odd``.  Flatten
+        the descendant DAG (deduplicating shared lemmas by key) so H0 inspects the whole composed proof.
+
+        Missing descendants are retained with a ``None`` artifact.  The H0 anti-vacuity rule then fails
+        the composition closed instead of silently ignoring a corrupt/incomplete DAG edge.
+        """
         out: dict[str, Optional[str]] = {}
-        for c in children:
-            node = self.dag.get(goal_hash(c))
-            out[c] = node.proof if node is not None else None
+        seen: set[str] = set()
+        total_chars = 0
+        saturated = False
+
+        def unavailable(label: str, reason: str) -> None:
+            candidate = f"{label} [{reason}]"
+            suffix = 2
+            while candidate in out:
+                candidate = f"{label} [{reason}:{suffix}]"
+                suffix += 1
+            out[candidate] = None
+
+        def visit(key: str, fallback_label: str) -> None:
+            nonlocal total_chars, saturated
+            if saturated:
+                return
+            if key in seen:
+                return
+            if len(seen) >= _MAX_H0_ARTIFACTS:
+                unavailable(fallback_label, "H0 artifact limit exceeded")
+                saturated = True
+                return
+            seen.add(key)
+            node = self.dag.get(key)
+            if node is None:
+                # Use a unique diagnostic label so multiple missing edges cannot overwrite one another.
+                unavailable(fallback_label, f"missing:{key}")
+                return
+
+            label = node.goal
+            if label in out:
+                # Defensive only: distinct full SHA-256 keys should not carry the exact same goal text,
+                # but never let a malformed DAG overwrite an artifact that H0 was meant to inspect.
+                label = f"{node.goal} [{key}]"
+            artifact = node.proof
+            if artifact is not None and not isinstance(artifact, str):
+                out[label] = None
+            elif artifact is not None and total_chars + len(artifact) > _MAX_H0_TOTAL_CHARS:
+                unavailable(label, "H0 byte budget exceeded")
+                saturated = True
+                return
+            else:
+                out[label] = artifact
+                total_chars += len(artifact or "")
+            for child_key in node.children:
+                child = self.dag.get(child_key)
+                child_label = (child.goal if child is not None
+                               else f"descendant of {node.goal!r}")
+                visit(child_key, child_label)
+
+        for child in children:
+            visit(goal_hash(child), child)
         return out
 
     def _check_h0_consistency(self, goal: str, children: list[str]):
-        """Run the H0 child-consistency gate over the (now all-proven) children. Returns the H0Result,
-        or None when the gate is disabled. ANTI-VACUITY is the gate's own concern: a check that could
-        inspect nothing returns consistent=False (reason vacuous_check), never a vacuous pass."""
-        if not self.h0_consistency:
-            return None
-        return check_children_consistency(children, self._child_proof_map(children))
+        """Run mandatory H0 over the full proven descendant closure of all children.
+
+        ANTI-VACUITY is the gate's own concern: an inspection that saw nothing returns
+        ``consistent=False`` rather than a vacuous pass. There is intentionally no disable path.
+        """
+        proofs = self._child_proof_map(children)
+        return check_children_consistency(list(proofs), proofs)
 
     def _compare_budget_ok(self) -> bool:
         """One pairwise comparison costs one model call (checked + spent atomically)."""

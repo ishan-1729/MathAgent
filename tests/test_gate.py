@@ -27,13 +27,27 @@ def test_bad_justification_rejected(toolkit):
     assert "bad_justification" in {f.code for f in rep.rejects()}
 
 
+def test_structural_reject_short_circuits_expensive_obligations(monkeypatch, toolkit):
+    import agent.gates.gate as gate_mod
+    bad = minimal_ledger()
+    bad["steps"][-1]["claim"] = "unrelated"
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("obligations must not run after a structural rejection")
+
+    monkeypatch.setattr(gate_mod, "check_obligations", should_not_run)
+    rep = gate_mod.evaluate(bad, toolkit)
+    assert rep.rejected
+    assert "goal_claim_mismatch" in {finding.code for finding in rep.rejects()}
+
+
 def test_incomplete_case_cover_rejected(toolkit):
     d = {
         "problem": "p", "claim": "c",
         "steps": [
             {"id": "s1", "claim": "split mod 4", "justification": "case_split", "depends_on": [],
              "obligations": {"case_cover": {"modulus": 4, "residues": [0, 1, 2]}}},
-            {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s2", "claim": "c", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     }
     rep = evaluate(d, toolkit)
@@ -57,7 +71,7 @@ def test_elastic_justification_needs_review(toolkit):
         "steps": [
             {"id": "s1", "claim": "bound it", "justification": "bounding", "depends_on": [],
              "obligations": {"bounding": {"inequality": "n < n+1", "strict": True}}},
-            {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s2", "claim": "c", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     }
     rep = evaluate(d, toolkit)

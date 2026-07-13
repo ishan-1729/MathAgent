@@ -110,11 +110,10 @@
         <div id="certsub">
           <div class="toggles" style="margin-bottom:7px">
             <label class="tg"><input type="checkbox" id="server" checked><span class="dot"></span>Lean server</label>
-            <label class="tg"><input type="checkbox" id="faithfulness" checked><span class="dot"></span>faithfulness</label>
           </div>
           <div class="field"><label>repair iters</label><input type="number" id="repair" value="3" min="0" max="8"></div>
         </div>
-        <div class="hint">off → informal proof only · on → Lean compile + proof-term audit + faithfulness · faithfulness off → audited-only (not authoritative)</div>
+        <div class="hint">off → informal proof only · on → Lean compile + proof-term audit + mandatory adversarial faithfulness</div>
       </div>
 
       <div class="group">
@@ -125,7 +124,7 @@
         <div class="field"><label>population K</label><input type="number" id="population" value="0" min="0" max="8"></div>
         <div class="field"><label>judges</label><input type="number" id="judges" value="1" min="1" max="5"></div>
         <div class="field"><label>evolve iters</label><input type="number" id="evolve" value="0" min="0" max="200"></div>
-        <div class="hint">evolve &gt; 0 → OpenEvolve proof-sketch search (needs mathagent[evolve]; no-op if absent)</div>
+        <div class="hint">evolve &gt; 0 → OpenEvolve proof-sketch search (needs mathagent[evolve]; request fails closed if absent)</div>
       </div>
 
       <div class="group">
@@ -142,7 +141,7 @@
         <div class="field"><label>max depth</label><input type="number" id="max_depth" value="3" min="0" max="8"></div>
         <div class="field"><label>max decomp</label><input type="number" id="max_decomp" value="2" min="1" max="6"></div>
         <div class="field"><label>episodes/node</label><input type="number" id="episodes" value="3" min="1" max="8"></div>
-        <div class="field"><label>max Codex calls</label><input type="number" id="budget" value="40" min="1" max="300"></div>
+        <div class="field"><label>max search/review calls</label><input type="number" id="budget" value="40" min="1" max="300"></div>
         <div class="field"><label>max replan</label><input type="number" id="max_replan" value="2" min="0" max="8"></div>
         <div class="field"><label>timeout (s)</label><input type="number" id="timeout" value="1500" min="30" max="3600"></div>
       </div>
@@ -160,13 +159,14 @@
 <script>
 const $ = id => document.getElementById(id);
 const log = $("log");
-let es = null, finished = false;
+const CSRF_TOKEN = "__MATHAGENT_CSRF_TOKEN__";
+let currentRun = null;
 
 // the certification sub-options dim when the headline toggle is off
 function syncCert(){ $("certsub").style.opacity = $("certify").checked ? "1" : "0.45"; }
 $("certify").addEventListener("change", syncCert); syncCert();
 
-const CHECKS = ["certify","server","faithfulness","refine","retrieval","neural","rerank"];
+const CHECKS = ["certify","server","refine","retrieval","neural","rerank"];
 const NUMS   = ["repair","population","judges","evolve","max_depth","max_decomp","episodes","budget","max_replan","timeout"];
 
 function params(){
@@ -185,46 +185,151 @@ function addLine(text){
   let cls = "";
   if(text.startsWith("[ui] running:")) cls = "l-cmd";
   else if(text.startsWith("# ")) cls = "l-head";
-  else if(/^result:\s*PROVEN/.test(text) || /authoritative_elementary:\s*True/.test(text) || /audit:\s*pass/.test(text)) cls="l-ok";
-  else if(/NOT PROVEN/.test(text) || /authoritative_elementary:\s*False/.test(text) || /failed|error|ERROR/.test(text)) cls="l-bad";
-  else if(/^(terminal Layer-4|dag:|calls spent|trace events)/.test(text)) cls="l-key";
+  else if(/^status:\s*(soft_proven|authoritative_elementary)\s*$/.test(text) || /authoritative_elementary:\s*True/.test(text) || /audit:\s*pass/.test(text)) cls="l-ok";
+  else if(/^status:\s*(rejected|candidate_incomplete|audited_not_certified)\s*$/.test(text) || /NOT PROVEN/.test(text) || /authoritative_elementary:\s*False/.test(text) || /failed|error|ERROR/.test(text)) cls="l-bad";
+  else if(/^(terminal Layer-4|dag:|orchestrator search\/review calls spent|trace events)/.test(text)) cls="l-key";
   if(cls) div.className = cls;
   div.textContent = text;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
 }
 function setState(label, kind){ const b=$("b-state"); b.textContent=label; b.className="badge"+(kind?" "+kind:""); }
-function parseBadges(text){
+const STATUS_BADGES = Object.freeze({
+  rejected: ["rejected", "off"],
+  candidate_incomplete: ["candidate incomplete", "off"],
+  soft_proven: ["soft proven", "on"],
+  audited_not_certified: ["audited, not certified", "off"],
+  authoritative_elementary: ["authoritative elementary", "on"],
+});
+function parseBadges(text, run){
   let m;
-  if((m = text.match(/^result:\s*(PROVEN|NOT PROVEN)/))) setState(m[1], m[1]==="PROVEN"?"on":"off");
-  if((m = text.match(/authoritative_elementary:\s*(True|False)/))){
-    const ok=m[1]==="True", b=$("b-auth"); b.style.display="";
-    b.textContent="certified-elementary: "+(ok?"yes":"no"); b.className="badge "+(ok?"on":"off");
+  // The CLI's categorical status is pending until the terminal SSE event confirms exit 0.  An
+  // earlier `result: PROVEN` is search output, not final transport authority.
+  if((m = text.match(/^status:\s*(rejected|candidate_incomplete|soft_proven|audited_not_certified|authoritative_elementary)\s*$/))){
+    run.reportStatus=m[1];
   }
-  if((m = text.match(/calls spent:\s*([\d/]+)/))){ const b=$("b-calls"); b.style.display=""; b.textContent="calls "+m[1]; }
+  if((m = text.match(/^authoritative_elementary:\s*(True|False)\s*$/))){
+    // This line is a pending claim until the same stream terminates successfully and its categorical
+    // status agrees. Rendering "yes" here would let a truncated/failed transport look certified.
+    run.authorityClaim=m[1]==="True";
+  }
+  if((m = text.match(/^orchestrator search\/review calls spent:\s*(\d+\/\d+)\s*$/))){
+    const b=$("b-calls"); b.style.display=""; b.textContent="calls "+m[1];
+  }
+}
+function markIncomplete(label){
+  setState(label, "off");
+  const auth=$("b-auth");
+  if(auth.style.display !== "none"){
+    auth.textContent="certification incomplete"; auth.className="badge off";
+  }
+}
+function applyDoneStatus(value, run){
+  const terminal=String(value || "").trim().toLowerCase();
+  const exit=terminal.match(/^exit\s+(\d+)$/);
+  if(exit && Number(exit[1]) === 0){
+    const presentation=STATUS_BADGES[run.reportStatus];
+    if(presentation) setState(presentation[0], presentation[1]);
+    else setState("complete", ""); // completed transport, but no categorical proof status observed
+    if(run.authorityClaim !== null && run.authorityClaim !== undefined){
+      const ok=run.authorityClaim === true && run.reportStatus === "authoritative_elementary";
+      const b=$("b-auth"); b.style.display="";
+      b.textContent="certified-elementary: "+(ok?"yes":"no");
+      b.className="badge "+(ok?"on":"off");
+    }
+    return;
+  }
+  if(run.authorityClaim !== null && run.authorityClaim !== undefined) $("b-auth").style.display="";
+  if(exit) markIncomplete(`failed (exit ${exit[1]})`);
+  else if(terminal === "cancelled") markIncomplete("cancelled (incomplete)");
+  else if(terminal === "error") markIncomplete("failed");
+  else markIncomplete("incomplete");
 }
 
-function start(path){
-  if(es) es.close();
-  log.textContent=""; finished=false;
+function handleEvent(block, run){
+  if(currentRun !== run) return; // stale chunks from an aborted run cannot mutate a newer run's UI
+  let type = "message";
+  const data = [];
+  for(const line of block.split(/\r?\n/)){
+    if(line.startsWith("event:")) type = line.slice(6).trim();
+    else if(line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  if(!data.length) return;
+  const value = data.join("\n");
+  if(type === "done") { run.finished=true; applyDoneStatus(value, run); finish(run); return; }
+  addLine(value); parseBadges(value, run);
+}
+
+async function start(){
+  if(currentRun) currentRun.controller.abort();
+  log.textContent="";
   $("b-auth").style.display="none"; $("b-calls").style.display="none";
   $("run").disabled=true; $("stop").disabled=false; setState("running","run");
-  es = new EventSource(path);
-  es.onmessage = ev => { addLine(ev.data); parseBadges(ev.data); };
-  es.addEventListener("done", () => { finished=true; finish(); });
-  es.onerror = () => { if(!finished){ addLine("[ui] stream closed"); finish(); } };
+  const run = {id:crypto.randomUUID(), controller:new AbortController(), finished:false,
+               reportStatus:null, authorityClaim:null};
+  currentRun = run;
+  const payload = Object.fromEntries(params());
+  payload.run_id = run.id;
+  try {
+    const response = await fetch("/run", {
+      method: "POST",
+      headers: {"Content-Type":"application/json", "X-MathAgent-CSRF":CSRF_TOKEN},
+      body: JSON.stringify(payload), signal: run.controller.signal,
+    });
+    if(!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let buffer = "";
+    while(true){
+      const {value, done} = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), {stream: !done}).replace(/\r\n/g, "\n");
+      let end;
+      while((end = buffer.indexOf("\n\n")) >= 0){
+        handleEvent(buffer.slice(0, end), run); buffer = buffer.slice(end + 2);
+      }
+      if(done) break;
+    }
+    if(!run.finished && currentRun === run){
+      addLine("[ui] stream closed before a terminal event");
+      run.finished=true; applyDoneStatus("incomplete", run); finish(run);
+    }
+  } catch(err) {
+    if(!run.finished && currentRun === run){
+      run.finished=true;
+      if(err.name === "AbortError") applyDoneStatus("cancelled", run);
+      else { addLine("[ui] " + err.message); applyDoneStatus("error", run); }
+    }
+    finish(run);
+  }
 }
-function finish(){
-  if(es){ es.close(); es=null; }
+function finish(run){
+  // An old aborted fetch may settle after a newer run starts.  Never let that stale completion clear
+  // the new run's controller/buttons.
+  if(currentRun !== run) return;
+  currentRun=null;
   $("run").disabled=false; $("stop").disabled=true;
-  if($("b-state").className==="badge run") setState("idle","");
+  if($("b-state").className==="badge run") markIncomplete("incomplete");
 }
 
 $("run").addEventListener("click", () => {
   if(!$("goal").value.trim()){ $("goal").focus(); return; }
-  start("/run?" + params().toString());
+  start();
 });
-$("stop").addEventListener("click", () => { addLine("[ui] stopped by user"); finish(); });
+$("stop").addEventListener("click", async () => {
+  const run = currentRun;
+  if(!run) return;
+  $("stop").disabled=true;
+  try {
+    await fetch("/stop", {
+      method:"POST", headers:{"Content-Type":"application/json", "X-MathAgent-CSRF":CSRF_TOKEN},
+      body:JSON.stringify({run_id:run.id}),
+    });
+  } catch(_) { /* aborting the stream below still triggers heartbeat-based server cleanup */ }
+  run.controller.abort();
+  if(currentRun === run){
+    addLine("[ui] stopped by user");
+    run.finished=true; applyDoneStatus("cancelled", run); finish(run);
+  }
+});
 $("goal").addEventListener("keydown", e => { if((e.ctrlKey||e.metaKey) && e.key==="Enter") $("run").click(); });
 </script>
 </body>

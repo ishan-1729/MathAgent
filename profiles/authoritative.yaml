@@ -3,8 +3,8 @@
 # elementarity=authoritative wires the terminal Layer-4 gate (formalize -> Lean audit -> faithfulness)
 # AND, with lean.per_node, Lean-verifies every leaf + AND-composition per node so LEAN_VERIFIED is
 # reachable. Requires a reachable Lean REPL (`lake build repl`) and a resolvable formalizer — the
-# supervisor (S1/S2) fails CLOSED before any model/Lean call if either is missing. DAG mode only
-# (mode=direct + authoritative is rejected by S5).
+# supervisor (S1/S2) fails CLOSED before any model/Lean call if either is missing. This preset uses
+# DAG mode; direct authoritative profiles are also valid when DAG-only stages are disabled.
 name: authoritative
 notes: "authoritative: terminal Layer-4 gate + per-node Lean. Needs a built Lean REPL."
 mode: dag

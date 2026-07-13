@@ -15,7 +15,7 @@ from agent.orchestrator.tournament import (
 )
 from agent.orchestrator.run_profile import ProviderKey, Role, RoleSpec
 from agent.orchestrator.registry import (
-    Deps, PROVIDERS, RegistryError, register, resolve,
+    Deps, PROVIDERS, RegistryError, register, resolve, resolution_of,
 )
 
 
@@ -54,9 +54,12 @@ def test_scripted_reviewer_conforms_and_accepts():
 
 
 def test_scripted_comparator_and_judge_conform():
+    from agent.orchestrator.driver import Judge
+
     comp = resolve(Role.comparator, RoleSpec(provider=ProviderKey.scripted), _deps())
     judge = resolve(Role.judge, RoleSpec(provider=ProviderKey.scripted), _deps())
-    assert isinstance(comp, Comparator) and isinstance(judge, Comparator)
+    assert isinstance(comp, Comparator) and isinstance(judge, Judge)
+    assert judge.review(object()).passed
 
 
 def test_scripted_formalizer_conforms():
@@ -99,7 +102,7 @@ def test_scripted_is_the_default_for_an_explicit_test_profile():
 
 def test_claude_provider_returns_claude_classes():
     from agent.tools.claude_roles import (
-        ClaudeProver, ClaudeDecomposer, ClaudeReviewer, ClaudeComparator, ClaudeJudge,
+        ClaudeProver, ClaudeDecomposer, ClaudeReviewer, ClaudeComparator, ClaudeLedgerJudge,
         ClaudeFaithfulnessChecker,
     )
     from agent.tools.formalizer import ClaudeFormalizer
@@ -109,7 +112,7 @@ def test_claude_provider_returns_claude_classes():
     assert isinstance(resolve(Role.decomposer, RoleSpec(provider=ProviderKey.claude), d), ClaudeDecomposer)
     assert isinstance(resolve(Role.reviewer, RoleSpec(provider=ProviderKey.claude), d), ClaudeReviewer)
     assert isinstance(resolve(Role.comparator, RoleSpec(provider=ProviderKey.claude), d), ClaudeComparator)
-    assert isinstance(resolve(Role.judge, RoleSpec(provider=ProviderKey.claude), d), ClaudeJudge)
+    assert isinstance(resolve(Role.judge, RoleSpec(provider=ProviderKey.claude), d), ClaudeLedgerJudge)
     assert isinstance(resolve(Role.formalizer, RoleSpec(provider=ProviderKey.claude), d), ClaudeFormalizer)
     assert isinstance(resolve(Role.faithfulness, RoleSpec(provider=ProviderKey.claude), d),
                       ClaudeFaithfulnessChecker)
@@ -147,7 +150,7 @@ def test_claude_refiner_is_a_real_controller():
 
 def test_codex_provider_returns_codex_classes():
     from agent.tools.codex_prover import (
-        CodexProver, CodexDecomposer, CodexReviewer, CodexComparator, CodexSolutionComparator,
+        CodexProver, CodexDecomposer, CodexReviewer, CodexComparator, CodexLedgerJudge,
         CodexFaithfulnessChecker,
     )
     from agent.tools.formalizer import CodexFormalizer
@@ -158,7 +161,7 @@ def test_codex_provider_returns_codex_classes():
     assert isinstance(resolve(Role.reviewer, RoleSpec(provider=ProviderKey.codex), d), CodexReviewer)
     assert isinstance(resolve(Role.comparator, RoleSpec(provider=ProviderKey.codex), d), CodexComparator)
     assert isinstance(resolve(Role.judge, RoleSpec(provider=ProviderKey.codex), d),
-                      CodexSolutionComparator)
+                      CodexLedgerJudge)
     assert isinstance(resolve(Role.formalizer, RoleSpec(provider=ProviderKey.codex), d), CodexFormalizer)
     assert isinstance(resolve(Role.faithfulness, RoleSpec(provider=ProviderKey.codex), d),
                       CodexFaithfulnessChecker)
@@ -175,6 +178,11 @@ def test_codex_refiner_is_a_real_controller():
     from agent.tools.codex_prover import CodexCritic
     assert isinstance(c, RevisionController)
     assert isinstance(c.critic, CodexCritic)
+    metadata = resolution_of(c)
+    assert metadata is not None
+    assert metadata["provider"] == "codex"
+    assert metadata["model"] == c.critic.cfg.model
+    assert metadata["effort"] == c.critic.cfg.reasoning_effort
 
 
 # --- registry mechanics --------------------------------------------------------------------------
@@ -183,6 +191,31 @@ def test_resolve_defaults_deps_when_none():
     # Scripted ignores deps, so resolve(..., None) must still work.
     c = resolve(Role.prover, RoleSpec(provider=ProviderKey.scripted))
     assert isinstance(c, Prover)
+
+
+def test_resolve_selects_reachable_fallback_provider(monkeypatch):
+    from agent.orchestrator import supervisor
+    from agent.tools.codex_prover import CodexProver
+
+    monkeypatch.setattr(
+        supervisor,
+        "_provider_available",
+        lambda provider: provider is ProviderKey.codex,
+    )
+    component = resolve(
+        Role.prover,
+        RoleSpec(provider=ProviderKey.claude, fallback=ProviderKey.codex),
+        _deps(),
+    )
+    assert isinstance(component, CodexProver)
+    assert resolution_of(component) == {
+        "role": "prover",
+        "provider": "codex",
+        "model": component.cfg.model,
+        "effort": component.cfg.reasoning_effort,
+        "timeout_s": component.cfg.timeout_s,
+        "fallback_selected": True,
+    }
 
 
 def test_unregistered_pair_raises():

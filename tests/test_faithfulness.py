@@ -1,4 +1,6 @@
 """Tests for the adversarial statement-faithfulness panel (model-agnostic aggregation)."""
+import pytest
+
 from agent.orchestrator.faithfulness import (
     SingleVerdict, adversarial_check, PanelFaithfulnessChecker, ScriptedFaithfulnessChecker,
     DEFAULT_LENSES,
@@ -68,3 +70,25 @@ def test_raising_judge_counts_as_unfaithful_and_does_not_propagate():
 def test_raising_judge_through_panel_checker():
     chk = PanelFaithfulnessChecker(_judge_one_raises)
     assert not chk.check("c", "l", "t").faithful  # crash must not propagate or pass
+
+
+def test_malformed_or_mislabeled_judge_vote_fails_closed():
+    malformed = PanelFaithfulnessChecker(lambda *_args: {"faithful": True}, lenses=["strength"])
+    verdict = malformed.check("claim", "source", "theorem")
+    assert not verdict.faithful and "SingleVerdict" in verdict.issues[0]
+
+    mislabeled = PanelFaithfulnessChecker(
+        lambda *_args: SingleVerdict("vacuity", True), lenses=["strength"])
+    verdict = mislabeled.check("claim", "source", "theorem")
+    assert not verdict.faithful and "unexpected lens" in verdict.issues[0]
+
+    truthy_string = PanelFaithfulnessChecker(
+        lambda *_args: SingleVerdict("strength", "false"), lenses=["strength"])
+    verdict = truthy_string.check("claim", "source", "theorem")
+    assert not verdict.faithful and verdict.n_unfaithful == 1
+
+
+@pytest.mark.parametrize("value", [-1, 1, 4, True, 0.5])
+def test_panel_rejects_invalid_or_vacuously_permissive_tolerance(value):
+    with pytest.raises(ValueError, match="max_unfaithful"):
+        PanelFaithfulnessChecker(_judge_all_faithful, lenses=["only"], max_unfaithful=value)

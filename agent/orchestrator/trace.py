@@ -46,6 +46,19 @@ class RunTrace:
     def write_jsonl(self, path: str | Path) -> None:
         Path(path).write_text(self.to_jsonl() + "\n", encoding="utf-8")
 
+    def _event_summary(self) -> str:
+        """One-line event summary derived from the ACTUAL stream: total count + per-kind counts for the
+        kinds actually present, in first-seen order. (Earlier this hardcoded a fixed
+        prove/gate/judge/final line from the retired FlatDriver era — no driver emits a bare 'gate'
+        event, and the production DagDriver's vocabulary is prove_node/decompose/population/node_lean/
+        terminal_gate/..., so a rendered DagDriver run under-reported and 'gate' was structurally 0.)"""
+        counts: dict[str, int] = {}
+        for e in self.events:
+            counts[e.kind] = counts.get(e.kind, 0) + 1
+        if not counts:
+            return "0 events"
+        return f"{len(self.events)} events; " + ", ".join(f"{k}={n}" for k, n in counts.items())
+
     # --- rendered view ---
     def render_run_record(self, fields: dict[str, Any]) -> str:
         """Render a markdown run record (mirrors run_record_TEMPLATE.md headings)."""
@@ -64,15 +77,13 @@ class RunTrace:
             f"## Papers or systems referenced\n{f.get('papers', '')}",
             f"## Attempt summary\n{f.get('summary', '')}",
             f"## Proof status\n{f.get('proof_status', '')}",
-            f"## Lean status\n{f.get('lean_status', 'n/a (advisory in v1)')}",
+            f"## Lean status\n{f.get('lean_status', 'n/a (no Layer-4 audit recorded)')}",
             f"## Metric scores\n{f.get('scores', 'gate-pending')}",
             f"## Notes\n{f.get('notes', '')}",
             f"## Next action\n{f.get('next_action', '')}",
             "",
             "## Trace (events)",
             "```",
-            f"{len(self.events)} events; "
-            f"prove={len(self.by_kind('prove'))}, gate={len(self.by_kind('gate'))}, "
-            f"judge={len(self.by_kind('judge'))}, final={len(self.by_kind('final'))}",
+            self._event_summary(),
             "```",
         ])

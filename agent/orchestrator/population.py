@@ -12,7 +12,7 @@ cheap pairwise LLM-judge comparisons, then resamples promising ones. This module
                          the Plackett-Luce analog, more stable than incremental Elo for a batch.
 
 All deterministic given the comparator and pairing order (default: round-robin), so it is fully
-testable offline with a scripted/keyed comparator; the live `Comparator` is Codex-backed.
+testable offline with a scripted/keyed comparator; live comparators are resolved from the run profile.
 
 .. note::
 

@@ -18,7 +18,12 @@ mutation gates PASSED (1.0). (The stub's own ``.calls`` counter lives in worker-
 the process pool, so it cannot be asserted from the main process — we assert on the RESULT instead.)
 """
 import json
+import os
 import pickle
+import sys
+import threading
+import time
+import types
 
 import pytest
 
@@ -134,9 +139,12 @@ def test_gate_evaluator_scores_good_ledger_passed_band(tmp_path, toolkit):
 
 
 def test_gate_evaluator_goal_binding_zeroes_off_goal(tmp_path, toolkit):
-    # The HARD goal-binding gate: minimal_ledger()'s conclusion is "The theorem.", NOT the goal, so
-    # binding fails -> combined_score is a HARD zero even though it gates PASSED structurally.
-    path = _write(tmp_path, _good_ledger_text())
+    # The HARD external binding gate: use an internally consistent, structurally valid ledger for a
+    # different theorem. It must score zero for the requested goal.
+    off_goal = json.loads(_good_ledger_text())
+    off_goal["claim"] = "A different theorem."
+    off_goal["steps"][-1]["claim"] = "A different theorem."
+    path = _write(tmp_path, json.dumps(off_goal))
     metrics = make_gate_evaluator(toolkit, goal="A demo theorem.")(path)
     assert metrics["combined_score"] == 0.0
     assert metrics["goal_bound"] == 0.0
@@ -221,6 +229,35 @@ def test_poison_claim_ledger_gates_without_side_effect(tmp_path, toolkit):
     assert isinstance(metrics["combined_score"], float)
     assert 0.0 <= metrics["combined_score"] <= 1.0
     assert not os.path.exists(marker)  # the claim string was NEVER executed
+
+
+def test_evolved_ledger_file_read_is_bounded(tmp_path, toolkit, monkeypatch):
+    import agent.tools.openevolve_bridge as bridge
+
+    path = tmp_path / "oversized-ledger.json"
+    path.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+    called = {"score": False}
+
+    def _forbidden(*_args, **_kwargs):
+        called["score"] = True
+        raise AssertionError("oversized evolved artifact reached the ledger parser")
+
+    monkeypatch.setattr(bridge, "score_ledger", _forbidden)
+    metrics = bridge.make_gate_evaluator(toolkit)(str(path))
+    assert metrics["combined_score"] == 0.0
+    assert called["score"] is False
+
+
+def test_serialized_evaluators_reject_oversized_artifacts(tmp_path):
+    from agent.tools.openevolve_bridge import gate_ledger_evaluator, witness_spec_evaluator
+
+    ledger = tmp_path / "large-ledger"
+    ledger.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+    assert gate_ledger_evaluator(str(ledger))["combined_score"] == 0.0
+
+    spec = tmp_path / "large-spec"
+    spec.write_bytes(b"x" * (256 * 1024 + 1))
+    assert witness_spec_evaluator(str(spec))["combined_score"] == 0.0
 
 
 def test_stub_llm_is_deterministic_and_not_openevolve_subclass():
@@ -418,6 +455,99 @@ def test_unavailable_when_openevolve_missing(monkeypatch):
         evolve_sketches("g", load_toolkit())
 
 
+def test_multiple_sketch_seeds_are_never_concatenated_as_code_lines(monkeypatch, toolkit):
+    """The upstream list contract joins lines; the bridge must pass one complete JSON program."""
+    import types
+    import agent.tools.openevolve_bridge as bridge
+    first = _goal_bound_good_ledger_text("multi-seed contract goal")
+    second = _goal_bound_good_ledger_text("a distinct second goal")
+    captured = {}
+    monkeypatch.setattr(bridge, "_require_openevolve", lambda: None)
+    monkeypatch.setattr(bridge, "build_evolve_config", lambda **_kwargs: object())
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(best_code=kwargs["initial_program"], best_score=0.0, metrics={})
+
+    monkeypatch.setattr(bridge, "_run_openevolve", fake_run)
+    bridge.evolve_sketches(
+        "multi-seed contract goal", toolkit, seed_sketches=[first, second], iterations=1)
+    assert captured["initial_program"] == first
+    assert isinstance(captured["initial_program"], str)
+    assert second not in captured["initial_program"]
+
+
+def test_multiple_witness_seeds_are_never_concatenated_as_code_lines(monkeypatch):
+    import types
+    import agent.tools.openevolve_bridge as bridge
+    first = json.dumps({"kind": "residue_cover", "modulus": 2, "residues": [0]})
+    second = json.dumps({"kind": "residue_cover", "modulus": 3, "residues": [0, 1]})
+    captured = {}
+    monkeypatch.setattr(bridge, "_require_openevolve", lambda: None)
+    monkeypatch.setattr(bridge, "build_evolve_config", lambda **_kwargs: object())
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(best_code=kwargs["initial_program"], best_score=0.0, metrics={})
+
+    monkeypatch.setattr(bridge, "_run_openevolve", fake_run)
+    bridge.evolve_witnesses("g", seed_specs=[first, second], iterations=1)
+    assert captured["initial_program"] == first
+    assert isinstance(captured["initial_program"], str)
+    assert second not in captured["initial_program"]
+
+
+def test_evolution_goal_environment_is_serialized_and_restored(monkeypatch):
+    import agent.tools.openevolve_bridge as bridge
+    active = 0
+    max_active = 0
+    observations = []
+    state_lock = threading.Lock()
+
+    def run_evolution(**kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            observations.append((kwargs["initial_program"],
+                                 os.environ.get("MATHAGENT_EVOLVE_GOAL")))
+        time.sleep(0.04)
+        with state_lock:
+            active -= 1
+        if kwargs["initial_program"] == "boom":
+            raise RuntimeError("evolution failed")
+        return kwargs["initial_program"]
+
+    fake_api = types.ModuleType("openevolve.api")
+    fake_api.run_evolution = run_evolution
+    monkeypatch.setitem(sys.modules, "openevolve.api", fake_api)
+    monkeypatch.setenv("MATHAGENT_EVOLVE_GOAL", "preexisting")
+    results = []
+
+    def run(program, goal):
+        results.append(bridge._run_openevolve(
+            initial_program=program, evaluator=object(), config=object(), iterations=1,
+            output_dir=None, goal=goal))
+
+    threads = [threading.Thread(target=run, args=("seed-a", "goal-a")),
+               threading.Thread(target=run, args=("seed-b", "goal-b"))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 1
+    assert set(observations) == {("seed-a", "goal-a"), ("seed-b", "goal-b")}
+    assert os.environ["MATHAGENT_EVOLVE_GOAL"] == "preexisting"
+
+    with pytest.raises(RuntimeError, match="evolution failed"):
+        bridge._run_openevolve(
+            initial_program="boom", evaluator=object(), config=object(), iterations=1,
+            output_dir=None, goal="goal-error")
+    assert os.environ["MATHAGENT_EVOLVE_GOAL"] == "preexisting"
+
+
 # ---- live (opt-in): a real short evolution PROVES the loop executes (no Claude subprocess) -----
 
 def test_live_evolution_actually_runs_and_improves_seed(toolkit):
@@ -530,6 +660,27 @@ def test_evolve_prove_unavailable_when_openevolve_missing(monkeypatch, toolkit):
     from agent.tools.openevolve_bridge import evolve_prove
     with pytest.raises(RuntimeError, match="pip install mathagent\\[evolve\\]"):
         evolve_prove("g", toolkit, iterations=1)
+
+
+def test_evolve_prove_threads_profile_ensemble_controls(monkeypatch, toolkit):
+    import agent.tools.openevolve_bridge as oe
+
+    goal = "A demo theorem."
+    seen = {}
+
+    def fake_evolve(_goal, _toolkit, **kwargs):
+        seen.update(kwargs)
+        return _goal_bound_good_ledger_text(goal), PASSED_FLOOR, {}
+
+    monkeypatch.setattr(oe, "evolve_sketches", fake_evolve)
+    oe.evolve_prove(
+        goal, toolkit, breadth_model="fast-custom", depth_model="deep-custom",
+        breadth_weight=0.35, depth_weight=0.65,
+    )
+    assert seen["breadth_model"] == "fast-custom"
+    assert seen["depth_model"] == "deep-custom"
+    assert seen["breadth_weight"] == 0.35
+    assert seen["depth_weight"] == 0.65
 
 
 def test_evolve_prove_returns_accepted_champion_for_goal_bound_passed(toolkit):

@@ -7,11 +7,12 @@ children may each be valid *locally* yet rest on *contradictory* hypotheses, var
 different versions of a shared lemma. Composing them then proves nothing globally: there is no single
 consistent world in which all the children hold at once.
 
-The category-theory shadow (optional label): "agreement on overlaps" is the **0-cocycle condition**;
-when it holds a **global section exists** (H0 is nonempty) and the composition is sound; when it fails
-there is a **0-cocycle violation** (no global section) and the parent must NOT be promoted — route to
-review / mark FAILED_ELEMENTARY (reason `elementary_violation`). The operational content is what
-matters: a concrete **signature-compatibility check**.
+The category-theory shadow (optional label): "agreement on overlaps" is the **0-cocycle condition**.
+Operationally this module is a mandatory **signature-compatibility guard**, not a complete logical
+decision procedure: a pass means the extracted signature language found no conflict, never that
+arbitrary prose hypotheses have been formally proved jointly satisfiable. A detected violation blocks
+promotion and is marked FAILED_GAP (a logical inconsistency, never an elementarity failure). Terminal
+Lean remains the authority for formal certification.
 
 What we extract from each child's proven ledger as its *signature*:
   * **assumptions / hypotheses** — the claims of `given`/`assumption` steps (the world the child rests
@@ -24,12 +25,11 @@ A conflict on an *overlap* (the same subject/symbol/lemma key constrained two in
 different children) is the violation. We name the conflicting overlap so the give-up is classified, not
 silent.
 
-ANTI-VACUITY (the Forge "running 0 tests fails loud" trap): a consistency check that inspected NOTHING
-— no children, or children whose proofs do not parse / carry no extractable signature at all — must NOT
-vacuously pass. `check_children_consistency` returns `consistent=False` with reason `vacuous_check` in
-that case (the caller treats a vacuous inspection as a non-promotion, never a silent OK). A genuinely
-empty-but-inspectable signature set (children that parsed and were inspected, finding nothing to
-conflict) DOES pass — vacuity is "inspected nothing", not "found nothing".
+ANTI-VACUITY (the Forge "running 0 tests fails loud" trap): a consistency check must inspect EVERY
+child proof. No children yields `vacuous_check`; any missing, unparseable, or stepless child yields
+`incomplete_check`. Neither can silently pass. A genuinely empty-but-inspectable signature set
+(children that parsed and were inspected, finding nothing to conflict) DOES pass — vacuity is
+"inspected nothing", not "found nothing".
 
 Everything here is deterministic and prover-independent. It never execs/evals/imports model output.
 """
@@ -51,7 +51,7 @@ _ASSUMPTION_JUSTIFICATIONS = frozenset({"given", "assumption", "hypothesis", "as
 class Conflict:
     """One concrete 0-cocycle violation: two children disagree on a shared overlap."""
 
-    kind: str                 # "binding" | "predicate" | "lemma_signature"
+    kind: str                 # "binding" | "predicate" | "relation" | "lemma_signature"
     subject: str              # the overlapping symbol / lemma key the children disagree on
     left_child: str           # a child goal (the first asserting side)
     right_child: str          # the conflicting sibling
@@ -73,14 +73,14 @@ class ChildSignature:
     bindings: dict[str, str] = field(default_factory=dict)  # symbol -> canonical value ("x" -> "0")
     predicates: dict[str, str] = field(default_factory=dict)  # subject -> canonical predicate ("n" -> "even")
     lemma_sigs: dict[str, str] = field(default_factory=dict)  # (relation@subjects) -> canonical statement
-    # subjects-bucket -> {relation tokens asserted about that subject set}. Keyed by SUBJECTS ONLY so a
-    # cross-relation contradiction on the same subjects (e.g. 'g<h' vs 'g>h') is checkable, while a
-    # COMPATIBLE pair of independent relations ('g<h' vs 'g|h') is NOT keyed together (V4 fix).
+    # subjects-bucket -> {normalized relation tokens asserted about that operand/subject set}. This
+    # includes comparison assumptions as well as lemma steps, so `x > 0` vs `x <= 0` cannot evade H0.
+    # Ordered comparisons are normalized to a stable operand orientation (`g<h` == `h>g`).
     lemma_relations: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def has_content(self) -> bool:
-        return bool(self.bindings or self.predicates or self.lemma_sigs)
+        return bool(self.bindings or self.predicates or self.lemma_sigs or self.lemma_relations)
 
     @property
     def inspectable(self) -> bool:
@@ -93,7 +93,7 @@ class ChildSignature:
 class H0Result:
     consistent: bool
     conflicts: list[Conflict] = field(default_factory=list)
-    reason: Optional[str] = None          # None on a real pass; "vacuous_check" / "conflict" otherwise
+    reason: Optional[str] = None          # None or "vacuous_check" / "incomplete_check" / "conflict"
     inspected_children: int = 0           # how many child signatures were actually inspected
     overlaps_checked: int = 0             # how many shared subjects/lemmas were compared (anti-vacuity)
 
@@ -107,6 +107,9 @@ class H0Result:
                     f"{self.overlaps_checked} overlaps checked)")
         if self.reason == "vacuous_check":
             return "VACUOUS: no child signature could be inspected (fails loud, not a pass)"
+        if self.reason == "incomplete_check":
+            return ("INCOMPLETE: one or more child signatures could not be inspected "
+                    "(fails closed, not a pass)")
         return "H0 VIOLATION: " + "; ".join(str(c) for c in self.conflicts)
 
 
@@ -123,13 +126,11 @@ _PREDICATE_RE = re.compile(
 
 # Mutually-exclusive predicate families: asserting two DIFFERENT members of a family about the SAME
 # subject (e.g. n even vs n odd) is a contradiction. Negation ("not even") is folded into the family.
-# open/closed (topology) is a genuine mutually-exclusive pair for a fixed set, so a sibling assuming a
-# set is open while another assumes it closed is a 0-cocycle violation (it is NOT generally true that a
-# set is clopen). These families are reused for the lemma-relation conflict check (_RELATION_FAMILIES).
+# Only pairs that cannot simultaneously hold belong here. In particular, open/closed is intentionally
+# absent: clopen sets exist, so treating those properties as exclusive rejects valid compositions.
 _EXCLUSIVE_FAMILIES = [
     {"even", "odd"},
     {"prime", "composite"},
-    {"open", "closed"},
     {"positive", "negative", "zero"},
     {"rational", "irrational"},
     {"finite", "infinite"},
@@ -169,6 +170,21 @@ def _norm_pred(value: str, negated: bool) -> str:
     return f"not:{v}" if negated else v
 
 
+def _predicate_signature(claim: str) -> Optional[tuple[str, str, str]]:
+    """Normalize a single-subject predicate, including negation and phrasing variants.
+
+    For example, ``n is not even`` becomes ``("n", "not:even", "n:not:even")`` and
+    ``n is an even number`` becomes ``("n", "even", "n:even")``. Keeping negation in the relation
+    token is essential: ``not even`` is compatible with ``odd`` but conflicts with ``even``.
+    """
+    match = _PREDICATE_RE.fullmatch(claim.strip())
+    if match is None:
+        return None
+    subject = match.group(1).lower()
+    relation = _norm_pred(match.group(3), bool(match.group(2)))
+    return subject, relation, f"{subject}:{relation}"
+
+
 def _family_of(pred: str) -> Optional[frozenset[str]]:
     base = pred[4:] if pred.startswith("not:") else pred
     base = _canon_member(base)
@@ -205,9 +221,8 @@ def _predicates_conflict(a: str, b: str) -> bool:
 def extract_signature(goal: str, proof: Optional[str]) -> ChildSignature:
     """Extract the compatibility-relevant signature from a child's proof ledger (text/JSON/sketch).
 
-    A proof that does not parse yields an *un-parsed* signature (`parsed=False`, no content) — the
-    anti-vacuity logic in `check_children_consistency` treats an all-unparsed child set as a vacuous
-    (fail-loud) inspection rather than a pass."""
+    A proof that does not parse yields an *un-parsed* signature (`parsed=False`, no content). The
+    fail-closed logic in `check_children_consistency` rejects any composition containing one."""
     sig = ChildSignature(goal=goal)
     if not proof:
         return sig
@@ -229,7 +244,15 @@ def extract_signature(goal: str, proof: Optional[str]) -> ChildSignature:
             # separately via `lemma_relations` (mutually-exclusive relation families), not by key.
             subjects = _lemma_subjects(claim)
             relation = _lemma_relation(claim, subjects)
-            sig.lemma_sigs[f"{relation}@{subjects}"] = canonical_form(claim)
+            comparison = _comparison_signature(claim)
+            predicate = _predicate_signature(claim)
+            if comparison is not None:
+                normalized_claim = comparison[2]
+            elif predicate is not None:
+                normalized_claim = predicate[2]
+            else:
+                normalized_claim = canonical_form(claim)
+            sig.lemma_sigs[f"{relation}@{subjects}"] = normalized_claim
             sig.lemma_relations.setdefault(subjects, set()).add(relation)
             continue
         if step.justification in _ASSUMPTION_JUSTIFICATIONS:
@@ -261,21 +284,53 @@ _RELATION_WORDS = frozenset({
 # The canonical form already folds 'divides'->'|', 'less than'->'<', 'equals'->'=' etc.
 _RELATION_OPERATORS = ("<=", ">=", "!=", "<->", "->", "<", ">", "=", "|")
 
-# MUTUALLY-EXCLUSIVE relation families (V4): two DIFFERENT relations on the SAME subjects conflict ONLY
-# when they are distinct members of one of these families. The order/equality family is an exclusion
-# group (g<h and g>h cannot both hold; g<h and g=h cannot both hold). Divisibility ('|') and coprimality
-# are INDEPENDENT relations — they share NO family with order/equality, so 'g<h' vs 'g|h' do NOT conflict
-# (the V4 false positive). Property families (prime/composite, even/odd, ...) reuse _EXCLUSIVE_FAMILIES
-# so a family-word lemma ('g is prime' vs 'g is composite') still conflicts.
-_RELATION_FAMILIES = [
-    {"<", ">", "=", "<=", ">=", "!="},     # order/equality trichotomy — mutually exclusive
-] + [set(fam) for fam in _EXCLUSIVE_FAMILIES]
+# A comparison token denotes the possible outcomes of ``left ? right`` after normalizing both claims
+# to the SAME stable operand orientation. Compatibility is set intersection, not "different operator
+# means conflict": `<` is compatible with `<=`, and `<=` with `>=` at equality. This also makes the
+# contradiction `<` vs `>=` exact rather than heuristic.
+_ORDER_OUTCOMES = {
+    "<": frozenset({-1}),
+    "<=": frozenset({-1, 0}),
+    "=": frozenset({0}),
+    "!=": frozenset({-1, 1}),
+    ">=": frozenset({0, 1}),
+    ">": frozenset({1}),
+}
+_INVERT_ORDER = {"<": ">", "<=": ">=", "=": "=", "!=": "!=", ">=": "<=", ">": "<"}
+_ATOMIC_TERM = r"(?:[A-Za-z][A-Za-z0-9_]*|[+-]?\d+(?:\.\d+)?)"
+_COMPARISON_RE = re.compile(
+    rf"^(?P<left>{_ATOMIC_TERM})(?P<op><=|>=|!=|=|<|>)(?P<right>{_ATOMIC_TERM})$")
+
+
+def _comparison_signature(claim: str) -> Optional[tuple[str, str, str]]:
+    """Return ``(operand_key, normalized_relation, normalized_claim)`` for an atomic comparison.
+
+    The canonical operand order is lexical and the relation is inverted when operands are swapped.
+    Thus ``g < h`` and ``h > g`` both become ``("g|h", "<", "g<h")``. Restricting this parser to
+    atomic identifiers/numbers avoids guessing about algebraically complex expressions; an unsupported
+    form conservatively misses a conflict instead of manufacturing a false one.
+    """
+    match = _COMPARISON_RE.fullmatch(canonical_form(claim))
+    if match is None:
+        return None
+    left, op, right = match.group("left"), match.group("op"), match.group("right")
+    if right < left:
+        left, right = right, left
+        op = _INVERT_ORDER[op]
+    key = f"{left}|{right}"
+    return key, op, f"{left}{op}{right}"
 
 
 def _lemma_subjects(claim: str) -> str:
     """The sorted SUBJECT identifier tokens of a lemma (the symbols it is about), with connective AND
     relation/family words stripped. Two siblings citing a lemma about the same subjects share this
     bucket regardless of the relation, so a cross-relation contradiction on those subjects is checkable."""
+    comparison = _comparison_signature(claim)
+    if comparison is not None:
+        return comparison[0]
+    predicate = _predicate_signature(claim)
+    if predicate is not None:
+        return predicate[0]
     toks = re.findall(r"[A-Za-z][A-Za-z0-9_]*", claim.lower())
     subjects = sorted({t for t in toks
                        if t not in _LEMMA_CONNECTIVES
@@ -289,6 +344,12 @@ def _lemma_relation(claim: str, subjects: str) -> str:
     ('|', '<', '=', ...) found in the canonical form; else a family/property word ('prime', 'even', ...);
     else a relation word ('coprime'); else a stable fallback (the canonical statement) so a non-relational
     lemma keys uniquely and never spuriously collides with a different one."""
+    comparison = _comparison_signature(claim)
+    if comparison is not None:
+        return comparison[1]
+    predicate = _predicate_signature(claim)
+    if predicate is not None:
+        return predicate[1]
     canon = canonical_form(claim)
     for op in _RELATION_OPERATORS:
         if op in canon:
@@ -313,21 +374,25 @@ def _lemma_key(claim: str) -> str:
 
 
 def _relations_conflict(a: str, b: str) -> bool:
-    """Do two DIFFERENT relation tokens on the SAME subjects contradict? Only when they are distinct
-    members of one mutually-exclusive relation family ('<' vs '>', 'prime' vs 'composite'). Independent
-    relations ('<' vs '|') share no family -> NOT a conflict (V4)."""
+    """Whether two normalized relations on the same operands/subjects cannot both hold."""
     if a == b:
         return False
-    for fam in _RELATION_FAMILIES:
+    if a in _ORDER_OUTCOMES and b in _ORDER_OUTCOMES:
+        return not bool(_ORDER_OUTCOMES[a] & _ORDER_OUTCOMES[b])
+    if (a.startswith("not:") or b.startswith("not:")
+            or _family_of(a) is not None or _family_of(b) is not None):
+        return _predicates_conflict(a, b)
+    for fam in _EXCLUSIVE_FAMILIES:
         if a in fam and b in fam:
             return True
     return False
 
 
 def _ingest_assumption(sig: ChildSignature, claim: str) -> None:
-    """Pull a binding (`x = 0`) or a predicate (`n is even`) out of an assumption claim."""
+    """Pull a binding, predicate, or atomic comparison out of an assumption claim."""
+    comparison = _comparison_signature(claim)
     mp = _PREDICATE_RE.match(claim)
-    if mp:
+    if mp and comparison is None:
         subject = mp.group(1).lower()
         sig.predicates[subject] = _norm_pred(mp.group(3), bool(mp.group(2)))
         return
@@ -337,6 +402,9 @@ def _ingest_assumption(sig: ChildSignature, claim: str) -> None:
         # Skip values that are themselves predicates parsed as bindings ("n is even" can't reach here,
         # predicate matched first); keep a canonical RHS so "0" == " 0 ".
         sig.bindings[symbol] = canonical_form(mb.group(2))
+    if comparison is not None:
+        subjects, relation, _normalized = comparison
+        sig.lemma_relations.setdefault(subjects, set()).add(relation)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -344,15 +412,16 @@ def _ingest_assumption(sig: ChildSignature, claim: str) -> None:
 # --------------------------------------------------------------------------------------------------
 def check_children_consistency(child_goals: list[str],
                                child_proofs: dict[str, Optional[str]]) -> H0Result:
-    """Check that the children's signatures agree on overlaps (the H0 / 0-cocycle gate).
+    """Check that the extracted child signatures agree on overlaps (the H0 / 0-cocycle guard).
 
     `child_goals` is the ordered list of child goals; `child_proofs[goal]` is each child's proven
     ledger (text/JSON/sketch) or None. Returns an `H0Result`. ANTI-VACUITY: if NO child signature
-    could be inspected (no children, or every child's proof was unparseable / contentless), the result
-    is `consistent=False, reason='vacuous_check'` — a vacuous inspection FAILS LOUD, never passes."""
+    could be inspected, the result is `vacuous_check`. Every declared child must also be inspectable;
+    ignoring one malformed sibling could hide exactly the contradiction H0 is meant to catch, so a
+    partial inspection returns `incomplete_check`. Both outcomes fail closed."""
     sigs = [extract_signature(g, child_proofs.get(g)) for g in child_goals]
 
-    # Anti-vacuity: a consistency claim requires SOMETHING to have been inspected. "Inspected" means a
+    # Anti-vacuity: a consistency claim requires EVERY child to have been inspected. "Inspected" means a
     # child whose proof PARSED and had steps to SCAN (its `inspectable` footprint), NOT merely that a
     # contradictable fact was found — a valid decomposition whose children declare no overlapping
     # hypotheses genuinely has nothing to conflict and must PASS. An all-unparsed / stepless child set
@@ -361,6 +430,9 @@ def check_children_consistency(child_goals: list[str],
     if not inspectable:
         return H0Result(consistent=False, reason="vacuous_check",
                         inspected_children=sum(1 for s in sigs if s.parsed))
+    if len(inspectable) != len(sigs):
+        return H0Result(consistent=False, reason="incomplete_check",
+                        inspected_children=len(inspectable))
 
     conflicts: list[Conflict] = []
     overlaps = 0
@@ -404,17 +476,41 @@ def check_children_consistency(child_goals: list[str],
                     conflicts.append(Conflict("lemma_signature", key, a.goal, b.goal,
                                               a.lemma_sigs[key], b.lemma_sigs[key]))
 
-            # (2) SAME subjects, DIFFERENT relations (V4): flag a conflict ONLY when the two relations
-            # are distinct members of a mutually-exclusive relation family ('g<h' vs 'g>h', 'g prime' vs
-            # 'g composite'). Independent relations on the same subjects ('g<h' vs 'g|h') are COMPATIBLE
-            # and must NOT be flagged — that was the V4 false positive.
+            # (2) SAME normalized operands/subjects, possibly DIFFERENT relations. Property families
+            # retain only genuinely exclusive members. Atomic order constraints are accumulated for
+            # one global intersection below, because pairwise agreement alone is insufficient.
             for subj in set(a.lemma_relations) & set(b.lemma_relations):
                 for ra in a.lemma_relations[subj]:
                     for rb in b.lemma_relations[subj]:
-                        if _relations_conflict(ra, rb):
-                            overlaps += 1
-                            conflicts.append(Conflict("lemma_signature", subj, a.goal, b.goal,
+                        overlaps += 1
+                        if (not (ra in _ORDER_OUTCOMES and rb in _ORDER_OUTCOMES)
+                                and _relations_conflict(ra, rb)):
+                            conflicts.append(Conflict("relation", subj, a.goal, b.goal,
                                                       ra, rb))
+
+    # A global section is stronger than pairwise consistency. Intersect every normalized atomic-order
+    # constraint on a subject across all children. This catches <=, >=, !=: every pair is compatible,
+    # but their conjunction has no possible order outcome.
+    order_assertions: dict[str, list[tuple[str, str]]] = {}
+    for sig in sigs:
+        for subj, relations in sig.lemma_relations.items():
+            for relation in sorted(relations):
+                if relation in _ORDER_OUTCOMES:
+                    order_assertions.setdefault(subj, []).append((sig.goal, relation))
+    for subj, assertions in order_assertions.items():
+        allowed = frozenset({-1, 0, 1})
+        accepted: list[tuple[str, str]] = []
+        for child, relation in assertions:
+            narrowed = allowed & _ORDER_OUTCOMES[relation]
+            if not narrowed:
+                conflicts.append(Conflict(
+                    "relation", subj,
+                    " & ".join(c for c, _ in accepted), child,
+                    " & ".join(r for _, r in accepted), relation,
+                ))
+                break
+            allowed = narrowed
+            accepted.append((child, relation))
 
     n_inspected = len(inspectable)
     if conflicts:

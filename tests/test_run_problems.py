@@ -14,9 +14,13 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from agent.gates.lean_audit import (
+    ConstDep, DependencyReport, LeanAuditResult, LeanVerdict, DERIVED_PROVENANCE_SCHEMA,
+)
 from agent.orchestrator.run_profile import (
     ProviderKey,
     RoleSpec,
@@ -57,12 +61,35 @@ class _StubDag:
 
 
 class _StubResult:
-    def __init__(self, proven=True, *, authoritative=False, terminal=None, spent=4, nodes=1):
+    def __init__(self, proven=True, *, authoritative=False, terminal=None, candidate=None,
+                 spent=4, nodes=1, policy_digest=None, resolved_roles=None):
         self.proven = proven
         self.authoritative_elementary = authoritative
         self.terminal = terminal
+        self.candidate = candidate
         self.budget = _StubBudget(spent)
         self.dag = _StubDag(nodes)
+        self.policy_digest = policy_digest
+        self.resolved_roles = resolved_roles or {}
+
+
+def _receipt_terminal(verdict=LeanVerdict.PASS):
+    audit = LeanAuditResult(
+        verdict=verdict,
+        report=DependencyReport(
+            theorem="ma_target", axioms=["propext"], constants=[ConstDep("ma_target")],
+            toolchain="leanprover/lean4:v4.30.0",
+            manifest="sha256:" + "a" * 64,
+            provenance=DERIVED_PROVENANCE_SCHEMA,
+        ),
+        provenance_verified=True,
+    )
+    return SimpleNamespace(
+        authoritative=audit.authoritative,
+        certification_trusted=True,
+        compiled=True,
+        audit=audit,
+    )
 
 
 def _scripted_profile(name="rp-offline", **kw):
@@ -179,6 +206,25 @@ def test_builder_receives_pure_goal_and_clause_via_context_channel(tmp_path):
     # The row still flags injected context for ljunggren (a clause was passed), not for imo.
     assert row_lj["injected_context"] is True
     assert row_imo["injected_context"] is False
+
+
+def test_problem_row_records_actual_provider_and_policy_receipt():
+    problem = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    profile = _scripted_profile("receipt")
+    result = _StubResult(
+        proven=False,
+        policy_digest="b" * 64,
+        resolved_roles={
+            "prover": {
+                "role": "prover", "provider": "claude", "model": "opus",
+                "effort": None, "timeout_s": 60, "fallback_selected": False,
+            },
+        },
+    )
+    row = rp.run_one(problem, profile, builder=lambda *_args, **_kwargs: result)
+    assert row["code_revision"]
+    assert row["toolkit_policy_sha256"] == "b" * 64
+    assert row["resolved_roles"]["prover"]["provider"] == "claude"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -374,22 +420,167 @@ def test_ledgers_dump_captures_terminal_gate_result(tmp_path):
     assert dumped["terminal"]["authoritative_elementary"] is False
 
     # A run with NO terminal gate -> terminal key is null, still no crash.
-    rp.run_one(imo, prof, builder=lambda p, g, **kw: _StubResult(proven=True, terminal=None),
+    prof_without_terminal = _scripted_profile("dump-none")
+    rp.run_one(imo, prof_without_terminal,
+               builder=lambda p, g, **kw: _StubResult(proven=True, terminal=None),
                ledgers_dir=ldir)
-    dumped2 = json.loads((ldir / fname).read_text(encoding="utf-8"))
+    fname2 = rp._ledger_filename(imo.slug, prof_without_terminal)
+    dumped2 = json.loads((ldir / fname2).read_text(encoding="utf-8"))
     assert dumped2["terminal"] is None
 
 
-def test_reporting_status_authoritative_when_terminal_gate_certifies(tmp_path):
-    class _Terminal:
+def test_ledger_artifact_uses_same_strict_outcome_as_reporting_row(tmp_path):
+    class _Audit:
+        passed = True
+    class _UntrustedTerminal:
         authoritative = True
+        certification_trusted = False
+        compiled = True
+        audit = _Audit()
 
+        def summary(self):
+            return "injected terminal"
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    prof = _scripted_profile("artifact-parity")
+    ldir = tmp_path / "ledgers"
+    row = rp.run_one(
+        imo, prof,
+        builder=lambda p, g, **kw: _StubResult(
+            proven="yes", authoritative=True, terminal=_UntrustedTerminal()),
+        ledgers_dir=ldir,
+    )
+
+    dumped = json.loads((ldir / rp._ledger_filename(imo.slug, prof)).read_text(encoding="utf-8"))
+    assert row["proven"] is False and dumped["proven"] is False
+    assert row["authoritative_elementary"] is False
+    assert dumped["terminal"]["authoritative_elementary"] is False
+
+
+def test_artifact_failure_does_not_relabel_run_outcome(monkeypatch, tmp_path):
+    def _artifact_boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rp, "_dump_ledgers", _artifact_boom)
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(
+        imo, _scripted_profile("artifact-failure"),
+        builder=lambda p, g, **kw: _StubResult(proven=True),
+        ledgers_dir=tmp_path / "ledgers",
+    )
+    assert row["proven"] is True
+    assert row["reporting_status"] == "soft_proven"
+    assert row["error"] is None
+    assert row["artifact_error"] == "OSError: disk full"
+
+
+def test_reporting_status_authoritative_when_terminal_gate_certifies(tmp_path):
     imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
     row = rp.run_one(imo, _scripted_profile("auth"),
                      builder=lambda p, g, **kw: _StubResult(proven=True, authoritative=True,
-                                                            terminal=_Terminal()))
+                                                            terminal=_receipt_terminal()))
     assert row["reporting_status"] == "authoritative_elementary"
     assert row["authoritative_elementary"] is True
+
+
+@pytest.mark.parametrize("terminal", [
+    type("Untrusted", (), {
+        "authoritative": True, "certification_trusted": False, "compiled": True,
+        "audit": type("Audit", (), {"passed": True})(),
+    })(),
+    type("TruthyAuthority", (), {
+        "authoritative": "yes", "certification_trusted": True, "compiled": True,
+        "audit": type("Audit", (), {"passed": True})(),
+    })(),
+    type("TruthyTrust", (), {
+        "authoritative": True, "certification_trusted": 1, "compiled": True,
+        "audit": type("Audit", (), {"passed": True})(),
+    })(),
+    type("TruthyAudit", (), {
+        "authoritative": True, "certification_trusted": True, "compiled": True,
+        "audit": type("Audit", (), {"passed": 1})(),
+    })(),
+    type("UnprovenancedAudit", (), {
+        "authoritative": True, "certification_trusted": True, "compiled": True,
+        "audit": type("Audit", (), {"passed": True, "authoritative": False})(),
+    })(),
+])
+def test_reporting_authority_rejects_untrusted_or_malformed_terminal_flags(terminal):
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(
+        imo, _scripted_profile("malformed"),
+        builder=lambda p, g, **kw: _StubResult(
+            proven=True, authoritative=True, terminal=terminal),
+    )
+    assert row["authoritative_elementary"] is False
+    assert row["reporting_status"] == "soft_proven"
+    assert row["lean_audit"] is None
+
+
+def test_reporting_authority_rejects_truthy_non_boolean_result_proven():
+    class _Audit:
+        passed = True
+    class _Terminal:
+        authoritative = True
+        certification_trusted = True
+        compiled = True
+        audit = _Audit()
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(
+        imo, _scripted_profile("truthy-proven"),
+        builder=lambda p, g, **kw: _StubResult(
+            proven="yes", authoritative=True, terminal=_Terminal()),
+    )
+    assert row["proven"] is False
+    assert row["authoritative_elementary"] is False
+    assert row["reporting_status"] == "rejected"
+
+
+def test_unproven_retained_candidate_is_reported_incomplete():
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(
+        imo, _scripted_profile("candidate"),
+        builder=lambda p, g, **kw: _StubResult(
+            proven=False, candidate="{\"claim\": \"candidate\"}"),
+    )
+    assert row["reporting_status"] == "candidate_incomplete"
+
+
+def test_inconsistent_authority_annotation_fails_closed():
+    class _Audit:
+        passed = True
+    class _Terminal:
+        compiled = True
+        audit = _Audit()
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    row = rp.run_one(
+        imo, _scripted_profile("impossible"),
+        builder=lambda p, g, **kw: _StubResult(
+            proven=False, authoritative=True, terminal=_Terminal()),
+    )
+    assert row["authoritative_elementary"] is False
+    assert row["reporting_status"] == "rejected"
+
+
+def test_reporting_status_requires_completed_audit_not_just_terminal_attempt():
+    class _Attempted:
+        compiled = False
+        audit = None
+
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    attempted = rp.run_one(
+        imo, _scripted_profile("attempted"),
+        builder=lambda p, g, **kw: _StubResult(proven=True, terminal=_Attempted()),
+    )
+    audited = rp.run_one(
+        imo, _scripted_profile("audited"),
+        builder=lambda p, g, **kw: _StubResult(
+            proven=True, terminal=_receipt_terminal(LeanVerdict.REJECT)),
+    )
+    assert attempted["reporting_status"] == "soft_proven"
+    assert audited["reporting_status"] == "audited_not_certified"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -453,4 +644,127 @@ def test_timeout_flag_changes_profile_hash(tmp_path):
     prof = _scripted_profile("t")
     capped = rp._apply_timeout(prof, 42)
     assert capped.profile_hash != prof.profile_hash
-    assert all(getattr(capped.roles, n).timeout_s == 42 for n in capped.roles.model_fields)
+    assert all(getattr(capped.roles, n).timeout_s == 42
+               for n in type(capped.roles).model_fields)
+
+
+@pytest.mark.parametrize("value", [-1, 0, 86_401])
+def test_invalid_cli_timeout_is_rejected_before_output(tmp_path, value):
+    out = tmp_path / "must-not-exist.jsonl"
+    rc = rp.main([
+        "--problems-dir", str(_PROBLEMS_DIR),
+        "--problem", "imo_1988_finite_descent",
+        "--profile", str(_REPO / "profiles" / "default.yaml"),
+        "--timeout-s", str(value),
+        "--out", str(out),
+        "--quiet",
+    ])
+    assert rc == 2
+    assert not out.exists()
+
+
+def test_apply_timeout_rejects_boolean():
+    with pytest.raises(ValueError, match="timeout"):
+        rp._apply_timeout(_scripted_profile("t"), True)
+
+
+# --------------------------------------------------------------------------------------------------
+# Durable/no-clobber artifact publication.
+# --------------------------------------------------------------------------------------------------
+def test_existing_output_is_rejected_before_any_problem_runs(tmp_path):
+    out = tmp_path / "evidence.jsonl"
+    out.write_text("irreplaceable evidence\n", encoding="utf-8")
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    calls = []
+
+    with pytest.raises(FileExistsError):
+        rp.run_sweep(
+            [(imo.slug, imo, None)], [_scripted_profile("never-runs")], out,
+            builder=lambda profile, goal, **kwargs: calls.append(profile.name), verbose=False,
+        )
+
+    assert calls == []
+    assert out.read_text(encoding="utf-8") == "irreplaceable evidence\n"
+
+    def replacement_builder(profile, goal, **kwargs):
+        # --force does not truncate the old artifact at startup; replacement occurs only after the
+        # complete checkpoint has been written and fsynced.
+        assert out.read_text(encoding="utf-8") == "irreplaceable evidence\n"
+        return _StubResult(proven=True)
+
+    rp.run_sweep(
+        [(imo.slug, imo, None)], [_scripted_profile("replacement")], out,
+        builder=replacement_builder, verbose=False, overwrite=True,
+    )
+    assert json.loads(out.read_text(encoding="utf-8"))["profile_name"] == "replacement"
+
+
+def test_jsonl_completed_row_survives_process_level_crash(tmp_path):
+    out = tmp_path / "crashed.jsonl"
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    first = _scripted_profile("first")
+    second = _scripted_profile("second")
+
+    def builder(profile, goal, **kwargs):
+        if profile.name == "second":
+            raise KeyboardInterrupt("injected process interruption")
+        return _StubResult(proven=True)
+
+    with pytest.raises(KeyboardInterrupt, match="injected process interruption"):
+        rp.run_sweep(
+            [(imo.slug, imo, None)], [first, second], out,
+            builder=builder, verbose=False,
+        )
+
+    assert not out.exists()
+    checkpoints = list(tmp_path.glob("crashed.jsonl.*.incomplete"))
+    assert len(checkpoints) == 1
+    payload = checkpoints[0].read_bytes()
+    assert payload.endswith(b"\n")
+    persisted = [json.loads(line) for line in payload.decode("utf-8").splitlines()]
+    assert len(persisted) == 1 and persisted[0]["profile_name"] == "first"
+
+
+def test_destination_created_during_run_is_never_clobbered(tmp_path):
+    out = tmp_path / "raced.jsonl"
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+
+    def builder(profile, goal, **kwargs):
+        out.write_text("racing writer\n", encoding="utf-8")
+        return _StubResult(proven=True)
+
+    with pytest.raises(FileExistsError):
+        rp.run_sweep(
+            [(imo.slug, imo, None)], [_scripted_profile("race")], out,
+            builder=builder, verbose=False,
+        )
+
+    assert out.read_text(encoding="utf-8") == "racing writer\n"
+    checkpoint = next(tmp_path.glob("raced.jsonl.*.incomplete"))
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["profile_name"] == "race"
+
+
+def test_csv_is_complete_and_fsynced_before_publication(monkeypatch, tmp_path):
+    out = tmp_path / "atomic.csv"
+    imo = rp.load_problem(_PROBLEMS_DIR / "imo_1988_finite_descent")
+    captured = {}
+
+    def interrupt_publish(checkpoint, final, *, overwrite=False):
+        assert final == out and not final.exists()
+        captured["checkpoint"] = checkpoint
+        captured["payload"] = checkpoint.read_text(encoding="utf-8")
+        raise RuntimeError("injected publication failure")
+
+    monkeypatch.setattr(rp._artifacts, "publish_single", interrupt_publish)
+    profiles = [_scripted_profile("csv-a"), _scripted_profile("csv-b")]
+    with pytest.raises(RuntimeError, match="publication failure"):
+        rp.run_sweep(
+            [(imo.slug, imo, None)], profiles, out,
+            builder=lambda profile, goal, **kwargs: _StubResult(proven=True), verbose=False,
+        )
+
+    assert not out.exists()
+    assert captured["checkpoint"].exists()
+    lines = captured["payload"].splitlines()
+    assert lines[0].split(",") == rp.ROW_FIELDS
+    assert len(lines) == 3

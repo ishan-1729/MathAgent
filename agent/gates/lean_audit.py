@@ -13,9 +13,10 @@ and the axioms it uses — this module decides whether the proof is elementary:
      `Decidable`, ...) or the elementary-by-fiat allowlist (Legendre/QR API, gcd, ...). The allowlists
      exist so the closure audit does not over-reject plumbing or heavy-impl-but-elementary APIs.
 
-The decision is **deterministic and model-independent**. Producing the report requires Lean
+The content decision is **deterministic and model-independent**. Producing the report requires Lean
 (see `agent/gates/lean/Audit.lean` + `agent/gates/lean_bridge.py`); this module only judges it, so it
-is fully testable offline against synthetic reports.
+is fully testable offline against synthetic reports. Such reports are classification-only: Layer-4
+authority additionally requires the production bridge's verified runtime-toolchain + manifest receipt.
 """
 from __future__ import annotations
 
@@ -27,6 +28,9 @@ from typing import Optional
 
 from agent.gates.report import Finding, Severity, LAYER_LEAN
 from agent.gates.toolkit import Toolkit, load_toolkit
+
+
+DERIVED_PROVENANCE_SCHEMA = "mathagent-derived-v1"
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,27 @@ class DependencyReport:
     axioms: list[str] = field(default_factory=list)
     constants: list[ConstDep] = field(default_factory=list)
     toolchain: Optional[str] = None  # e.g. "leanprover/lean4:v4.x" — recorded for reproducibility
+    manifest: Optional[str] = None   # host-derived sha256:<Lake manifest> or explicit core-only
+    provenance: Optional[str] = None  # exact derived-provenance schema marker
+
+    @property
+    def has_derived_provenance(self) -> bool:
+        """Whether the production bridge stamped a complete toolchain/manifest receipt."""
+        manifest_ok = (self.manifest == "core-only"
+                       or (isinstance(self.manifest, str)
+                           and self.manifest.startswith("sha256:")
+                           and len(self.manifest) == len("sha256:") + 64
+                           and all(ch in "0123456789abcdef" for ch in self.manifest[7:])))
+        toolchain_ok = bool(
+            isinstance(self.toolchain, str) and self.toolchain
+            and len(self.toolchain) <= 256
+            and all(ord(ch) >= 32 and ch not in "\r\n" for ch in self.toolchain)
+        )
+        return bool(
+            toolchain_ok
+            and self.provenance == DERIVED_PROVENANCE_SCHEMA
+            and manifest_ok
+        )
 
     @staticmethod
     def from_dict(d: dict) -> "DependencyReport":
@@ -59,6 +84,8 @@ class DependencyReport:
             axioms=list(d.get("axioms", [])),
             constants=consts,
             toolchain=d.get("toolchain"),
+            manifest=d.get("manifest"),
+            provenance=d.get("provenance"),
         )
 
     @staticmethod
@@ -76,16 +103,25 @@ class LeanAuditResult:
     verdict: LeanVerdict
     findings: list[Finding] = field(default_factory=list)
     report: Optional[DependencyReport] = None
+    # True only when the production compile bridge derived and validated the runtime toolchain +
+    # project-manifest receipt. Offline/synthetic report auditing remains useful, but cannot mint
+    # Layer-4 authority merely by supplying a plausible string in `toolchain`.
+    provenance_verified: bool = False
 
     @property
     def passed(self) -> bool:
         return self.verdict is LeanVerdict.PASS
 
+    @property
+    def authoritative(self) -> bool:
+        return self.passed is True and self.provenance_verified is True
+
     def rejects(self) -> list[Finding]:
         return [f for f in self.findings if f.severity is Severity.REJECT]
 
     def summary(self) -> str:
-        return f"lean-audit: {self.verdict.value} (rejects={len(self.rejects())})"
+        return (f"lean-audit: {self.verdict.value} (rejects={len(self.rejects())}, "
+                f"provenance_verified={self.provenance_verified})")
 
 
 def _match_span(name: str, pattern: str) -> Optional[tuple[int, int]]:
@@ -175,7 +211,8 @@ def _anchored_allow(name: str, patterns: list[str]) -> Optional[str]:
 
 
 def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
-                 theorem_name: Optional[str] = None) -> LeanAuditResult:
+                 theorem_name: Optional[str] = None, *,
+                 provenance_verified: bool = False) -> LeanAuditResult:
     """Audit a dependency report. Deterministic; REJECT findings are authoritative.
 
     If `theorem_name` is given, the report's stamped `theorem` MUST equal it (the extractor stamps
@@ -248,12 +285,18 @@ def audit_report(report: DependencyReport, toolkit: Optional[Toolkit] = None,
                                 "report has no axioms and no constants — nothing was audited"))
 
     verdict = LeanVerdict.REJECT if any(f.severity is Severity.REJECT for f in findings) else LeanVerdict.PASS
-    return LeanAuditResult(verdict=verdict, findings=findings, report=report)
+    verified = provenance_verified is True and report.has_derived_provenance is True
+    return LeanAuditResult(
+        verdict=verdict, findings=findings, report=report,
+        provenance_verified=verified)
 
 
 def audit_json(text: str, toolkit: Optional[Toolkit] = None,
-               theorem_name: Optional[str] = None) -> LeanAuditResult:
-    return audit_report(DependencyReport.from_json(text), toolkit, theorem_name=theorem_name)
+               theorem_name: Optional[str] = None, *,
+               provenance_verified: bool = False) -> LeanAuditResult:
+    return audit_report(
+        DependencyReport.from_json(text), toolkit, theorem_name=theorem_name,
+        provenance_verified=provenance_verified)
 
 
 def audit_file(path: str | Path, toolkit: Optional[Toolkit] = None,

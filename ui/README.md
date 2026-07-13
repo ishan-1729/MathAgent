@@ -23,6 +23,9 @@ each run makes live Codex calls (and, when certifying, Lean/Mathlib compiles) �
 - **Retrieval** — `--retrieval` (Loogle+BM25), `--neural` (bi-encoder), `--rerank`.
 - **Budget** — `--max-depth`, `--max-decomp`, `--episodes`, `--budget`, `--max-replan`, `--timeout`.
 
-`GET /selftest` streams a stub subprocess to confirm the SSE plumbing without invoking Codex.
+`POST /selftest` streams a stub subprocess to confirm the SSE plumbing without invoking a model. Like
+`/run` and `/stop`, it requires a JSON body containing a fresh UUID `run_id`, the same-origin `Origin`
+header, and the `X-MathAgent-CSRF` token embedded in the uncached page served by `GET /`; there is no
+ambient or token-free GET endpoint that starts work.
 
 Tests: `python -m pytest tests/test_ui_server.py` (argv mapping + streaming, no model calls).

@@ -75,6 +75,50 @@ def test_respects_budget():
     assert budget.calls_spent <= 2
 
 
+def test_partial_judge_panel_cannot_displace_incumbent():
+    """A budget that could fund only the first favorable vote must not change the champion."""
+    class CountingComparator:
+        def __init__(self, scores):
+            self.scores = scores
+            self.calls = 0
+
+        def compare(self, a, b):
+            self.calls += 1
+            return (self.scores[a.content] > self.scores[b.content]) - \
+                (self.scores[a.content] < self.scores[b.content])
+
+    pro_b = CountingComparator({"A": 0, "B": 1})
+    pro_a = CountingComparator({"A": 1, "B": 0})
+    # Critic+author+synth consume three calls. One call remains: enough for the old implementation to
+    # apply the first pro-B vote, but not enough for the complete two-judge panel.
+    budget = Budget(max_llm_calls=4)
+    ctrl = RevisionController(
+        ScriptedCritic([["flaw"]]), ScriptedAuthor(["B"]), ScriptedSynthesizer(["B"]),
+        [pro_b, pro_a], budget=budget, max_passes=1, margin=1, seed=0,
+    )
+    res = ctrl.refine("goal", "A")
+    assert res.content == "A"
+    assert res.changed is False and res.displacements == 0
+    assert pro_b.calls == pro_a.calls == 0          # panel preflight is atomic; no partial votes applied
+    assert budget.calls_spent == 3
+    assert res.history[0]["reason"] == "judge_panel_incomplete"
+
+
+def test_exact_full_panel_budget_can_still_displace():
+    # Control for the atomic preflight: exactly enough budget for critic+author+synth and both votes
+    # completes the panel and admits the unanimously preferred challenger.
+    judges = [KeyComparator(lambda c: {"A": 0, "B": 1}[c.content]) for _ in range(2)]
+    budget = Budget(max_llm_calls=5)
+    ctrl = RevisionController(
+        ScriptedCritic([["flaw"]]), ScriptedAuthor(["B"]), ScriptedSynthesizer(["B"]),
+        judges, budget=budget, max_passes=1, margin=1, seed=0,
+    )
+    res = ctrl.refine("goal", "A")
+    assert res.content == "B" and res.displacements == 1
+    assert budget.calls_spent == 5
+    assert "reason" not in res.history[0]
+
+
 def test_is_deterministic_under_seed():
     scores = {"A": 1.0, "B": 5.0, "AB": 3.0}
     a = _controller(scores, author=["B"], synth=["AB"], seed=0).refine("g", "A")
@@ -121,7 +165,7 @@ def test_driver_refine_registers_champion_with_barrier():
     pytest.importorskip("openevolve", reason="pip install mathagent[evolve]")
     import json
     from agent.orchestrator.dag_driver import DagDriver
-    from agent.orchestrator.driver import ScriptedProver
+    from agent.orchestrator.driver import JudgeVerdict, ScriptedJudge, ScriptedProver
     from agent.tools.openevolve_bridge import explore_exploit_barrier
     from agent.gates.toolkit import load_toolkit
 
@@ -138,7 +182,10 @@ def test_driver_refine_registers_champion_with_barrier():
             from agent.orchestrator.tournament import RefineResult
             return RefineResult(content=refined, changed=True, passes=1, displacements=1)
 
-    driver = DagDriver(ScriptedProver([incumbent]), toolkit=tk, refiner=_Refiner())
+    proof_judge = ScriptedJudge(
+        "logic", [JudgeVerdict("logic", elementary=True, no_gaps=True)])
+    driver = DagDriver(ScriptedProver([incumbent]), toolkit=tk, refiner=_Refiner(),
+                       judges=[proof_judge])
     out = driver._refine("G", incumbent)
     assert out == refined
     assert explore_exploit_barrier().is_refined(refined)   # registered -> barred from the archive

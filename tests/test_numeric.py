@@ -91,6 +91,24 @@ def test_verify_solution_set_integer_claim_still_ok():
     assert not res.spurious_claims and not res.counterexamples
 
 
+def test_verify_solution_set_rejects_solution_outside_requested_box():
+    # x=999 satisfies x-999=0, but the requested set is restricted to x in [0,0].  A root outside
+    # that domain is an extra/spurious member, not evidence that the exact in-box solution set matches.
+    res = verify_solution_set("x - 999", ["x"], {"x": (0, 0)}, claimed=[{"x": 999}])
+    assert res.ok is False
+    assert res.solutions == []
+    assert res.counterexamples == []
+    assert res.spurious_claims == [{"x": 999}]
+
+
+def test_verify_solution_set_requires_every_coordinate_inside_box():
+    # Multivariate adversarial case: satisfying the equation is insufficient when just one coordinate
+    # escapes its bound.
+    res = verify_solution_set("x + y - 3", ["x", "y"],
+                              {"x": (0, 1), "y": (0, 1)}, claimed=[{"x": 1, "y": 2}])
+    assert res.ok is False and res.spurious_claims == [{"x": 1, "y": 2}]
+
+
 def test_residue_cover_complete():
     assert verify_residue_cover(2, [0, 1]).ok
     assert verify_residue_cover(4, [0, 1, 2, 3]).ok
@@ -106,6 +124,32 @@ def test_residue_cover_incomplete():
 def test_residue_cover_bad_modulus():
     with pytest.raises(NumericError):
         verify_residue_cover(0, [0])
+
+
+# --- M1: verify_residue_cover must cap the modulus BEFORE materializing set(range(modulus)). An
+#     untrusted ledger's case_cover.modulus reaches here via obligations._check_case_cover; a huge
+#     modulus would exhaust memory instead of the gate returning a REJECT. Fail closed instead. ---
+
+def test_residue_cover_rejects_oversized_modulus():
+    import time
+    # modulus = 10**9 would build set(range(10**9)) (tens of GB); the cap must REJECT it as a
+    # NumericError essentially instantly, never materializing the range.
+    t = time.perf_counter()
+    with pytest.raises(NumericError, match="MAX_COVER_MODULUS"):
+        verify_residue_cover(10**9, [0, 1])
+    assert time.perf_counter() - t < 1.0   # returned via the cap; did not build the giant set
+
+
+def test_residue_cover_modulus_cap_boundary_rejects_above():
+    # Pins the threshold to MAX_COVER_MODULUS: one above the cap is rejected (does not build the set).
+    with pytest.raises(NumericError, match="MAX_COVER_MODULUS"):
+        verify_residue_cover(numeric.MAX_COVER_MODULUS + 1, [0])
+
+
+def test_residue_cover_small_modulus_unchanged():
+    # A legitimate small cover verifies exactly as before (the cap only rejects absurd moduli).
+    res = verify_residue_cover(3, [0, 1, 2])
+    assert res.ok is True and res.missing == []
 
 
 def test_rejects_undeclared_symbol():
@@ -273,6 +317,47 @@ def test_valid_polynomials_still_parse_after_hardening():
     assert nonneg == []  # x-1 < x everywhere -> never >= 0
 
 
+def test_numeric_evaluator_never_calls_sympy_lambdify(monkeypatch):
+    """Regression: lambdify generates/executes source and is forbidden for model input."""
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("numeric checks must not call sympy.lambdify")
+
+    monkeypatch.setattr(numeric.sympy, "lambdify", _forbidden)
+    assert find_integer_solutions("x**2 - 4", ["x"], {"x": (-3, 3)}) == [
+        {"x": -2}, {"x": 2}
+    ]
+
+
+def test_verify_solution_set_streams_dense_results_with_bounded_previews():
+    result = verify_solution_set("0", ["x"], {"x": (0, 4_999)}, claimed=[])
+
+    assert result.ok is False
+    assert result.solution_count == 5_000
+    assert len(result.solutions) == numeric.MAX_RESULT_ROWS
+    assert result.solutions_truncated is True
+    assert result.counterexample_count == 5_000
+    assert len(result.counterexamples) == numeric.MAX_EVIDENCE_ROWS
+    assert result.counterexamples_truncated is True
+
+
+def test_find_integer_solutions_rejects_dense_materialization():
+    with pytest.raises(NumericError, match="MAX_RESULT_ROWS"):
+        find_integer_solutions(
+            "0", ["x"], {"x": (0, numeric.MAX_RESULT_ROWS)}
+        )
+
+
+def test_witness_spec_and_claimed_rows_are_bounded():
+    oversized = " " * (numeric.MAX_SPEC_CHARS + 1)
+    result = numeric.check_witness_spec(oversized)
+    assert result.ok is False
+    assert result.error is not None and "MAX_SPEC_CHARS" in result.error
+
+    claimed = ({"x": index} for index in range(numeric.MAX_CLAIMED_ROWS + 1))
+    with pytest.raises(NumericError, match="MAX_CLAIMED_ROWS"):
+        verify_solution_set("x", ["x"], {"x": (0, 0)}, claimed=claimed)
+
+
 # --- Latent NameError fix: SpecCheck.error: Optional[str] must resolve (`Optional` imported) ---
 
 def test_optional_annotation_resolves_on_speccheck():
@@ -303,6 +388,43 @@ def test_evaluate_integer_constant_symbolic_raises_symbolic():
     # A free variable -> SymbolicExpression (a NumericError subclass), distinct from "malformed".
     with pytest.raises(numeric.SymbolicExpression):
         numeric.evaluate_integer_constant("n + 1")
+
+
+# --- M2: a constant power must be capped at BUILD time, before `left ** right` materializes it. The
+#     post-build MAX_POW_EXPONENT check never saw a huge CLOSED constant (the Pow had already
+#     auto-evaluated to a single Integer), so evaluate_integer_constant('2**1000') used to return the
+#     full 302-digit int. _build_from_ast now validates each Pow's exponent as it builds. ---
+
+def test_evaluate_integer_constant_rejects_huge_constant_power_fast():
+    import time
+    t = time.perf_counter()
+    with pytest.raises(NumericError):
+        numeric.evaluate_integer_constant("2**1000")    # pre-fix: materialized a 302-digit int
+    with pytest.raises(NumericError):
+        numeric.evaluate_integer_constant("9**9**9")     # exponent subtree 9**9 caught before 9**(...)
+    # Never materialized the astronomically large integer -> fast, not a hang / OOM.
+    assert time.perf_counter() - t < 1.0
+
+
+def test_evaluate_integer_constant_small_power_unchanged():
+    # Legitimate small constant powers are unaffected by the build-time exponent cap.
+    assert numeric.evaluate_integer_constant("2**10") == 1024
+    assert numeric.evaluate_integer_constant("-(2**3)") == -8
+
+
+def test_symbolic_exponent_not_blocked_by_constant_power_cap():
+    # A symbolic exponent (2**n) must NOT trip the integer-exponent guard (right.is_Integer is False):
+    # it stays symbolic, so evaluate_integer_constant reports SymbolicExpression and the concrete
+    # inequality '2**n < 3**n' defers (None) rather than being mis-rejected as malformed.
+    with pytest.raises(numeric.SymbolicExpression):
+        numeric.evaluate_integer_constant("2**n")
+    assert numeric.concrete_inequality_holds("2**n", "3**n", "<") is None
+
+
+def test_find_integer_solutions_symbolic_power_still_parses():
+    # Symbolic base with a small integer exponent (x**2, y**3) is unchanged by the build-time cap.
+    assert find_integer_solutions("x**2 + 1 - y**3", ["x", "y"],
+                                  {"x": (-50, 50), "y": (-10, 10)}) == [{"x": 0, "y": 1}]
 
 
 @pytest.mark.parametrize("bad", [
@@ -345,3 +467,64 @@ def test_concrete_inequality_holds_decides_and_defers():
 def test_concrete_inequality_malformed_side_raises():
     with pytest.raises(NumericError):
         numeric.concrete_inequality_holds("x / 2", "3", "<")
+
+
+# --- H1: NESTED constant-power DoS. A per-Pow exponent cap (MAX_POW_EXPONENT) alone does NOT bound a
+#     nested constant power like ((2**64)**64)**64: every node passes exp<=64 while the exponent
+#     multiplies into the base, materializing a ~2**(64**d) integer (~79k digits at depth 3). The
+#     BASE-MAGNITUDE guard in _build_from_ast predicts exp*base.bit_length() > MAX_CONST_BITS and
+#     REJECTS before `left ** right` materializes the giant int. _safe_parse caps raw input length by
+#     MAX_EXPR_CHARS. Both regress into a hang/OOM if reverted, so each pins a wall-clock bound. ---
+
+def test_evaluate_integer_constant_rejects_nested_base_power_fast():
+    import time
+    # ((2**64)**64)**64 == 2**(64**3) == 2**262144 (~79k digits): the nested-base sibling the per-node
+    # exponent guard missed. The base-magnitude cap must reject it essentially instantly, never
+    # materializing the astronomically large integer.
+    t = time.perf_counter()
+    with pytest.raises(NumericError):
+        numeric.evaluate_integer_constant("((2**64)**64)**64")
+    assert time.perf_counter() - t < 2.0   # rejected via the cap; did not build the ~79k-digit int
+
+
+def test_evaluate_integer_constant_rejects_five_level_tower_fast():
+    import time
+    t = time.perf_counter()
+    with pytest.raises(NumericError):
+        numeric.evaluate_integer_constant("(((((2**64)**64)**64)**64)**64)")
+    assert time.perf_counter() - t < 2.0
+
+
+def test_evaluate_integer_constant_legit_small_powers_unchanged():
+    # No false reject: legitimate small constant powers still evaluate exactly (the base-magnitude
+    # cap only fires when exp*base.bit_length() exceeds MAX_CONST_BITS).
+    assert numeric.evaluate_integer_constant("2**10") == 1024
+    assert numeric.evaluate_integer_constant("9**9") == 387420489
+    assert numeric.evaluate_integer_constant("2**64") == 18446744073709551616
+
+
+def test_evaluate_integer_constant_rejects_overlength_expression():
+    # A long constant Mul/Add chain grows the materialized value with input length; _safe_parse's
+    # MAX_EXPR_CHARS cap refuses input over 10000 chars before ast.parse walks it.
+    huge = "1+" * 6000 + "1"       # > 12000 chars, well over MAX_EXPR_CHARS
+    assert len(huge) > numeric.MAX_EXPR_CHARS
+    with pytest.raises(NumericError):
+        numeric.find_integer_solutions(huge, ["x"], {"x": (0, 0)})
+
+
+def test_evaluate_integer_constant_uses_shared_length_and_ast_caps():
+    huge = "1+" * 6000 + "1"
+    with pytest.raises(NumericError, match="expression exceeds"):
+        numeric.evaluate_integer_constant(huge)
+
+
+def test_evaluate_integer_constant_rejects_large_literal_and_product_before_sympy():
+    oversized_literal = str(1 << (numeric.MAX_CONST_BITS + 1))
+    with pytest.raises(NumericError, match="integer literal"):
+        numeric.evaluate_integer_constant(oversized_literal)
+
+    # Each factor is admissible on its own; their product is not. The product guard runs before
+    # SymPy materializes the result.
+    factor = str(1 << (numeric.MAX_CONST_BITS // 2 + 8))
+    with pytest.raises(NumericError, match="constant product"):
+        numeric.evaluate_integer_constant(f"{factor}*{factor}")

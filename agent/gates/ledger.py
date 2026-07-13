@@ -30,6 +30,13 @@ _SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
 _VALIDATOR = jsonschema.Draft7Validator(_SCHEMA)
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_STEP_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_MAX_LEDGER_SOURCE_CHARS = 4 * 1024 * 1024
+_MAX_LEDGER_CONTAINER_ITEMS = 50_000
+_MAX_LEDGER_STRING_CHARS = 4 * 1024 * 1024
+_MAX_LEDGER_NESTING = 64
+_MAX_LEDGER_STEPS = 2000
+_MAX_STEP_DEPENDENCIES = 2000
 
 
 class LedgerError(ValueError):
@@ -95,6 +102,8 @@ def _norm_claim(s: str) -> str:
 
 def _extract_json(text: str) -> dict:
     """Pull a ledger object out of raw text: a dict, a JSON string, or a fenced ```json block."""
+    if len(text) > _MAX_LEDGER_SOURCE_CHARS:
+        raise LedgerError(f"ledger source exceeds {_MAX_LEDGER_SOURCE_CHARS} characters")
     text = text.strip()
     # Prefer fenced blocks (most common in LLM output). A DECOY fence can precede the real ledger, so
     # scan ALL fenced blocks and take the LAST one that parses as JSON — the real ledger is
@@ -117,15 +126,85 @@ def _extract_json(text: str) -> dict:
     return parsed
 
 
+def _validate_resource_bounds(obj: Any) -> None:
+    """Reject oversized/non-tree programmatic inputs before recursive schema validation."""
+    stack: list[tuple[Any, bool, int]] = [(obj, False, 1)]
+    active_containers: set[int] = set()
+    container_items = 0
+    string_chars = 0
+    while stack:
+        value, leaving, depth = stack.pop()
+        if leaving:
+            active_containers.remove(id(value))
+            continue
+        if depth > _MAX_LEDGER_NESTING:
+            raise LedgerError(f"ledger nesting exceeds {_MAX_LEDGER_NESTING}")
+        if isinstance(value, str):
+            string_chars += len(value)
+            if string_chars > _MAX_LEDGER_STRING_CHARS:
+                raise LedgerError(
+                    f"ledger strings exceed {_MAX_LEDGER_STRING_CHARS} total characters"
+                )
+            continue
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in active_containers:
+                raise LedgerError("ledger input must be an acyclic JSON tree")
+            active_containers.add(identity)
+            container_items += len(value)
+            stack.append((value, True, depth))
+            stack.extend((item, False, depth + 1) for item in value.keys())
+            stack.extend((item, False, depth + 1) for item in value.values())
+        elif isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in active_containers:
+                raise LedgerError("ledger input must be an acyclic JSON tree")
+            active_containers.add(identity)
+            container_items += len(value)
+            stack.append((value, True, depth))
+            stack.extend((item, False, depth + 1) for item in value)
+        if container_items > _MAX_LEDGER_CONTAINER_ITEMS:
+            raise LedgerError(
+                f"ledger containers exceed {_MAX_LEDGER_CONTAINER_ITEMS} total items"
+            )
+
+
 def parse_ledger(source: Any) -> Ledger:
     """Parse + schema-validate a ledger from a dict or text. Raises LedgerError on malformed input."""
     obj = source if isinstance(source, dict) else _extract_json(str(source))
+    # Enforce the high-amplification array bounds before jsonschema creates one rich ValidationError
+    # per element. This keeps a 100k-entry malformed `steps` list from consuming hundreds of MiB.
+    if isinstance(obj, dict):
+        raw_steps = obj.get("steps")
+        if isinstance(raw_steps, list):
+            if len(raw_steps) > _MAX_LEDGER_STEPS:
+                raise LedgerError(
+                    f"schema violation at steps: {len(raw_steps)} items exceeds "
+                    f"maximum {_MAX_LEDGER_STEPS}")
+            for index, raw_step in enumerate(raw_steps):
+                if not isinstance(raw_step, dict):
+                    continue
+                dependencies = raw_step.get("depends_on")
+                if isinstance(dependencies, list) and len(dependencies) > _MAX_STEP_DEPENDENCIES:
+                    raise LedgerError(
+                        f"schema violation at steps/{index}/depends_on: {len(dependencies)} items "
+                        f"exceeds maximum {_MAX_STEP_DEPENDENCIES}")
+    _validate_resource_bounds(obj)
 
-    errors = sorted(_VALIDATOR.iter_errors(obj), key=lambda e: list(e.path))
-    if errors:
-        first = errors[0]
+    first = next(_VALIDATOR.iter_errors(obj), None)
+    if first is not None:
         loc = "/".join(str(p) for p in first.path) or "(root)"
-        raise LedgerError(f"schema violation at {loc}: {first.message}")
+        detail = first.message
+        if len(detail) > 500:
+            detail = detail[:497] + "..."
+        raise LedgerError(f"schema violation at {loc}: {detail}")
+
+    # JSON Schema's `$` anchor can match immediately before a trailing newline in Python. Use a true
+    # full match for the identifier security boundary so visually identical/newline-suffixed ids can
+    # neither evade duplicate checks nor create confusing dependency keys.
+    for raw_step in obj["steps"]:
+        if _STEP_ID_RE.fullmatch(raw_step["id"]) is None:
+            raise LedgerError(f"schema violation at steps/id: invalid step id {raw_step['id']!r}")
 
     steps = tuple(
         Step(
@@ -242,21 +321,17 @@ def validate_structure(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
     #     statement than the one requested, so it is not a proof of this goal. Compared under
     #     NFC + whitespace normalization (folding a leading "Hence/Therefore" connective and a
     #     trailing period, which carry no mathematical content), so a benign restatement still binds.
-    #     To stay free of false positives on placeholder/scaffolding ledgers (whose claims are not
-    #     genuine restatements of each other), the REJECT fires only on a *genuine* mismatch: the
-    #     conclusion restates some OTHER body step's claim instead of the goal — i.e. the proof
-    #     concludes an intermediate lemma, not the requested statement. (Robust goal binding against the
-    #     *requested* goal is enforced in the orchestrator via goal_hash — FlatDriver/DagDriver/CLI.)
+    #     This is unconditional: placeholder/scaffolding ledgers are still proof ledgers and must obey
+    #     the same invariant. Robust binding against the *externally requested* goal is additionally
+    #     enforced by the shared orchestrator goal-binding helper used by Flat, Ralph, DAG promotion,
+    #     the independent elementary verifier, and therefore the CLI paths built on those drivers.
     if len(conclusions) == 1:
         concl = conclusions[0]
         norm_concl = _norm_claim(concl.claim)
         if norm_concl != _norm_claim(ledger.claim):
-            body_claims = {_norm_claim(s.claim) for s in ledger.steps if s.id != concl.id}
-            if norm_concl in body_claims:
-                findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "goal_claim_mismatch",
-                                        "conclusion step restates an intermediate step's claim "
-                                        "rather than the ledger's stated goal (the proof does not "
-                                        "conclude the requested claim)", concl.id))
+            findings.append(Finding(LAYER_STRUCTURE, Severity.REJECT, "goal_claim_mismatch",
+                                    "conclusion step does not restate the ledger's stated goal "
+                                    "(the proof does not conclude the requested claim)", concl.id))
 
     # 5b. a lone conclusion that depends on nothing, while other steps exist, "proves itself".
     if len(conclusions) == 1 and len(ledger.steps) > 1 and not conclusions[0].depends_on:

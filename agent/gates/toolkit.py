@@ -6,6 +6,8 @@ later Lean Layer-4 dependency audit.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -63,6 +65,38 @@ class Toolkit:
     def ruling(self, tool: str) -> Optional[str]:
         entry = self.boundary_rulings.get(tool)
         return entry.get("ruling") if entry else None
+
+
+def toolkit_policy_payload(toolkit: Toolkit) -> dict[str, object]:
+    """Return the complete deterministic gate-policy payload in a stable, JSON-safe form."""
+    return {
+        "schema": "mathagent-toolkit-policy-v1",
+        "justifications": {
+            key: {
+                "obligation": value.obligation,
+                "desc": value.desc,
+                "method_ref": value.method_ref,
+            }
+            for key, value in sorted(toolkit.justifications.items())
+        },
+        "boundary_rulings": toolkit.boundary_rulings,
+        "prose_terms": toolkit.prose_terms,
+        "allow_context_terms": toolkit.allow_context_terms,
+        "lean_denylist_decls": toolkit.lean_denylist_decls,
+        "lean_infrastructure_allowlist": toolkit.lean_infrastructure_allowlist,
+        "lean_elementary_by_fiat": toolkit.lean_elementary_by_fiat,
+        "lean_axiom_whitelist": toolkit.lean_axiom_whitelist,
+        "lean_axiom_denylist": toolkit.lean_axiom_denylist,
+    }
+
+
+def toolkit_policy_sha256(toolkit: Toolkit) -> str:
+    """Content identity for every toolkit/denylist input that can change a gate verdict."""
+    payload = json.dumps(
+        toolkit_policy_payload(toolkit), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _coerce_justifications(raw: dict) -> dict[str, Justification]:

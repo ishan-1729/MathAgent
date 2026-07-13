@@ -19,19 +19,118 @@ from __future__ import annotations
 
 import hashlib
 import math
-import pickle
+import re
+import threading
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 from agent.gates.lean_bridge import find_mathlib_project
-from agent.tools.semantic_retrieval import DEFAULT_MODULES, build_corpus, tokenize
+from agent.tools.semantic_retrieval import (
+    DEFAULT_MODULES, _atomic_write_json, _read_json_cache, _source_fingerprint,
+    build_corpus, tokenize,
+)
 
 try:                                   # numpy ships with sentence-transformers; optional for tests
     import numpy as _np
 except Exception:                      # pragma: no cover - environment-dependent
     _np = None
 
-_VERSION = 1
+_VERSION = 3
+_CACHE_FORMAT = "mathagent-neural-json"
+_MAX_CACHE_BYTES = 32 * 1024 * 1024
+_MAX_CACHE_ROWS = 120_000
+_MAX_CACHE_TEXT_CHARS = 16 * 1024 * 1024
+_MAX_VECTOR_DIM = 8_192
+_MAX_VECTOR_VALUES = 5_000_000
+_MAX_CACHE_VECTOR_VALUES = 1_500_000
+_EMBED_BATCH_SIZE = 256
+_COMMIT_HASH = re.compile(r"^[0-9a-fA-F]{40,64}$")
+
+
+def _normalized_vector(row: object, expected_dim: Optional[int] = None) -> Optional[list[float]]:
+    if not isinstance(row, list) or not row:
+        return None
+    if len(row) > _MAX_VECTOR_DIM or (expected_dim is not None and len(row) != expected_dim):
+        return None
+    values: list[float] = []
+    for item in row:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        try:
+            number = float(item)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        values.append(number)
+
+    # Scale first so values larger than float32 (or whose squared sum overflows float64) are safely
+    # normalized before conversion to the float32 matrix.  A zero vector has undefined cosine and
+    # must never become an all-ties result.
+    scale = max(abs(number) for number in values)
+    if scale == 0.0:
+        return None
+    scaled = [number / scale for number in values]
+    norm = math.sqrt(sum(number * number for number in scaled))
+    if not math.isfinite(norm) or norm == 0.0:
+        return None
+    normalized = [number / norm for number in scaled]
+    return normalized if all(math.isfinite(number) for number in normalized) else None
+
+
+def _validated_vectors(value: object, expected_rows: Optional[int] = None,
+                       expected_dim: Optional[int] = None,
+                       max_values: Optional[int] = None) -> Optional[list[list[float]]]:
+    value_limit = _MAX_VECTOR_VALUES if max_values is None else max_values
+    if not isinstance(value, list) or not value or len(value) > _MAX_CACHE_ROWS:
+        return None
+    if expected_rows is not None and len(value) != expected_rows:
+        return None
+    dim: Optional[int] = None
+    out: list[list[float]] = []
+    for row in value:
+        normalized = _normalized_vector(row, expected_dim if dim is None else dim)
+        if normalized is None:
+            return None
+        if dim is None:
+            dim = len(normalized)
+            if dim > _MAX_VECTOR_DIM or len(value) * dim > value_limit:
+                return None
+        out.append(normalized)
+    return out
+
+
+def _validated_neural_cache(blob: object, modules: list[str], model: str, source_fingerprint: str
+                            ) -> Optional[tuple[list[str], list[str], list[list[float]]]]:
+    if not isinstance(blob, dict):
+        return None
+    if (blob.get("format") != _CACHE_FORMAT or blob.get("version") != _VERSION
+            or blob.get("modules") != modules or blob.get("model") != model
+            or blob.get("source_fingerprint") != source_fingerprint):
+        return None
+    raw_corpus = blob.get("corpus")
+    if not isinstance(raw_corpus, list) or not raw_corpus or len(raw_corpus) > _MAX_CACHE_ROWS:
+        return None
+    names: list[str] = []
+    docs: list[str] = []
+    total_chars = 0
+    for row in raw_corpus:
+        if not isinstance(row, list) or len(row) != 2:
+            return None
+        name, signature = row
+        if (not isinstance(name, str) or not name or len(name) > 512
+                or not isinstance(signature, str) or len(signature) > 4_096):
+            return None
+        total_chars += len(name) + len(signature)
+        if total_chars > _MAX_CACHE_TEXT_CHARS:
+            return None
+        names.append(name)
+        docs.append(f"{name} : {signature}" if signature else name)
+    vectors = _validated_vectors(
+        blob.get("vectors"), len(names), max_values=_MAX_CACHE_VECTOR_VALUES)
+    if vectors is None:
+        return None
+    return list(names), list(docs), vectors
 
 
 @runtime_checkable
@@ -40,6 +139,9 @@ class Embedder(Protocol):
     def encode(self, texts: list[str]) -> list[list[float]]:
         """Return one L2-normalized vector per input text."""
         ...
+
+    # Custom embedders may expose a stable non-secret `cache_tag` string.  Without one, disk cache
+    # reuse is disabled because a class name/dimension does not identify a vector coordinate space.
 
 
 def _l2(v: list[float]) -> list[float]:
@@ -51,16 +153,58 @@ def _dot(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
+def _commit_from_model(model: object) -> Optional[str]:
+    """Best-effort extraction of the immutable Hugging Face snapshot commit."""
+    objects = [model]
+    modules = getattr(model, "_modules", None)
+    if isinstance(modules, dict):
+        objects.extend(modules.values())
+    cursor = 0
+    while cursor < len(objects) and len(objects) < 64:
+        obj = objects[cursor]
+        cursor += 1
+        for attr in ("auto_model", "config", "tokenizer"):
+            child = getattr(obj, attr, None)
+            if child is not None and not any(child is existing for existing in objects):
+                objects.append(child)
+
+    for obj in objects:
+        for candidate in (
+            getattr(obj, "_commit_hash", None),
+            getattr(obj, "commit_hash", None),
+            getattr(obj, "revision", None),
+        ):
+            if isinstance(candidate, str) and _COMMIT_HASH.fullmatch(candidate):
+                return candidate.lower()
+        for mapping_name in ("init_kwargs", "_model_config"):
+            mapping = getattr(obj, mapping_name, None)
+            if isinstance(mapping, dict):
+                for key in ("_commit_hash", "commit_hash", "revision"):
+                    candidate = mapping.get(key)
+                    if isinstance(candidate, str) and _COMMIT_HASH.fullmatch(candidate):
+                        return candidate.lower()
+        for path_attr in ("name_or_path", "model_name_or_path", "cache_dir"):
+            candidate = getattr(obj, path_attr, None)
+            if isinstance(candidate, str):
+                match = re.search(r"(?:^|[/\\])snapshots[/\\]([0-9a-fA-F]{40,64})(?:[/\\]|$)",
+                                  candidate)
+                if match:
+                    return match.group(1).lower()
+    return None
+
+
 class SentenceTransformerEmbedder:
     """Pretrained bi-encoder via `sentence-transformers` (the default neural backend)."""
 
     # bge-small-en-v1.5: 33M params, 384-dim, ~130 MB, strong small-model retrieval; needs no prefix.
     DEFAULT_MODELS = ["BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"]
 
-    def __init__(self, model_name: Optional[str] = None):
+    def __init__(self, model_name: Optional[str] = None, revision: Optional[str] = None):
         self.model_name = model_name
+        self.revision = revision
         self._model = None
         self.loaded_name: Optional[str] = None
+        self.loaded_revision: Optional[str] = None
 
     def available(self) -> bool:
         try:
@@ -77,8 +221,17 @@ class SentenceTransformerEmbedder:
         last: Optional[Exception] = None
         for n in names:
             try:
-                self._model = SentenceTransformer(n)
+                kwargs = {"revision": self.revision} if self.revision is not None else {}
+                self._model = SentenceTransformer(n, **kwargs)
                 self.loaded_name = n
+                pinned = (self.revision.lower() if isinstance(self.revision, str)
+                          and _COMMIT_HASH.fullmatch(self.revision) else None)
+                try:
+                    self.loaded_revision = _commit_from_model(self._model) or pinned
+                except Exception:
+                    # Revision introspection controls only cache reuse; it must not make an otherwise
+                    # usable encoder unavailable.
+                    self.loaded_revision = pinned
                 return self._model
             except Exception as e:  # try the next fallback (offline / not downloaded)
                 last = e
@@ -164,11 +317,12 @@ class NeuralRetriever:
         self.rerank_pool = rerank_pool
         self._given_corpus = corpus
         self._cache_path = (Path(cache_path) if cache_path else
-                            (Path(self.project_dir) / ".lake" / "mathagent_neural.pkl"
+                            (Path(self.project_dir) / ".lake" / "mathagent_neural.json"
                              if (self.project_dir and corpus is None) else None))
         self._names: list[str] = []
         self._docs: list[str] = []
         self._mat = None        # numpy array or list[list[float]]
+        self._index_lock = threading.RLock()
 
     def _mathlib_root(self) -> Optional[Path]:
         if not self.project_dir:
@@ -189,41 +343,170 @@ class NeuralRetriever:
             return []
         return [(name, sig) for name, sig, _toks in build_corpus(root, self.modules)]
 
-    def _model_tag(self) -> str:
-        return getattr(self.embedder, "loaded_name", None) or self.embedder.__class__.__name__
+    def _model_tag(self) -> Optional[str]:
+        # Cache identity must name the actual vector space, not merely its dimension or a fallback
+        # chain.  BGE and MiniLM are both 384-dimensional but their coordinates are incompatible;
+        # reusing one model's document matrix with the other's query vector silently corrupts ranks.
+        cls = self.embedder.__class__.__name__
+        if type(self.embedder) is SentenceTransformerEmbedder:
+            # A repo id or tag can move.  Reuse is safe only when the loaded snapshot exposes the
+            # immutable commit that defines this exact vector space.
+            self.embedder._load()
+            selected = self.embedder.loaded_name
+            revision = self.embedder.loaded_revision
+            if (not isinstance(selected, str) or not selected
+                    or not isinstance(revision, str) or not _COMMIT_HASH.fullmatch(revision)):
+                return None
+            return f"{cls}:{selected}@{revision.lower()}"
+        explicit = getattr(self.embedder, "cache_tag", None)
+        if isinstance(explicit, str) and explicit and len(explicit) <= 512:
+            return f"{cls}:{explicit}"
+        if type(self.embedder) is HashingEmbedder:
+            return f"{cls}:{self.embedder.dim}"
+        return None
+
+    def _expected_embedding_dim(self) -> Optional[int]:
+        dim = getattr(self.embedder, "dim", None)
+        if isinstance(dim, int) and not isinstance(dim, bool):
+            return int(dim) if 0 < dim <= _MAX_VECTOR_DIM else -1
+        if isinstance(self.embedder, SentenceTransformerEmbedder):
+            try:
+                getter = getattr(self.embedder, "get_sentence_embedding_dimension", None)
+                if callable(getter):
+                    model_dim = getter()
+                elif type(self.embedder) is SentenceTransformerEmbedder:
+                    model = self.embedder._load()
+                    getter = getattr(model, "get_sentence_embedding_dimension", None)
+                    model_dim = getter() if callable(getter) else None
+                else:
+                    model_dim = None
+            except Exception:
+                return None
+            if isinstance(model_dim, int) and not isinstance(model_dim, bool):
+                return int(model_dim) if 0 < model_dim <= _MAX_VECTOR_DIM else -1
+        return None
+
+    def _cache_source_fingerprint(self) -> Optional[str]:
+        if self._given_corpus is not None:
+            h = hashlib.sha256()
+            for name, signature in self._given_corpus:
+                for value in (name, signature):
+                    data = value.encode("utf-8")
+                    h.update(len(data).to_bytes(8, "big")); h.update(data)
+            return h.hexdigest()
+        root = self._mathlib_root()
+        if root is None:
+            return None
+        try:
+            return _source_fingerprint(root, self.modules)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _validated_corpus(corpus: object) -> Optional[list[tuple[str, str]]]:
+        if not isinstance(corpus, list) or not corpus or len(corpus) > _MAX_CACHE_ROWS:
+            return None
+        out: list[tuple[str, str]] = []
+        total_chars = 0
+        for row in corpus:
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
+                return None
+            name, signature = row
+            if (not isinstance(name, str) or not name or len(name) > 512
+                    or not isinstance(signature, str) or len(signature) > 4_096):
+                return None
+            total_chars += len(name) + len(signature)
+            if total_chars > _MAX_CACHE_TEXT_CHARS:
+                return None
+            out.append((name, signature))
+        return out
+
+    def _embed_documents(self, docs: list[str], expected_dim: Optional[int]
+                         ) -> Optional[list[list[float]]]:
+        if expected_dim is not None:
+            if expected_dim <= 0 or len(docs) * expected_dim > _MAX_VECTOR_VALUES:
+                return None
+        vectors: list[list[float]] = []
+        actual_dim = expected_dim
+        for start in range(0, len(docs), _EMBED_BATCH_SIZE):
+            batch = docs[start:start + _EMBED_BATCH_SIZE]
+            encoded = self.embedder.encode(batch)
+            validated = _validated_vectors(encoded, len(batch), actual_dim)
+            if validated is None:
+                return None
+            if actual_dim is None:
+                actual_dim = len(validated[0])
+                # Discover the dimension from only one bounded batch, then reject before embedding
+                # the rest of a corpus that could never fit the global vector budget.
+                if len(docs) * actual_dim > _MAX_VECTOR_VALUES:
+                    return None
+            vectors.extend(validated)
+        return vectors
 
     def _ensure_index(self) -> bool:
+        # Serialize lazy construction and publish the matrix last. Concurrent proof repairs may
+        # share one retriever; no caller may see names/docs from one generation with another matrix.
+        with self._index_lock:
+            return self._ensure_index_locked()
+
+    def _ensure_index_locked(self) -> bool:
         if self._mat is not None:
             return True
         if not self.embedder.available():
             return False
-        if self._cache_path and self._cache_path.exists():
+        source_fingerprint = self._cache_source_fingerprint()
+        if source_fingerprint is None:
+            return False
+        try:
+            model_tag = self._model_tag()
+        except Exception:
+            return False
+        if model_tag is not None and self._cache_path and self._cache_path.exists():
             try:
-                blob = pickle.loads(self._cache_path.read_bytes())
-                if (blob.get("version") == _VERSION and blob.get("modules") == self.modules
-                        and blob.get("model") == self._model_tag()):
-                    self._names, self._docs, self._mat = blob["names"], blob["docs"], blob["mat"]
-                    return True
+                blob = _read_json_cache(self._cache_path, _MAX_CACHE_BYTES)
+                cached = _validated_neural_cache(
+                    blob, self.modules, model_tag, source_fingerprint)
+                if cached is not None:
+                    names, docs, vecs = cached
+                    expected = self._expected_embedding_dim()
+                    if expected is None or len(vecs[0]) == expected:
+                        mat = _np.asarray(vecs, dtype="float32") if _np is not None else vecs
+                        self._names, self._docs = names, docs
+                        self._mat = mat
+                        return True
             except Exception:
                 pass
-        corpus = self._build_corpus()
-        if not corpus:
+        corpus = self._validated_corpus(self._build_corpus())
+        if corpus is None:
             return False
         names = [n for n, _ in corpus]
         docs = [f"{n} : {s}" if s else n for n, s in corpus]
-        vecs = self.embedder.encode(docs)
-        if not vecs:                       # embedder produced nothing → not usable
+        expected = self._expected_embedding_dim()
+        validated = self._embed_documents(docs, expected)
+        if validated is None:
+            # empty/ragged/non-finite/wrong-dimension embedder output → not usable
             return False
-        self._names, self._docs = names, docs
-        self._mat = _np.asarray(vecs, dtype="float32") if _np is not None else vecs
-        if self._cache_path:
+        mat = _np.asarray(validated, dtype="float32") if _np is not None else validated
+        cacheable_vectors = len(validated) * len(validated[0]) <= _MAX_CACHE_VECTOR_VALUES
+        if model_tag is not None and self._cache_path and cacheable_vectors:
             try:
-                self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-                self._cache_path.write_bytes(pickle.dumps(
-                    {"version": _VERSION, "modules": self.modules, "model": self._model_tag(),
-                     "names": self._names, "docs": self._docs, "mat": self._mat}))
+                # Eight decimal places are ample for cosine ranking while preventing Python's
+                # full-precision float representation from producing a cache larger than its read
+                # limit.  Reload validation renormalizes the quantized rows.
+                cached_vectors = [[round(value, 8) for value in row] for row in validated]
+                _atomic_write_json(self._cache_path, {
+                    "format": _CACHE_FORMAT,
+                    "version": _VERSION,
+                    "modules": self.modules,
+                    "model": model_tag,
+                    "source_fingerprint": source_fingerprint,
+                    "corpus": [[name, signature] for name, signature in corpus],
+                    "vectors": cached_vectors,
+                }, _MAX_CACHE_BYTES)
             except Exception:
                 pass
+        self._names, self._docs = names, docs
+        self._mat = mat  # readiness marker is published last
         return True
 
     def _topk(self, q: list[float], k: int) -> list[int]:
@@ -233,11 +516,28 @@ class NeuralRetriever:
         scored = sorted(range(len(self._mat)), key=lambda i: -_dot(q, self._mat[i]))
         return scored[:k]
 
+    def _matrix_dim(self) -> Optional[int]:
+        if self._mat is None:
+            return None
+        if _np is not None and not isinstance(self._mat, list):
+            return int(self._mat.shape[1]) if getattr(self._mat, "ndim", 0) == 2 else None
+        if isinstance(self._mat, list) and self._mat and isinstance(self._mat[0], list):
+            return len(self._mat[0])
+        return None
+
     def retrieve(self, claim: str, error: str = "") -> list[str]:
         if not self._ensure_index() or self._mat is None:
             return []
         query = f"{claim} {error}".strip()
-        q = self.embedder.encode([query])[0]
+        encoded = self.embedder.encode([query])
+        if not isinstance(encoded, list) or len(encoded) != 1 or not isinstance(encoded[0], list):
+            return []
+        dim = self._matrix_dim()
+        if dim is None:
+            return []
+        q = _normalized_vector(encoded[0], dim)
+        if q is None:
+            return []
         pool = max(self.max_results, self.rerank_pool) if (self.reranker and
                                                            self.reranker.available()) else self.max_results
         idx = self._topk(q, pool)

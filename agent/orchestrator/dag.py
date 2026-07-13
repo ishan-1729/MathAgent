@@ -10,8 +10,9 @@ Nodes are keyed by a **deep hash** of the (normalized) goal statement (`semantic
 identical sub-lemma arising on different branches resolves to the *same* node and is proven once and
 reused (memoization). The memo is **split-keyed** (T100 P1 item 4): the *effective* cache key is the
 PAIR `(semantic_goal_hash, proof_context_hash)`, where `proof_context_hash` fingerprints the
-elementary toolkit / gate / denylist / axiom-whitelist. A goal stays shared across branches under one
-context, but a toolkit/gate/lemma change INVALIDATES a stale PROVEN certificate (it is not reused).
+elementary toolkit / gate / denylist / axiom-whitelist, exact per-run permissions, and live
+review/verification policy. A goal stays shared across branches under one context, but any ruleset,
+permission, or authority-policy change invalidates a stale PROVEN certificate (it is not reused).
 A committed decomposition may not introduce a child that is an ancestor of the goal (acyclicity
 guard, LEAP's state-writer), so the "proof" can never be circular.
 """
@@ -30,13 +31,18 @@ if TYPE_CHECKING:  # avoid a runtime import cycle (toolkit is only needed for ty
 
 
 # --------------------------------------------------------------------------------------------------
-# Semantic-ish canonicalization for the memo key (see research/docs/system_design.md §7).
+# Strict proof-goal identity plus lossy signature-analysis normalization.
 #
-# This key is SOUNDNESS-CRITICAL: a *false hit* (two distinct goals hashing equal) would reuse a proof
-# of the wrong lemma. So canonicalization folds ONLY meaning-preserving surface differences (notation,
-# synonyms, spacing) and DELIBERATELY does NOT rename variables (α-renaming free single letters is
-# unsound — it would merge `x ∣ y` with `y ∣ x`) and does NOT reorder operands. Missing a true match
-# only costs recomputation; a false match would be unsound, so we bias hard toward never merging.
+# Goal identity is SOUNDNESS-CRITICAL: a *false hit* (two distinct goals sharing an identity) reuses a
+# proof of the wrong lemma.  Consequently the identity path below performs only Unicode NFC and
+# whitespace normalization.  In particular it never guesses that two notations or English phrasings
+# mean the same thing: ``×`` can mean Cartesian product while ``*`` can mean pointwise multiplication,
+# and an en/em dash is not generally a minus sign.  Missing a true match only costs recomputation; a
+# false match is unsound.
+#
+# ``canonical_form`` remains a deliberately lossy ANALYSIS helper for H0 signature extraction.  It is
+# not used for goal binding, DAG keys, cycle checks, or proof-certificate reuse.  Keeping the two paths
+# distinct prevents convenience normalization from becoming proof authority.
 # --------------------------------------------------------------------------------------------------
 
 _SUPERSCRIPT = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
@@ -44,13 +50,13 @@ _SUPERSCRIPT = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
 _SUBSCRIPT = {"₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
               "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9"}
 
-# Single-character math symbols → a canonical ASCII spelling (meaning-preserving).
+# Single-character math symbols -> a convenient ASCII spelling for ANALYSIS ONLY.  Context-sensitive
+# glyphs such as multiplication/Cartesian-product and typographic dashes are intentionally absent.
 _SYMBOLS = [
     ("⟺", "<->"), ("⇔", "<->"), ("↔", "<->"),
     ("⟹", "->"), ("⟶", "->"), ("⇒", "->"), ("→", "->"),
     ("≤", "<="), ("⩽", "<="), ("≥", ">="), ("⩾", ">="), ("≠", "!="),
-    ("×", "*"), ("⋅", "*"), ("·", "*"),
-    ("−", "-"), ("–", "-"), ("—", "-"),          # U+2212 minus, en-dash, em-dash → '-'
+    ("−", "-"),                                     # U+2212 mathematical minus only
     ("∤", " notdvd "), ("∣", "|"),               # divisibility
     ("ℤ", " Int "), ("ℕ", " Nat "), ("ℚ", " Rat "), ("ℝ", " Real "), ("ℂ", " Complex "),
     ("∀", " forall "), ("∃", " exists "), ("∈", " in "),
@@ -99,8 +105,23 @@ def _fold_scripts(s: str) -> str:
     return "".join(out)
 
 
+def goal_identity_form(statement: str) -> str:
+    """Return the collision-resistant textual identity input for a proof goal.
+
+    Only Unicode canonical composition and whitespace runs are normalized.  No punctuation,
+    delimiter, notation, symbol, synonym, or leading-command rewrite is sound for arbitrary
+    mathematical prose, so none is performed on this authority-bearing path.
+    """
+    s = unicodedata.normalize("NFC", statement or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def canonical_form(statement: str) -> str:
-    """Conservative semantic canonicalization of a goal statement (see the module note above)."""
+    """Lossy convenience normalization for deterministic signature analysis only.
+
+    This function must never be used as proof-goal identity.  Use :func:`goal_identity_form` (or the
+    public :func:`goal_hash`) for goal binding and memoization.
+    """
     s = unicodedata.normalize("NFC", statement or "")
     s = s.replace("$", "").replace("`", "")          # drop math/code delimiters
     s = _fold_scripts(s)
@@ -116,15 +137,19 @@ def canonical_form(statement: str) -> str:
 
 
 def semantic_goal_hash(statement: str) -> str:
-    """Deep hash of a goal STATEMENT, keyed by its conservative canonical form. Case-preserving
-    (`x` != `X`); folds notation/synonyms/spacing but never renames variables or reorders operands.
+    """Full SHA-256 identity of a goal statement's conservative textual identity.
+
+    Case and notation are preserved (``x`` != ``X`` and ``×`` != ``*``).  Only NFC and whitespace
+    runs are normalized by :func:`goal_identity_form`.  Returning the full digest matters because
+    this value is an authority-bearing DAG/cache key, not a display abbreviation.
 
     This is the *statement identity* (T100 split-keyed memo): an identical sub-lemma arising on
     different branches resolves to the SAME node and is proven once (cross-branch sharing / fan-in).
     It deliberately does NOT depend on the toolkit/gate config — that invalidation axis is carried
     separately by `proof_context_hash` so a goal stays shared while a ruleset change invalidates only
-    the stale PROVEN certificate."""
-    return hashlib.sha256(canonical_form(statement).encode("utf-8")).hexdigest()[:16]
+    the stale PROVEN certificate. ``run_context`` carries exact per-run permissions separately from
+    statement identity."""
+    return hashlib.sha256(goal_identity_form(statement).encode("utf-8")).hexdigest()
 
 
 # Backwards-compatible public alias (callers across the repo import `goal_hash`). The semantic hash
@@ -166,23 +191,33 @@ def _ctx_tokens(toolkit: "Toolkit") -> list[str]:
     return tokens
 
 
-def proof_context_hash(toolkit: "Toolkit") -> str:
-    """A stable hash over the elementary-proof CONTEXT (T100 split-keyed memo): the toolkit /
-    elementary-axiom vocabulary, the allowed-justification vocabulary, the denylist/allow-context and
-    Lean allowlist/denylist, and the axiom whitelist. Two runs with the same context share PROVEN
-    certificates; any toolkit/gate/lemma/denylist change yields a DIFFERENT hash so a stale PROVEN
-    minted under the old context is NOT reused (a cache MISS).
+def proof_context_hash(toolkit: "Toolkit", *, run_context: Optional[str] = None,
+                       policy_context: Optional[str] = None) -> str:
+    """A stable hash over every permission-bearing proof context.
+
+    The certificate identity includes both the toolkit/gate/denylist/axiom vocabulary and the exact
+    per-run prover context (for example, a citable-input whitelist), and the execution policy supplied
+    by the orchestrator (proof-judge/reviewer/verifier identity plus enforcement flags). Two runs may
+    share a PROVEN certificate only when every dimension is identical. ``None`` and an explicitly empty
+    string are encoded distinctly and no text normalization is attempted: a false cache hit is a
+    soundness bug, while a conservative miss only costs work.
 
     Length-prefixed token encoding (steal from Forge's `_canon`): each token is emitted as
     `<len>:<token>` so a goal/string boundary can never be forged by embedding a delimiter."""
     h = hashlib.sha256()
-    for tok in _ctx_tokens(toolkit):
+    tokens = _ctx_tokens(toolkit)
+    tokens.append("run_context:none" if run_context is None else f"run_context:text:{run_context}")
+    tokens.append("policy_context:none" if policy_context is None
+                  else f"policy_context:text:{policy_context}")
+    for tok in tokens:
         b = tok.encode("utf-8")
         h.update(str(len(b)).encode("ascii"))
         h.update(b":")
         h.update(b)
         h.update(b"|")
-    return h.hexdigest()[:16]
+    # This digest is authority-bearing certificate identity, not a display ID.  Keep all 256 bits;
+    # truncation creates an avoidable collision path for stale-proof reuse.
+    return h.hexdigest()
 
 
 @dataclass
@@ -243,10 +278,12 @@ class ProofDAG:
     """An AND-OR proof DAG with a SPLIT-KEYED memo (T100 P1 item 4).
 
     Nodes are keyed by `semantic_goal_hash` (statement identity → cross-branch sharing / fan-in). The
-    DAG additionally carries a `context` = `proof_context_hash(toolkit)`. A PROVEN certificate records
-    the context it was accepted under (`OrNode.proof_context`). The *effective* cache key is therefore
+    DAG additionally carries a `context` = `proof_context_hash(toolkit, run_context=...,
+    policy_context=...)`. A PROVEN
+    certificate records the context it was accepted under (`OrNode.proof_context`). The *effective*
+    cache key is therefore
     the PAIR `(semantic_goal_hash, proof_context_hash)`: a PROVEN node minted under a DIFFERENT context
-    (a toolkit/gate/denylist/lemma change) is a STALE certificate and is NOT reused — it is reset to
+    (a toolkit/gate/denylist/lemma/review-policy change) is a STALE certificate and is NOT reused — it is reset to
     OPEN so the goal is re-attempted under the new context (a cache MISS). Identical context ⇒ hit.
 
     `context` may be None (legacy / context-agnostic callers): then no invalidation occurs and the
@@ -382,10 +419,16 @@ class ProofDAG:
 
     def mark_proven_via_children(self, goal: str) -> OrNode:
         node = self.get_or_create(goal)
-        # all-children-success: `.proven` is is_success, so a LEAN_VERIFIED child counts exactly like a
-        # PROVEN one (a soft-PROVEN and a hard-LEAN_VERIFIED child are both "proven" for composition).
-        if not all(self.nodes[ck].proven for ck in node.children):
-            raise ValueError("cannot mark proven: not all children are proven")
+        if not node.children:
+            raise ValueError("cannot mark proven: decomposition has no children")
+        child_nodes = [self.nodes.get(ck) for ck in node.children]
+        # All children must carry a success certificate for THIS exact context. Raw `.proven` is not
+        # enough after a DAG context retarget: an A-context child remains state=PROVEN until an evicting
+        # access, but it cannot discharge a B-context parent. A LEAN_VERIFIED child counts like PROVEN
+        # only when its receipt is current too.
+        if not all(child is not None and child.proven and self._context_valid(child)
+                   for child in child_nodes):
+            raise ValueError("cannot mark proven: not all children are proven in the current context")
         node.proof_context = self.context   # certificate is valid only under the current context
         node.reason = None
         # P4 LEAP parent-composition rule: a parent is lean_verified ONLY when its COMPOSITION sketch
@@ -397,7 +440,8 @@ class ProofDAG:
         # default path) this leaves lean_verified False (soft PROVEN), unchanged behavior.
         lean = bool(
             node.sketch_lean_verified
-            and all(self.nodes[ck].state is NodeState.LEAN_VERIFIED for ck in node.children))
+            and all(child is not None and child.state is NodeState.LEAN_VERIFIED
+                    for child in child_nodes))
         node.lean_verified = lean
         # First-class state: a fully Lean-verified composition is LEAN_VERIFIED (dominates PROVEN); a
         # soft composition (no/failed sketch verifier, or any non-LEAN_VERIFIED child) stays PROVEN.

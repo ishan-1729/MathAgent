@@ -1,7 +1,8 @@
 # ABLATION: default profile with the REVIEW stage disabled.
-# review=False -> the builder injects reviewer=None; decomposition sketches are not soft-reviewed.
+# review=False -> reviewer=None and proof-ledger judge=None; neither decomposition sketches nor direct
+# leaf proofs receive Layer-2 model review (deterministic gates remain active).
 name: ablation-no-review
-notes: "Ablation of the default profile: review OFF (reviewer=None)."
+notes: "Ablation of the default profile: review OFF (reviewer=None, proof judge=None)."
 mode: dag
 elementarity: soft
 stages:

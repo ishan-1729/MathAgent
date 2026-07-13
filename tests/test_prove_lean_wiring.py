@@ -249,46 +249,20 @@ def test_main_exits_when_lean_per_node_but_lean_unavailable(monkeypatch, capsys)
     rc = prove_cli.main()
     assert rc == 2
     err = capsys.readouterr().err
-    assert "--lean-per-node requires the Lean server" in err
+    assert "lean.per_node=True requires the persistent Lean REPL" in err
 
 
-def test_main_falls_back_for_plain_server_when_lean_unavailable(monkeypatch, capsys):
-    """CONTRAST (byte-identical pre-feature behavior): plain --server (NOT --lean-per-node) with no REPL
-    must NOT exit early — it falls back to per-call lean. This guards that the new error path is scoped
-    to --lean-per-node only. We stop the run right after the server block by stubbing the DAG run."""
+def test_main_rejects_plain_inert_server_flag(monkeypatch, capsys):
+    """A persistent server with no terminal/per-node consumer is an inert control and fails before
+    any backend call; it is not silently rewritten into an unrelated one-shot compilation mode."""
     import agent.tools.codex_prover as cp
     import agent.gates.lean_server as ls
 
     monkeypatch.setattr(cp.CodexProver, "available", staticmethod(lambda: True))
     monkeypatch.setattr(ls.LeanServer, "available", classmethod(lambda cls, project_dir=None: False))
 
-    # Make the DAG driver a no-op so main() does not launch a real Codex run after the server block.
-    class _NoopResult:
-        proven = False
-        terminal = None
-
-        class dag:
-            nodes = {}
-
-            @staticmethod
-            def stats():
-                return {"nodes": 0, "proven": 0, "cache_hits": 0}
-
-        def proof_tree(self):
-            return {}
-
-    class _NoopDriver:
-        def __init__(self, *a, **k):
-            pass
-
-        def run(self, goal):
-            return _NoopResult()
-
-    monkeypatch.setattr(prove_cli, "build_dag_driver", lambda *a, **k: _NoopDriver())
     monkeypatch.setattr(sys, "argv", ["prove.py", "a goal", "--server"])
 
     rc = prove_cli.main()
-    out = capsys.readouterr().out
-    # Did NOT take the --lean-per-node error exit (rc==2); fell through to per-call lean.
-    assert rc in (0, 1)
-    assert "using per-call lean" in out
+    assert rc == 2
+    assert "lean.server=True is inert" in capsys.readouterr().err

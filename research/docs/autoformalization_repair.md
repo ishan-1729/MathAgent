@@ -73,11 +73,11 @@ the elementary Mathlib source** (Data/Nat, Data/Int, Data/ZMod by default), with
 fully-qualified names and on-disk caching (builds in ~2.5s, cached under `.lake/`). `HybridRetriever`
 combines it with Loogle (Loogle = exact names from compile errors; BM25 = relevance from the claim's
 meaning words). The CLI `--retrieval` now uses the hybrid. BM25 is the standard local lexical-IR
-baseline and the backend is pluggable; **true neural embeddings remain future work** — BM25 is lexical,
-so an abbreviation like `gcd` won't match the phrase "greatest common divisor" (it matches `findGreatest*`).
+baseline. The default remains lexical, while `--neural` with the `mathagent[neural]` extra adds the
+implemented bi-encoder and optional cross-encoder reranker for abbreviation/synonym recall.
 
 ## Caveats
 - Repair improves the rate but does not guarantee compilation on hard NT statements; the loop reports
   honest failure with the last Lean error after exhausting the budget.
-- Retrieval is lexical (Loogle name/type patterns + BM25 token overlap); a neural embedding backend
-  would close abbreviation/synonym gaps.
+- Retrieval defaults to lexical Loogle + BM25. Neural retrieval is opt-in because it carries larger
+  model/index dependencies; when enabled, the bi-encoder/reranker addresses abbreviation/synonym gaps.

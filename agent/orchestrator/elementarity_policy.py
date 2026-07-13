@@ -17,12 +17,12 @@ TABLE (authoritative — keep in lockstep with the architecture contract)::
 
     level          enforce  terminal  per_node
     none            False    False     False
-    soft            True     False     False
+    soft            True     False     <lean.per_node>
     authoritative   True     True      <lean.per_node>
 
-Note ``authoritative``'s ``attach_per_node_lean`` is data-dependent: it is the run's
-``lean.per_node`` flag. ``policy_for`` therefore takes that flag (defaulting to ``False`` so a bare
-``policy_for(level)`` is still total); the builder passes ``profile.lean.per_node``.
+The ``soft`` and ``authoritative`` rows' ``attach_per_node_lean`` decision is data-dependent: it is
+the run's ``lean.per_node`` flag. ``policy_for`` therefore takes that flag (defaulting to ``False``
+so a bare ``policy_for(level)`` is still total); the builder passes ``profile.lean.per_node``.
 """
 from __future__ import annotations
 
@@ -43,9 +43,9 @@ class ElementarityPolicy:
 def policy_for(level: ElementarityLevel, *, lean_per_node: bool = False) -> ElementarityPolicy:
     """Map an :class:`ElementarityLevel` to its :class:`ElementarityPolicy` per the TABLE.
 
-    ``lean_per_node`` is the run's ``lean.per_node`` flag; it ONLY affects ``authoritative`` (the one
-    row whose ``attach_per_node_lean`` is data-dependent). For ``none``/``soft`` per-node Lean is
-    always off regardless of the flag (those levels wire no Lean gates at all).
+    ``lean_per_node`` is the run's ``lean.per_node`` flag. It affects both enforcing levels
+    (``soft`` and ``authoritative``); ``none`` always keeps every Lean gate off. The terminal gate is
+    still exclusive to ``authoritative``.
     """
     if level is ElementarityLevel.none:
         return ElementarityPolicy(
@@ -57,7 +57,7 @@ def policy_for(level: ElementarityLevel, *, lean_per_node: bool = False) -> Elem
         return ElementarityPolicy(
             enforce_elementarity=True,
             attach_terminal_gate=False,
-            attach_per_node_lean=False,
+            attach_per_node_lean=bool(lean_per_node),
         )
     if level is ElementarityLevel.authoritative:
         return ElementarityPolicy(

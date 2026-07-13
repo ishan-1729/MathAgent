@@ -1,8 +1,8 @@
 # The DEFAULT MathAgent profile (the maintainer default: Claude roles).
 #
 # Today's wiring: elementarity enforced in-engine (soft), decompose + review on, no breadth search
-# (population/refine/evolve off), no Lean gates, DAG mode, depth 3. This is the BYTE-IDENTICAL
-# pre-feature search path expressed as data; it relies on the RunProfile field defaults (so every role
+# (population/refine/evolve off), no Lean gates, DAG mode, depth 3. It includes the now-standard
+# full-ledger Layer-2 judge and relies on the RunProfile field defaults (so every role
 # is provider=claude with its per-role default model: prover/refiner=opus, decomposer/reviewer/
 # comparator/judge/formalizer/faithfulness=sonnet).
 name: default

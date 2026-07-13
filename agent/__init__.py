@@ -5,8 +5,8 @@ This package holds the runnable harness described in agent/PLAN.md:
   - agent.tools        : deterministic tools (numeric/witness search, ...)
   - agent.orchestrator : the control loop, state machine, and run trace
 
-v1 is training-free: the deterministic verifiers in this package *pressure and filter*
-elementarity; the authoritative hard gate (the Lean dependency audit, Layer 4) is a later phase.
+v1 is training-free: Layers 1–3 pressure and filter elementarity; authoritative certification is
+reserved for the compiled Lean proof-term dependency/axiom audit (Layer 4) plus faithfulness.
 """
 
 __version__ = "0.1.0"

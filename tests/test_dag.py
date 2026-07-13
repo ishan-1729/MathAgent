@@ -15,7 +15,7 @@ def test_goal_hash_is_case_sensitive():
     assert goal_hash("x^2") != goal_hash("X^2")
 
 
-# ---- semantic canonicalization: meaning-preserving surface differences MUST collapse ----
+# ---- lossy analysis canonicalization (never used for proof-goal identity) ----
 
 @pytest.mark.parametrize("a,b", [
     ("n² − n is even", "n^2 - n is even"),                 # superscript + unicode minus
@@ -32,7 +32,23 @@ def test_goal_hash_is_case_sensitive():
     ("x₁ + x₂", "x_1 + x_2"),                              # subscripts
 ])
 def test_canonical_form_folds_surface_differences(a, b):
-    assert goal_hash(a) == goal_hash(b)
+    assert canonical_form(a) == canonical_form(b)
+
+
+@pytest.mark.parametrize("a,b", [
+    ("For finite sets A and B, A × B is empty.",
+     "For finite sets A and B, A * B is empty."),          # Cartesian vs pointwise product
+    ("The expression x–y is positive.",
+     "The expression x-y is positive."),                  # typographic dash is not a parsed minus
+    ("P if and only if Q", "P iff Q"),                    # no natural-language semantic guessing
+    ("$a + b$", "a + b"),                                 # delimiters remain part of identity
+])
+def test_goal_hash_never_merges_context_sensitive_restated_goals(a, b):
+    assert goal_hash(a) != goal_hash(b)
+
+
+def test_goal_hash_is_full_sha256_not_a_display_truncation():
+    assert len(goal_hash("G")) == 64
 
 
 # ---- soundness: DISTINCT goals must NEVER collide (a false hit reuses the wrong proof) ----
@@ -103,6 +119,22 @@ def test_mark_proven_via_children_requires_all_proven():
     dag.mark_proven_direct("B", "lb")
     node = dag.mark_proven_via_children("G")
     assert node.state is NodeState.PROVEN
+
+
+def test_mark_proven_via_children_rejects_vacuous_decomposition():
+    dag = ProofDAG()
+    dag.commit_decomposition("G", "sketch", [])
+    with pytest.raises(ValueError, match="no children"):
+        dag.mark_proven_via_children("G")
+
+
+def test_mark_proven_via_children_rejects_child_certificate_from_stale_context():
+    dag = ProofDAG(context="ctx-a")
+    dag.commit_decomposition("G", "sketch", ["A"])
+    dag.mark_proven_direct("A", "ledger")
+    dag.context = "ctx-b"
+    with pytest.raises(ValueError, match="current context"):
+        dag.mark_proven_via_children("G")
 
 
 def test_assemble_marks_shared_nodes():

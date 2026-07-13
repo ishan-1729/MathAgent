@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 #   agent/      - the agentic system (orchestrator, roles, gates, tools, instructions, workflows)
 #   knowledge/  - the math knowledge base (methods, library, examples)
 #   benchmarks/ - targets + scoring (problems, evaluation)
-#   formal/     - Lean (advisory in v1)
+#   formal/     - Lean project used by the authoritative Layer-4 audit
 #   research/   - literature + design docs (papers, docs)
 #   scripts/    - infra ; .agents/ - skill discovery convention
 REQUIRED_TOP_LEVEL_DIRS = [
@@ -68,6 +71,7 @@ KEY_FILES = [
     "agent/roles/prover.md",
     "agent/roles/critic_judge.md",
     "scripts/prove.py",
+    "scripts/__init__.py",
     "research/papers/INDEX.md",
     "research/docs/literature_design_implications.md",
     "knowledge/methods/TEMPLATE.md",
@@ -81,6 +85,40 @@ KEY_FILES = [
 ]
 
 REQUIRED_FRONTMATTER_KEYS = {"name", "type", "status"}
+_YAML_EXCLUDED_PARTS = frozenset({
+    ".git", ".hypothesis", ".lake", ".pytest_cache", ".venv", "build", "dist",
+    "node_modules", "__pycache__",
+})
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects literal duplicate keys instead of overwriting history."""
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep=False):
+    seen: set[object] = set()
+    for key_node, _value_node in node.value:
+        key = loader.construct_object(key_node, deep=False)
+        try:
+            duplicate = key in seen
+            seen.add(key)
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "found an unhashable mapping key", key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"found duplicate key {key!r}", key_node.start_mark,
+            )
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 def read_frontmatter(path: Path) -> dict[str, str]:
@@ -124,6 +162,37 @@ def check_frontmatter(markdown_files: list[Path], skipped_names: set[str]) -> li
     return failures
 
 
+def discover_yaml_files(root: Path = ROOT) -> list[Path]:
+    files: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        # Prune before descent. Filtering paths after ``rglob`` still traverses multi-gigabyte
+        # virtualenv/Lake dependency trees and turns an instant structural check into a long scan.
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if name not in _YAML_EXCLUDED_PARTS and not name.endswith(".egg-info")
+        )
+        base = Path(directory)
+        files.extend(
+            base / name for name in sorted(filenames)
+            if (base / name).suffix.lower() in {".yaml", ".yml"}
+        )
+    return files
+
+
+def check_yaml_files(yaml_files: list[Path], *, root: Path = ROOT) -> list[str]:
+    failures: list[str] = []
+    for path in yaml_files:
+        try:
+            yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                rel = path
+            failures.append(f"{rel}: invalid strict YAML: {exc}")
+    return failures
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -141,6 +210,9 @@ def main() -> int:
     library_files = sorted((ROOT / "knowledge" / "library").rglob("*.md"))
     failures.extend(check_frontmatter(library_files, {"README.md", "identity_TEMPLATE.md"}))
 
+    yaml_files = discover_yaml_files()
+    failures.extend(check_yaml_files(yaml_files))
+
     if failures:
         print("MathAgent skeleton check: FAIL")
         for failure in failures:
@@ -152,6 +224,7 @@ def main() -> int:
     print(f"Checked {len(KEY_FILES)} key files.")
     print(f"Checked {len(method_files)} method markdown files.")
     print(f"Checked {len(library_files)} library markdown files.")
+    print(f"Checked {len(yaml_files)} YAML files with duplicate-key rejection.")
     return 0
 
 

@@ -106,6 +106,8 @@ def _parse_sketch_result(raw: str) -> FormalizationResult:
 
 
 class CodexFormalizer:
+    certification_trusted = True
+    model_call_cost = 1
     def __init__(self, toolkit: Toolkit, cfg: Optional[CodexConfig] = None):
         self.toolkit = toolkit
         self.cfg = cfg or CodexConfig()
@@ -193,6 +195,9 @@ class ClaudeFormalizer:
     instead of Codex. A drop-in for the same ``Formalizer`` Protocol used by ``formalize_and_audit`` /
     ``make_terminal_gate``."""
 
+    certification_trusted = True
+    model_call_cost = 1
+
     def __init__(self, toolkit: Toolkit, cfg: Optional[ClaudeConfig] = None):
         self.toolkit = toolkit
         self.cfg = cfg or ClaudeConfig(model="opus")
@@ -258,13 +263,20 @@ class ClaudeFormalizer:
 
 
 class ScriptedFormalizer:
-    """Returns a fixed Lean source, or a SEQUENCE (one per formalize call) to drive a repair loop."""
+    """Returns fixed Lean source for deterministic tests.
+
+    Scripted output is not a production certificate source. ``certification_trusted`` therefore
+    defaults to False; tests that intentionally model a trusted external formalizer must opt in
+    explicitly. The registry never opts in.
+    """
 
     def __init__(self, lean_source: str | list[str], theorem_name: str = DEFAULT_THEOREM_NAME,
-                 ok: bool = True):
+                 ok: bool = True, *, certification_trusted: bool = False):
         self._sources = [lean_source] if isinstance(lean_source, str) else list(lean_source)
         self.theorem_name = theorem_name
         self.ok = ok
+        self.certification_trusted = bool(certification_trusted)
+        self.model_call_cost = 0
         self.calls = 0
         self.repair_calls = 0
 

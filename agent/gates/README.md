@@ -20,33 +20,41 @@ sense, first-order PA, IΔ₀+exp, the reverse-math Big Five, and Buss's feasibl
 so any operational definition is a **stipulation, not a discovered fact**.
 
 What the audit actually decides is the *decidable* predicate **"this proof term's transitive
-dependency/axiom footprint is contained in a stipulated fragment T"** — where T is delimited by
-[`denylist.yaml`](denylist.yaml) (`lean_denylist_decls` — the content-bearing declarations excluded from T,
-minus the `lean_infrastructure_allowlist` / `lean_elementary_by_fiat` carve-outs) together with the positive
-vocabulary in [`allowed_toolkit.yaml`](allowed_toolkit.yaml), over the benign-axiom base
-`{propext, Classical.choice, Quot.sound}`. Informally T is a PA / IΔ₀+exp-flavored fragment of elementary
-number theory, but the *authoritative* meaning of "elementary" here is exactly and only "footprint ⊆ T as those
-two YAML files currently define it." (By Gödel/Church–Turing the complementary claim — "φ has *no* elementary
-proof" — is undecidable, so this gate is sound-but-incomplete *by theorem*, not by effort: it can over-reject a
-genuinely-elementary proof whose only found derivation routes through a denylisted lemma.)
+dependency/axiom footprint is contained in a stipulated fragment T"**. At Layer 4, T is defined by
+[`denylist.yaml`](denylist.yaml): `lean_denylist_decls`, the dominating
+`lean_infrastructure_allowlist` / `lean_elementary_by_fiat` carve-outs, and the axiom policy (including the
+accepted base `{propext, Classical.choice, Quot.sound}`). The positive justification vocabulary in
+[`allowed_toolkit.yaml`](allowed_toolkit.yaml) constrains the informal ledger at Layers 0–3; it is not a
+positive whitelist over every constant in the compiled Lean proof. Informally T is a PA / IΔ₀+exp-flavored
+fragment of elementary number theory, but the authoritative meaning here is exactly the versioned Layer-4
+policy, not a canonical mathematical definition. (By Gödel/Church–Turing the complementary claim — "φ has
+*no* elementary proof" — is undecidable, so this gate is sound-but-incomplete *by theorem*, not by effort: it
+can over-reject a genuinely-elementary proof whose only found derivation routes through a denylisted lemma.)
 
-Because T is a stipulated, human-authored, versioned approximation, **the denylist version and the toolchain
-hash are part of the verdict's identity**: the same proof term can be `PROVEN`-elementary under one revision of
-`denylist.yaml`/`allowed_toolkit.yaml` and rejected under the next (the `ℤ[i]`/`Zsqrtd` additions of 2026-06-28
-are exactly such a revision). A Layer-4 verdict is therefore only meaningful relative to the denylist/allowlist
-revision and Lean/Mathlib toolchain that produced it — treat "certified elementary" as shorthand for "footprint
-⊆ T@\<denylist-version, toolchain-hash\>", never as a canonical mathematical property.
+Because T is a stipulated, human-authored, versioned approximation, **the policy revision and Lean/Mathlib
+toolchain must accompany any durable verdict**: the same proof term can pass Layer 4 under one revision of
+`denylist.yaml` and be rejected under the next (the `ℤ[i]`/`Zsqrtd` additions of 2026-06-28
+are exactly such a revision). The production bridge records the runtime-derived Lean toolchain and a
+SHA-256 receipt for the exact Lake manifest (or an explicit `core-only` marker), rejects a runtime/project-pin
+mismatch or a manifest that changes during compilation/server startup, and never accepts the former
+caller-controlled `MATHAGENT_TOOLCHAIN` label. Durable experiment/certificate storage retains that receipt
+and must also retain the policy revision. A Layer-4 verdict is therefore only meaningful relative to those inputs
+— treat "certified elementary" as shorthand for "footprint ⊆ T@\<policy-revision, toolchain\>", never as a
+canonical mathematical property.
 
-## The dual gate
+## The layered gate
 
 ### Soft gates (rank / prune during search — never authoritative)
 - **Elementary Judge node** — pre-commit reviewer that scores admissibility and prunes branches before they
   enter the proof DAG (strongest soft lever).
-- **Constrained-scope framing** — the allowed toolkit is pinned as an explicit, agent-immutable fact set.
+- **Constrained-scope framing** — generation roles receive the closed justification vocabulary and
+  elementary-method instructions. The prose files under `agent/instructions/` and the contents of
+  `knowledge/` are not implicitly injected into prompts.
 - **Paradigm scaffold** — force an intermediate elementary-arithmetic reasoning trace before any formalization.
-- **Retrieval bias** — premise retrieval restricted to a curated elementary corpus in `knowledge/`.
+- **Retrieval bias** — premise retrieval is restricted to a curated elementary subset of Mathlib.
 
-### Hard gates (deterministic accept/reject — authoritative), ranked by robustness
+### Implemented deterministic defenses
+
 1. **Two-tier proof-term dependency audit** — walk the kernel proof term's constant-dependency closure; reject
    if it touches a **content-bearing denylist** declaration, while always permitting an **infrastructure
    allowlist** (`WellFounded.fix`, `Acc.rec`, `Nat.rec`, `Decidable`/`DecidableEq` instances, `SizeOf`,
@@ -56,24 +64,45 @@ revision and Lean/Mathlib toolchain that produced it — treat "certified elemen
    routed around.
 2. **Axiom integrity** — kernel `collectAxioms`: accepted axiom set ⊆ `{propext, Classical.choice, Quot.sound}`
    (this, not a source scan, catches `sorry`/injected-axiom smuggling).
-3. **AST legality check** (LongCat `V_leg`-style) — statement unchanged, no `unsafe`/`macro`/redefinition,
-   plus forbidden `import`/`open` rejection (coarse first filter).
-4. **Tactic-palette whitelist** — restrict to elementary tactics; *necessary but not sufficient* (`simp`,
-   `nlinarith`, `decide`, `polyrith`, `exact?` can silently pull heavy lemmas — always re-audit the term).
+3. **Conservative source boundary** — before compilation, `lean_bridge.py` lexes model-authored Lean,
+   permits only fixed umbrella imports, requires the requested theorem to be declared locally, and rejects
+   quoted literals/identifiers, attributes, `#` commands, `unsafe`, `macro`, elaborator/evaluation bridges,
+   `set_option`, foreign/native hooks, and related code-bearing tokens. The bridge also binds the emitted
+   audit to a fresh nonce, validates the returned theorem/report shape, and derives the toolchain/manifest
+   receipt. A content-passing legacy or synthetic report without that verified receipt is non-authoritative.
+
+Only items 1–2 decide elementary certification. Item 3 narrows the untrusted-source attack surface and
+prevents theorem/import substitution; it is not a substitute for the kernel dependency audit.
+
+### Deferred defense-in-depth
+
+- A full **elaborated-AST legality pass** in the LongCat `V_leg` style remains unimplemented. The current
+  lexer-level source validator is deliberately conservative but is not described as a complete AST pass.
+- A **restricted-import Lean environment** and a deterministic **tactic-palette whitelist** remain optional
+  future filters. Prompt rules discourage problematic tactics, but tactics such as `simp`, `nlinarith`,
+  `decide`, `polyrith`, or `exact?` can pull dependencies indirectly, so the proof term must always be
+  re-audited.
 
 The **boundary rulings** for contested tools (Pell fundamental solution, roots-of-unity filter, QR/Jacobi,
-Zsygmondy, LTE `p=2`, `v_p` vs `p`-adic) are pinned in `../PLAN.md` §2.1 and belong in `allowed_toolkit.md`.
+Zsygmondy, LTE `p=2`, `v_p` vs `p`-adic) are pinned in `../PLAN.md` §2.1 and declared in
+`allowed_toolkit.yaml` (`boundary_rulings`) — but note they are **declared, not enforced**: no gate consults
+`Toolkit.ruling()` yet.
 
-For the v1 (informal-first) plan, the hard gate operates over the informal proof via a structured
-**method-ledger** check, with the Lean dependency audit prototyped as the Lean track matures. See
-`../PLAN.md` §5 for the full design, the denylist seed, and the v1-vs-later split.
+The structured **method-ledger** gate is the deterministic admission filter for informal search. It can
+reject malformed, logically incomplete, numerically false, or explicitly non-elementary candidates, but a
+pass is only `soft_proven`. Certification additionally requires a compiling Lean proof, a passing Layer-4
+audit, statement faithfulness, and trusted production formalizer/faithfulness components. Scripted and
+generic duck-typed components default to `certification_trusted=False` and cannot mint authority.
 
 > **Layer 4 is now built + live-validated (Lean 4.30.0).** `lean/Audit.lean` (extractor),
 > `lean_audit.py` (the decision logic), and `lean_bridge.py` (the runner) implement the proof-term
 > dependency + axiom audit. Confirmed: an elementary core proof passes; a `sorry` proof is rejected
-> via the axiom whitelist. See `../../research/docs/lean_layer4_and_population.md`.
+> via the axiom whitelist. See
+> [`../../research/docs/lean_layer4_and_population.md`](../../research/docs/lean_layer4_and_population.md).
 
-## Artifacts that live here (as they are built)
-- `denylist.md` / `denylist.yaml` — banned methods, Mathlib namespaces, and lemma families.
-- `allowed_toolkit.md` — the positive elementary toolkit (mirrors `agent/instructions/elementary_proof_rules.md`).
-- `auditor/` — the dependency-audit + AST-legality tool (Lean track).
+## Artifacts that live here
+- `denylist.yaml` — banned methods, Mathlib namespaces, and lemma families.
+- `allowed_toolkit.yaml` — the positive elementary toolkit + `boundary_rulings` (mirrors `agent/instructions/elementary_proof_rules.md`).
+- `ledger.schema.json` — the Draft-07 step-ledger schema.
+- Layer-1–3 gate: `ledger.py`, `obligations.py`, `scanner.py`, `gate.py`, `toolkit.py`, `report.py`.
+- Layer-4 (authoritative Lean audit): `lean/` (`Audit.lean` extractor) + `lean_audit.py` (decision logic) + `lean_bridge.py` (runner) + `lean_server.py` (persistent Mathlib REPL). *(There is no `auditor/` directory.)*

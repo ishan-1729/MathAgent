@@ -6,10 +6,11 @@ import json
 
 import pytest
 
+from agent.gates.gate import Verdict, evaluate
 from agent.orchestrator.dag_driver import (
     DagDriver, ReviewVerdict, ScriptedDecomposer, ScriptedReviewer, _proves_goal,
 )
-from agent.orchestrator.driver import FlatDriver, ScriptedProver
+from agent.orchestrator.driver import FlatDriver, JudgeVerdict, ScriptedJudge, ScriptedProver
 from agent.orchestrator.population import KeyComparator
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.tournament import (
@@ -20,6 +21,11 @@ from agent.gates.toolkit import load_toolkit
 
 TOOLKIT = load_toolkit()
 OK_REVIEW = ReviewVerdict(useful=True, elementary=True)
+
+
+def passing_proof_judge(name: str = "logic") -> ScriptedJudge:
+    """A repeatable Layer-2 verdict for tests whose challenger is logically sound."""
+    return ScriptedJudge(name, [JudgeVerdict(name, elementary=True, no_gaps=True)])
 
 
 def valid_ledger(goal: str) -> str:
@@ -179,6 +185,111 @@ def test_reviewer_non_elementary_blocks_commit():
     assert not _driver(prover, decomposer=decomp, reviewer=rev, max_decomp_attempts=2).run("G").proven
 
 
+def test_reviewer_requires_literal_true_booleans():
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    malformed = ScriptedReviewer([
+        ReviewVerdict(useful="false", elementary=True, notes=["malformed provider boolean"]),
+    ])
+    res = _driver(prover, decomposer=decomp, reviewer=malformed,
+                  max_decomp_attempts=1).run("G")
+    assert not res.proven
+    event = res.trace.by_kind("review")[0]
+    assert event.data["useful"] is False and event.data["accepted"] is False
+
+
+def test_solution_only_judge_ignores_only_elementarity_dimension():
+    """``elementarity=none`` admits a logically complete proof rejected only as non-elementary."""
+    judge = ScriptedJudge("J", [
+        JudgeVerdict("J", elementary=False, no_gaps=True, notes=["uses ANT"]),
+    ])
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}),
+        judges=[judge],
+        enforce_elementarity=False,
+        ralph_episodes=1,
+    ).run("G")
+
+    assert res.proven
+    event = res.trace.by_kind("ralph_judge")[0]
+    assert event.data["raw_passed"] is False
+    assert event.data["passed"] is True
+    assert event.data["elementary"] is False and event.data["no_gaps"] is True
+
+
+def test_solution_only_judge_still_rejects_logical_gap():
+    """Turning off elementarity enforcement must never weaken the no-gaps soundness dimension."""
+    judge = ScriptedJudge("J", [
+        JudgeVerdict("J", elementary=True, no_gaps=False, notes=["missing implication"]),
+    ])
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}),
+        judges=[judge],
+        enforce_elementarity=False,
+        ralph_episodes=1,
+    ).run("G")
+
+    assert not res.proven
+    event = res.trace.by_kind("ralph_judge")[0]
+    assert event.data["passed"] is False
+    assert event.data["no_gaps"] is False
+
+
+def test_judge_requires_literal_true_no_gaps():
+    judge = ScriptedJudge("J", [
+        JudgeVerdict("J", elementary=True, no_gaps="false", notes=["malformed"]),
+    ])
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}), judges=[judge], ralph_episodes=1,
+    ).run("G")
+    assert not res.proven
+    event = res.trace.by_kind("ralph_judge")[0]
+    assert event.data["passed"] is False and event.data["no_gaps"] is False
+
+
+def test_solution_only_reviewer_accepts_useful_non_elementary_decomposition():
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    reviewer = ScriptedReviewer([
+        ReviewVerdict(useful=True, elementary=False, notes=["uses ANT"]),
+    ])
+
+    res = _driver(
+        prover,
+        decomposer=decomp,
+        reviewer=reviewer,
+        enforce_elementarity=False,
+        max_decomp_attempts=1,
+    ).run("G")
+
+    assert res.proven
+    event = res.trace.by_kind("review")[0]
+    assert event.data["accepted"] is True
+    assert event.data["useful"] is True and event.data["elementary"] is False
+
+
+def test_solution_only_reviewer_still_rejects_useless_decomposition():
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    reviewer = ScriptedReviewer([
+        ReviewVerdict(useful=False, elementary=False, notes=["does not simplify"]),
+    ])
+
+    res = _driver(
+        prover,
+        decomposer=decomp,
+        reviewer=reviewer,
+        enforce_elementarity=False,
+        max_decomp_attempts=1,
+    ).run("G")
+
+    assert not res.proven
+    root = res.dag.get(res.dag.get_or_create("G").key)
+    assert root.reason == "gap_found"
+    event = res.trace.by_kind("review")[0]
+    assert event.data["accepted"] is False
+
+
 # ---- sketch/children consistency ----
 
 def test_sketch_lemma_mismatch_rejected():
@@ -279,7 +390,8 @@ def _refiner(score_map):
 
 def test_refiner_improves_a_direct_proof():
     a, b = valid_ledger("G"), valid_ledger2("G")
-    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 1.0, b: 5.0})).run("G")
+    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 1.0, b: 5.0}),
+                  judges=[passing_proof_judge()]).run("G")
     assert res.proven
     node = res.dag.get(res.dag.get_or_create("G").key)
     assert node.proof_kind == "direct"
@@ -288,7 +400,8 @@ def test_refiner_improves_a_direct_proof():
 
 def test_refiner_never_regresses_a_direct_proof():
     a, b = valid_ledger("G"), valid_ledger2("G")
-    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 10.0, b: 1.0})).run("G")
+    res = _driver(DictProver({"G": a}), refiner=_refiner({a: 10.0, b: 1.0}),
+                  judges=[passing_proof_judge()]).run("G")
     node = res.dag.get(res.dag.get_or_create("G").key)
     assert node.proof == a               # incumbent held (do-nothing wins)
 
@@ -302,6 +415,18 @@ def non_elementary_ledger(goal: str) -> str:
     return json.dumps({"problem": "p", "claim": goal, "steps": [
         {"id": "s1", "claim": "use the class group structure", "justification": "given",
          "depends_on": []},
+        {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]}]})
+
+
+def unresolved_factorization_gap(goal: str) -> str:
+    """Goal-bound and structurally admitted, but logically false and explicitly NEEDS_REVIEW.
+
+    The elementary refuter intentionally cannot decide arbitrary factorization prose; only the proof
+    judge's ``no_gaps`` dimension can resolve this review. A pairwise preference comparator is not a
+    substitute for that review.
+    """
+    return json.dumps({"problem": "p", "claim": goal, "steps": [
+        {"id": "s1", "claim": "2 = 3", "justification": "factorization", "depends_on": []},
         {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]}]})
 
 
@@ -332,7 +457,8 @@ def test_non_elementary_challenger_is_rejected_by_admissibility_gate():
     challenger = non_elementary_ledger("G")
     # The judge ADORES the non-elementary challenger (score 100 vs 1) — only admissibility stops it.
     refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
-    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[passing_proof_judge()]).run("G")
     assert res.proven
     node = res.dag.get(res.dag.get_or_create("G").key)
     assert node.proof == incumbent       # incumbent held: the non-elementary challenger was inadmissible
@@ -344,9 +470,110 @@ def test_elementary_challenger_still_displaces_via_authoritative_gate():
     it) — proving the new gate rejects only NON-elementary challengers, not every challenger."""
     incumbent, challenger = valid_ledger("G"), valid_ledger2("G")
     refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 5.0})
-    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[passing_proof_judge()]).run("G")
     node = res.dag.get(res.dag.get_or_create("G").key)
     assert node.proof == challenger      # an admissible (elementary) challenger still wins
+
+
+def test_unresolved_needs_review_challenger_cannot_bypass_missing_proof_judge():
+    """Regression: the refiner's comparator must not resolve a logical NEEDS_REVIEW verdict.
+
+    Previously ``not report.rejected`` admitted this false challenger, the preference comparator loved
+    it, and the already-proven node silently replaced its incumbent with ``2 = 3``. Direct Ralph would
+    reject the same unresolved review when no proof judge exists; refinement must do the same.
+    """
+    incumbent = valid_ledger("G")
+    challenger = unresolved_factorization_gap("G")
+    assert evaluate(challenger, TOOLKIT).verdict is Verdict.NEEDS_REVIEW
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert node.proof != challenger
+    assert res.trace.by_kind("refine_skipped")
+
+
+def test_deterministically_structural_false_challenger_cannot_refine_without_proof_judge():
+    """A deterministic gate PASS is structural, not a proof of arbitrary algebra prose."""
+    incumbent = valid_ledger("G")
+    challenger = json.dumps({"problem": "p", "claim": "G", "steps": [
+        {"id": "s1", "claim": "2 = 3", "justification": "algebra", "depends_on": []},
+        {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]},
+    ]})
+    assert evaluate(challenger, TOOLKIT).verdict is Verdict.PASSED_DETERMINISTIC
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert res.trace.by_kind("refine_skipped")
+
+
+def test_refinement_candidate_must_pass_proof_judge_no_gaps_not_only_comparator():
+    """Even with Layer 2 configured, a comparator preference cannot override ``no_gaps=False``."""
+    incumbent = valid_ledger("G")
+    challenger = unresolved_factorization_gap("G")
+    proof_judge = ScriptedJudge("logic", [
+        JudgeVerdict("logic", elementary=True, no_gaps=True),   # original direct proof
+        JudgeVerdict("logic", elementary=True, no_gaps=False, notes=["2 is not 3"]),
+    ])
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[proof_judge]).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert proof_judge.calls == 2
+
+
+def test_refinement_rechecks_returned_champion_when_controller_ignores_callback():
+    """A custom/future controller cannot bypass admission by ignoring ``is_admissible``."""
+    from types import SimpleNamespace
+
+    incumbent = valid_ledger("G")
+    challenger = unresolved_factorization_gap("G")
+
+    class IgnoringController:
+        def refine(self, goal, ledger, is_admissible=None):
+            return SimpleNamespace(content=challenger, changed=True, passes=1, displacements=1)
+
+    proof_judge = ScriptedJudge("logic", [
+        JudgeVerdict("logic", elementary=True, no_gaps=True),
+        JudgeVerdict("logic", elementary=True, no_gaps=False),
+    ])
+    res = _driver(DictProver({"G": incumbent}), refiner=IgnoringController(),
+                  judges=[proof_judge]).run("G")
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert res.trace.by_kind("refine_postcondition_rejected")
+
+
+def test_refinement_distrusts_changed_metadata_and_rechecks_different_content():
+    """A controller cannot bypass the postcondition by lying that changed=False."""
+    from types import SimpleNamespace
+
+    incumbent = valid_ledger("G")
+    challenger = unresolved_factorization_gap("G")
+
+    class LyingController:
+        def refine(self, goal, ledger, is_admissible=None):
+            return SimpleNamespace(content=challenger, changed=False, passes=0, displacements=0)
+
+    proof_judge = ScriptedJudge("logic", [
+        JudgeVerdict("logic", elementary=True, no_gaps=True),
+        JudgeVerdict("logic", elementary=True, no_gaps=False),
+    ])
+    res = _driver(DictProver({"G": incumbent}), refiner=LyingController(),
+                  judges=[proof_judge]).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert res.trace.by_kind("refine_postcondition_rejected")
 
 
 def test_admissibility_gate_uses_lean_audit_to_refute_when_node_verifier_configured():
@@ -363,9 +590,53 @@ def test_admissibility_gate_uses_lean_audit_to_refute_when_node_verifier_configu
         return _verdict_reject() if ledger == challenger else _verdict_pass()
     refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
     res = _driver(DictProver({"G": incumbent}), refiner=refiner,
-                  node_verifier=lean_verifier).run("G")
+                  judges=[passing_proof_judge()], node_verifier=lean_verifier).run("G")
     node = res.dag.get(res.dag.get_or_create("G").key)
     assert node.proof == incumbent       # Lean-rejected challenger was inadmissible -> incumbent held
+
+
+def test_refinement_lean_verification_is_bounded_and_preserves_final_call():
+    incumbent, challenger = valid_ledger("G"), valid_ledger2("G")
+    calls: list[str] = []
+
+    def lean_verifier(goal, ledger):
+        calls.append(ledger)
+        return _verdict_pass()
+
+    budget = Budget(max_node_verify_calls=1)
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[passing_proof_judge()], node_verifier=lean_verifier,
+                  budget=budget).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == incumbent
+    assert calls == [incumbent]
+    assert budget.node_verify_spent == 1
+    assert res.trace.by_kind("refine_node_lean")[0].data["outcome"] == \
+        "node_verify_budget_reserved"
+
+
+def test_refinement_reuses_successful_lean_receipt_without_double_charge():
+    incumbent, challenger = valid_ledger("G"), valid_ledger2("G")
+    calls: list[str] = []
+
+    def lean_verifier(goal, ledger):
+        calls.append(ledger)
+        return _verdict_pass()
+
+    budget = Budget(max_node_verify_calls=2)
+    refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[passing_proof_judge()], node_verifier=lean_verifier,
+                  budget=budget).run("G")
+
+    node = res.dag.get(res.dag.get_or_create("G").key)
+    assert res.proven and node.proof == challenger
+    assert calls == [challenger]
+    assert budget.node_verify_spent == 1
+    assert any(event.data["outcome"] == "reuse_refinement_verification"
+               for event in res.trace.by_kind("node_lean"))
 
 
 # ---- max_replan_depth bounds re-decomposition globally ----
@@ -405,14 +676,13 @@ def mismatched_ledger(goal: str, proved: str) -> str:
 
 
 def claim_matches_goal_but_concludes_other(goal: str, concluded: str) -> str:
-    """A gate-passing ledger whose TOP-LEVEL `claim` equals the requested `goal` (so a claim-only
+    """An invalid ledger whose TOP-LEVEL `claim` equals the requested `goal` (so a claim-only
     binding is satisfied) but whose terminal `conclusion` step proves a DIFFERENT statement.
 
     This is the residual attack: setting `claim == goal` while the conclusion proves `concluded`
     sneaks a proof of the wrong statement past any binding that only checks the top-level claim.
-    The deterministic gate admits it because the fresh conclusion restates neither the goal nor an
-    intermediate body step. Only a binding that checks the TERMINAL CONCLUSION against the goal
-    catches it."""
+    The ledger-local structural gate and the external goal binder both reject it, providing independent
+    defenses against a terminal-conclusion substitution."""
     return json.dumps({"problem": goal, "claim": goal, "steps": [
         {"id": "a", "claim": "1 = 1", "justification": "given", "depends_on": []},
         {"id": "c", "claim": concluded, "justification": "conclusion", "depends_on": ["a"]}]})
@@ -432,21 +702,31 @@ def test_direct_proof_of_wrong_goal_is_rejected():
     assert not res.trace.by_kind("goal_claim_mismatch")       # backstop stayed unreachable
 
 
+def test_context_sensitive_notation_cannot_bind_a_wrong_goal():
+    # ``A × B`` denotes a Cartesian product for sets, whereas ``A * B`` can denote a pointwise product.
+    # The old lossy canonicalizer mapped both to ``*`` and accepted this wrong-goal ledger as PROVEN.
+    goal = "For finite sets A and B, A × B is empty."
+    other = "For finite sets A and B, A * B is empty."
+    res = _driver(DictProver({goal: valid_ledger(other)})).run(goal)
+    assert not res.proven
+    assert res.trace.by_kind("ralph_goal_unbound")
+
+
 def test_direct_proof_claim_matches_goal_but_concludes_other_is_rejected():
     # Residual L5 trigger: claim == goal "G" (so a claim-only check passes), but the terminal
-    # conclusion proves a fresh statement "H". The gate admits it, yet the harness must reject it
-    # because the proof concludes a DIFFERENT statement than the requested goal.
+    # conclusion proves a fresh statement "H". Both the ledger-local invariant and harness binding
+    # must reject it because the proof concludes a DIFFERENT statement than the requested goal.
     attack = claim_matches_goal_but_concludes_other("G", concluded="H")
-    # Sanity: the deterministic gate (lenient, goal-agnostic) DOES admit this ledger ...
+    # The deterministic gate now rejects every claim/conclusion mismatch, not just one that happens to
+    # duplicate an intermediate body step.
     from agent.gates.gate import evaluate
-    assert not evaluate(attack, TOOLKIT).rejected
-    # ... but RalphLoop's per-episode terminal-conclusion goal-binding rejects it for goal "G"
-    # (success=False), so it is never proven; with no decomposer it ends not-proven.
+    report = evaluate(attack, TOOLKIT)
+    assert report.rejected
+    assert "goal_claim_mismatch" in {finding.code for finding in report.rejects()}
+    # The full harness still fails closed and never reports the attack proven.
     prover = DictProver({"G": attack})
     res = _driver(prover).run("G")
     assert not res.proven
-    assert res.trace.by_kind("ralph_goal_unbound")
-    assert not res.trace.by_kind("goal_claim_mismatch")
 
 
 def test_proves_goal_requires_terminal_conclusion_to_match():
@@ -568,10 +848,10 @@ def test_failed_decomposition_leaves_no_stale_children():
     assert "children" not in tree
 
 
-# ---- L5: FlatDriver goal<->claim binding (a ledger for a DIFFERENT problem is not accepted) ----
+# ---- L5: FlatDriver claim/conclusion binding (a ledger for a DIFFERENT theorem is not accepted) ----
 
 def test_flat_driver_rejects_proof_of_different_problem():
-    # A structurally valid ledger, but written for problem "other" while we requested "p".
+    # A ledger whose claim/conclusion prove another theorem cannot pass for requested goal "p".
     wrong = json.dumps({"problem": "other", "claim": "c", "steps": [
         {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
         {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]}]})
@@ -584,12 +864,64 @@ def test_flat_driver_rejects_proof_of_different_problem():
     assert res.trace.by_kind("goal_claim_mismatch")
 
 
-def test_flat_driver_accepts_matching_problem():
-    ok = json.dumps({"problem": "p", "claim": "c", "steps": [
+def test_flat_driver_accepts_problem_identifier_when_theorem_is_bound():
+    ok = json.dumps({"problem": "benchmark-item-1729", "claim": "p", "steps": [
         {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
-        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]}]})
+        {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]}]})
     res = FlatDriver(ScriptedProver([ok]), toolkit=TOOLKIT, trace=RunTrace("flat")).run("p")
     assert res.proven
+
+
+def test_goal_binding_contract_has_flat_dag_verifier_parity():
+    """All consumers accept an arbitrary problem id and bind claim + unique conclusion identically."""
+    from agent.orchestrator.elementary_verifier import refute_elementary
+
+    ledger = json.dumps({"problem": "dataset/id", "claim": "G", "steps": [
+        {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+        {"id": "s2", "claim": "G", "justification": "conclusion", "depends_on": ["s1"]},
+    ]})
+    flat = FlatDriver(
+        ScriptedProver([ledger]), toolkit=TOOLKIT, trace=RunTrace("flat-parity")
+    ).run("G")
+    dag = _driver(DictProver({"G": ledger})).run("G")
+    verifier = refute_elementary(ledger, TOOLKIT, goal="G")
+    assert flat.proven and dag.proven and not verifier.refuted
+
+
+@pytest.mark.parametrize(
+    ("claim", "conclusion", "mismatched_field"),
+    [
+        ("1 = 1", "1 = 1", "claim"),
+        ("p", "1 = 1", "conclusion"),
+    ],
+)
+def test_flat_driver_rejects_inert_problem_field_with_wrong_proof(
+        claim, conclusion, mismatched_field):
+    """Putting the requested goal only in ``ledger.problem`` cannot certify another theorem."""
+    ledger = json.dumps({"problem": "p", "claim": claim, "steps": [
+        {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+        {"id": "s2", "claim": conclusion, "justification": "conclusion",
+         "depends_on": ["s1"]}]})
+    res = FlatDriver(ScriptedProver([ledger]), toolkit=TOOLKIT,
+                     budget=Budget(max_repair_iters=0), trace=RunTrace("flat-bind")).run("p")
+    assert res.state is NodeState.FAILED_GAP
+    mismatch = res.trace.by_kind("goal_claim_mismatch")
+    assert mismatch and mismatched_field in mismatch[0].data["fields"]
+
+
+def test_flat_driver_wrong_goal_dominates_elementarity_failure_classification():
+    ledger = json.dumps({"problem": "p", "claim": "q", "steps": [
+        {"id": "s1", "claim": "Invoke the class group.",
+         "justification": "class_field_theory", "depends_on": []},
+        {"id": "s2", "claim": "q", "justification": "conclusion",
+         "depends_on": ["s1"]},
+    ]})
+    res = FlatDriver(
+        ScriptedProver([ledger]), toolkit=TOOLKIT,
+        budget=Budget(max_repair_iters=0), trace=RunTrace("flat-bind-precedence"),
+    ).run("p")
+    assert res.state is NodeState.FAILED_GAP
+    assert res.trace.by_kind("goal_claim_mismatch")
 
 
 # ==================================================================================================
@@ -724,13 +1056,9 @@ def test_adversarial_verifier_refutes_needs_review_decomposition_sketch():
 
 
 def test_needs_review_no_reviewer_unbound_sketch_classifies_gap_not_elementary():
-    """TRUTH-IN-LABELING: a NEEDS_REVIEW decomposition sketch (no reviewer) whose conclusion does NOT
-    bind to the goal is a GOAL/BINDING GAP, not an elementarity finding. The conclusion-binding check
-    must run BEFORE _refute_for_enforcement — otherwise the (default-enforcing) verifier refutes the
-    unbound conclusion on its goal_binding dimension and mislabels the gap as elementary_violation
-    (feeding FAILED_ELEMENTARY). This fires only in review:false profiles (an ablation arm). The
-    sketch is un-refutable on ELEMENTARITY (a clean descent, no denylist prose), so the ONLY thing
-    wrong with it is the binding miss -> the reason must be gap_found, and it must never commit."""
+    """TRUTH-IN-LABELING: a decomposition whose conclusion does not bind is a structural/goal gap,
+    not an elementarity finding. The deterministic ledger gate rejects the mismatch before the
+    independent elementarity verifier, and the failed blueprint never commits."""
     prover = DictProver({"A": valid_ledger("A")})
     # lemma A (matches the declared child), a CLEAN descent step (routes to NEEDS_REVIEW but the
     # adversarial verifier cannot refute it — not a denylist hit), and a conclusion proving WRONG != G.
@@ -740,8 +1068,8 @@ def test_needs_review_no_reviewer_unbound_sketch_classifies_gap_not_elementary()
          "obligations": {"descent": {"measure": "x", "strictly_decreases": True,
                                      "stays_in_domain": True}}},
         {"id": "c", "claim": "WRONG", "justification": "conclusion", "depends_on": ["s1"]}]})
-    # Sanity: the gate ADMITS this as NEEDS_REVIEW (elastic descent), NOT a deterministic REJECT.
-    assert _gate_evaluate(unbound_sketch, TOOLKIT).verdict is Verdict.NEEDS_REVIEW
+    # The elastic descent would need review, but the harder structural mismatch wins and rejects.
+    assert _gate_evaluate(unbound_sketch, TOOLKIT).verdict is Verdict.REJECTED
     decomp = ScriptedDecomposer([(unbound_sketch, ["A"])])
     res = _driver(prover, decomposer=decomp, reviewer=None, max_decomp_attempts=1).run("G")
     assert not res.proven                                   # an unbound sketch must NEVER commit
@@ -848,7 +1176,7 @@ def test_verifier_does_not_refute_a_clean_elementary_ledger():
 
 
 # ==================================================================================================
-# P2 — DILWORTH-WIDTH AND-CHILDREN FAN-OUT + H0 CHILD-CONSISTENCY (forge_relevance_study §7)
+# P2 — DILWORTH-WIDTH SERIAL AND-CHILD WAVES + H0 CHILD-CONSISTENCY (forge_relevance_study §7)
 # ==================================================================================================
 
 def _h0_ledger(goal: str, givens: list[str]) -> str:
@@ -860,58 +1188,59 @@ def _h0_ledger(goal: str, givens: list[str]) -> str:
     return json.dumps({"problem": "p", "claim": goal, "steps": steps})
 
 
-# ---- (P2) AND-children fan-out yields the SAME result as the old serial loop on stubs ----
+# ---- (P2) serial wave grouping yields the same result at every configured wave cap ----
 
 def _serial_result(prover_map, decomp_map):
-    """Prove G with the fan-out DISABLED (cap=1) — a pure serial pass — for the parity baseline."""
+    """Prove G with one child per serial wave (cap=1)."""
     prover = DictProver(dict(prover_map))
     decomp = DictDecomposer(dict(decomp_map))
     return _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
                    fanout_cap=1).run("G")
 
 
-def _parallel_result(prover_map, decomp_map):
-    """Prove G with the width-bounded rank-ordered fan-out ENABLED (a wide cap)."""
+def _wide_wave_result(prover_map, decomp_map):
+    """Prove G with wider planned waves; child calls are still strictly serial."""
     prover = DictProver(dict(prover_map))
     decomp = DictDecomposer(dict(decomp_map))
     return _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
                    fanout_cap=16).run("G")
 
 
-def test_and_fanout_same_result_all_children_prove():
-    # G decomposes into three independent children, all of which prove directly. Width-bounded waves
-    # must reach the SAME PROVEN result as the serial loop.
+def test_and_serial_waves_same_result_all_children_prove():
+    # G decomposes into three independent children, all of which prove directly. Changing the serial
+    # wave partition must not change the PROVEN result.
     pm = {"A": valid_ledger("A"), "B": valid_ledger("B"), "C": valid_ledger("C")}
     dm = {"G": (sketch("G", ["A", "B", "C"]), ["A", "B", "C"])}
-    serial, parallel = _serial_result(pm, dm), _parallel_result(pm, dm)
-    assert serial.proven and parallel.proven
-    assert {c["goal"] for c in parallel.proof_tree()["children"]} == {"A", "B", "C"}
+    narrow, wide = _serial_result(pm, dm), _wide_wave_result(pm, dm)
+    assert narrow.proven and wide.proven
+    assert {c["goal"] for c in wide.proof_tree()["children"]} == {"A", "B", "C"}
 
 
-def test_and_fanout_same_result_one_child_fails():
-    # B is unprovable (no direct proof, no plan). BOTH the serial and the fan-out schedule must fail
+def test_and_serial_waves_same_result_one_child_fails():
+    # B is unprovable (no direct proof, no plan). BOTH serial wave caps must fail
     # the parent identically (order-independent: a single failing child sinks the AND-node either way).
     pm = {"A": valid_ledger("A"), "C": valid_ledger("C")}     # B missing -> fails
     dm = {"G": (sketch("G", ["A", "B", "C"]), ["A", "B", "C"])}
-    serial, parallel = _serial_result(pm, dm), _parallel_result(pm, dm)
-    assert not serial.proven and not parallel.proven
+    narrow, wide = _serial_result(pm, dm), _wide_wave_result(pm, dm)
+    assert not narrow.proven and not wide.proven
 
 
-def test_and_fanout_width_equals_child_count_for_independent_children():
+def test_and_serial_wave_width_equals_child_count_for_independent_children():
     # Independent (flat) children form an antichain -> the Dilworth width is the child count, and the
-    # fan-out cap is bounded by it (so a wide decomposition fans out wide, a deep one would not).
+    # wave cap is bounded by it (planning metadata only; execution remains serial).
     pm = {"A": valid_ledger("A"), "B": valid_ledger("B"), "C": valid_ledger("C")}
     dm = {"G": (sketch("G", ["A", "B", "C"]), ["A", "B", "C"])}
-    res = _parallel_result(pm, dm)
+    res = _wide_wave_result(pm, dm)
     assert res.proven
-    ev = res.trace.by_kind("and_fanout")
-    assert ev, "the AND fan-out must emit its scheduling decision"
+    ev = res.trace.by_kind("and_serial_waves")
+    assert ev, "the AND scheduler must emit its serial wave plan"
     top = next(e for e in ev if e.data["children"] == 3)
     assert top.data["width"] == 3          # three independent children -> antichain width 3
     assert top.data["max_rank"] == 0       # flat decomposition -> all ranks 0
+    assert top.data["execution"] == "serial"
 
 
-def test_and_fanout_deep_chain_collapses_width_to_one():
+def test_and_serial_wave_deep_chain_collapses_width_to_one():
     # A precedence CHAIN among an AND-node's children must collapse the Dilworth width to 1 (a deep
     # chain -> don't over-spawn). We build the committed edge A -> B (A's decomposition cites B as a
     # sub-lemma) in the DAG, then ask the driver for the width over {A, B}: B is reachable from A, so
@@ -932,24 +1261,21 @@ def test_and_fanout_deep_chain_collapses_width_to_one():
     assert dilworth_width(["B", "X"], driver._and_child_precedence(["B", "X"])) == 2
 
 
-def test_and_fanout_budget_caps_the_wave(monkeypatch):
-    # The fan-out cap is min(width, budget-derived limit, operator cap). With only a little budget left
-    # the wave is budget-capped, yet the parent still proves (scheduling, not correctness, changes).
+def test_and_serial_wave_budget_caps_the_plan(monkeypatch):
+    # The serial wave cap is min(width, budget-derived limit, operator cap).
     pm = {"A": valid_ledger("A"), "B": valid_ledger("B"), "C": valid_ledger("C"), "D": valid_ledger("D")}
     dm = {"G": (sketch("G", ["A", "B", "C", "D"]), ["A", "B", "C", "D"])}
-    res = _parallel_result(pm, dm)
+    res = _wide_wave_result(pm, dm)
     assert res.proven
-    ev = [e for e in res.trace.by_kind("and_fanout") if e.data["children"] == 4]
+    ev = [e for e in res.trace.by_kind("and_serial_waves") if e.data["children"] == 4]
     assert ev and ev[0].data["cap"] <= ev[0].data["width"]   # cap never exceeds the antichain width
 
 
-# ---- (P2) the fan-out is NEVER used to choose among OR alternatives ----
+# ---- (P2) serial AND-child scheduling is never used to choose among OR alternatives ----
 
-def test_fanout_not_applied_to_or_alternatives():
-    # The population/Elo path explores COMPETING decompositions (OR alternatives). The Dilworth fan-out
-    # must NOT fire to pick among them: each alternative is tried via _try_decomposition, and only the
-    # AND children of the COMMITTED plan are fanned out. Here the first (only) plan's children [A] prove;
-    # we assert the and_fanout event reflects committed AND children, not a choice among alternatives.
+def test_serial_wave_plan_not_applied_to_or_alternatives():
+    # Population/Elo explores competing OR decompositions. Serial wave planning applies only after an
+    # AND plan is committed; it never selects among those alternatives.
     prover = DictProver({"A": valid_ledger("A")})
     # Two competing single-child plans for G (OR alternatives), explored by the population search.
     decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"]), (sketch("G", ["A"]), ["A"])])
@@ -958,9 +1284,8 @@ def test_fanout_not_applied_to_or_alternatives():
                     toolkit=TOOLKIT, budget=Budget(), trace=RunTrace("or"),
                     comparator=comparator, population_k=2, population_rounds=1).run("G")
     assert res.proven
-    # Every and_fanout event is over the COMMITTED children of an AND-node (here the single child A),
-    # never over the two OR alternatives -> no fan-out event reports >1 child from alternative plans.
-    for e in res.trace.by_kind("and_fanout"):
+    # Every event is over the committed plan's AND children (here the single child A).
+    for e in res.trace.by_kind("and_serial_waves"):
         assert e.data["children"] == 1        # the committed plan's AND children, not the OR set of 2
 
 
@@ -1018,7 +1343,8 @@ def test_population_gate_rejected_candidate_never_ranked():
 def test_h0_rejects_inconsistent_sibling_composition():
     # G decomposes into [A, B]; both prove directly BUT under CONTRADICTORY hypotheses (A assumes
     # `n is even`, B assumes `n is odd`). Each child passes locally, yet composing them is unsound (no
-    # global section) -> the parent is NOT promoted; it is FAILED_ELEMENTARY (elementary_violation).
+    # global section) -> the parent is NOT promoted; this is a logical FAILED_GAP, not an
+    # elementarity-objective failure.
     pm = {"A": _h0_ledger("A", ["n is even"]), "B": _h0_ledger("B", ["n is odd"])}
     dm = {"G": (sketch("G", ["A", "B"]), ["A", "B"])}
     prover = DictProver(pm)
@@ -1027,10 +1353,34 @@ def test_h0_rejects_inconsistent_sibling_composition():
                   max_decomp_attempts=1).run("G")
     assert not res.proven, "contradictory-sibling composition must not be promoted"
     g = res.dag.get(res.dag.get_or_create("G").key)
-    assert g.state is NodeState.FAILED_ELEMENTARY
-    assert g.reason == ReasonCode.elementary_violation.value
+    assert g.state is NodeState.FAILED_GAP
+    assert g.reason == ReasonCode.gap_found.value
     viol = res.trace.by_kind("h0_violation")
     assert viol and viol[0].data["overlap"] == "n"     # the conflicting overlap is NAMED
+
+
+def test_h0_rejects_inconsistent_transitive_descendant_composition():
+    # G -> [A, B], A -> [C].  A's winning artifact is only the A-from-C sketch; the assumption
+    # ``n is even`` lives in C's leaf ledger.  H0 must compare that grandchild artifact with B's
+    # contradictory ``n is odd`` assumption rather than inspecting only the two immediate artifacts.
+    prover = DictProver({
+        "C": _h0_ledger("C", ["n is even"]),
+        "B": _h0_ledger("B", ["n is odd"]),
+    })
+    decomp = DictDecomposer({
+        "G": (sketch("G", ["A", "B"]), ["A", "B"]),
+        "A": (sketch("A", ["C"]), ["C"]),
+    })
+    res = _driver(
+        prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+        max_decomp_attempts=1,
+    ).run("G")
+
+    assert not res.proven, "a contradiction hidden in a grandchild must block parent promotion"
+    g = res.dag.get(res.dag.get_or_create("G").key)
+    assert g.state is NodeState.FAILED_GAP
+    violations = res.trace.by_kind("h0_violation")
+    assert violations and violations[-1].data["overlap"] == "n"
 
 
 def test_h0_passes_consistent_sibling_composition_non_vacuously():
@@ -1049,16 +1399,31 @@ def test_h0_passes_consistent_sibling_composition_non_vacuously():
     assert g.proven and g.proof_kind == "decomposition"
 
 
-def test_h0_can_be_disabled():
-    # With the H0 gate OFF, the inconsistent-sibling composition is (unsoundly) promoted — proving the
-    # gate is what blocks it when ON (a behavioral control, not an incidental pass).
+def test_h0_transitive_scan_fails_closed_on_aggregate_artifact_budget(monkeypatch):
+    import agent.orchestrator.dag_driver as dag_driver
+
+    monkeypatch.setattr(dag_driver, "_MAX_H0_TOTAL_CHARS", 8)
+    pm = {"A": _h0_ledger("A", ["n is even"]), "B": _h0_ledger("B", ["n is even"])}
+    dm = {"G": (sketch("G", ["A", "B"]), ["A", "B"])}
+    res = _driver(DictProver(pm), decomposer=DictDecomposer(dm),
+                  reviewer=ScriptedReviewer([OK_REVIEW]), max_decomp_attempts=1).run("G")
+
+    assert not res.proven
+    violations = res.trace.by_kind("h0_violation")
+    assert violations
+    assert any(marker in violations[-1].data["detail"] for marker in ("VACUOUS", "INCOMPLETE"))
+
+
+def test_h0_cannot_be_disabled_on_a_proof_driver():
+    # H0 is a logical-soundness invariant, not an elementarity/ablation knob. A direct constructor that
+    # asks to bypass it fails closed before any proof-producing run can begin.
     pm = {"A": _h0_ledger("A", ["n is even"]), "B": _h0_ledger("B", ["n is odd"])}
     dm = {"G": (sketch("G", ["A", "B"]), ["A", "B"])}
     prover = DictProver(pm)
     decomp = DictDecomposer(dm)
-    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
-                  max_decomp_attempts=1, h0_consistency=False).run("G")
-    assert res.proven                                  # no H0 gate -> the unsound composition slips through
+    with pytest.raises(ValueError, match="mandatory logical-soundness"):
+        _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                max_decomp_attempts=1, h0_consistency=False)
 
 
 # ---- (P3 / §7) next_producers LEVERAGE = fan-in x critical-path depth --------------------------
@@ -1148,10 +1513,10 @@ def test_leverage_critical_path_guard_shallow_high_fanin_does_not_starve_deep_ch
     assert ordered[0] == gh("D3")
 
 
-def test_leverage_critical_path_guard_preserves_serial_parallel_parity():
+def test_leverage_critical_path_guard_preserves_serial_wave_cap_parity():
     # The critical-path guard is a SCHEDULING change only: an AND-node needs EVERY child, so results are
     # order-independent. Proving G whose children include both a deep chain and a shallow high-fan-in
-    # lemma must reach the SAME PROVEN result whether fan-out is serial (cap=1) or parallel.
+    # lemma must reach the SAME PROVEN result under narrow or wide serial wave plans.
     pm = {"D0": valid_ledger("D0"), "S": valid_ledger("S")}
     # G -> [D2, S]; D2 -> [D1]; D1 -> [D0]; S is a shallow leaf also shared by Q1, Q2 (high fan-in).
     dm = {
@@ -1159,9 +1524,9 @@ def test_leverage_critical_path_guard_preserves_serial_parallel_parity():
         "D2": (sketch("D2", ["D1"]), ["D1"]),
         "D1": (sketch("D1", ["D0"]), ["D0"]),
     }
-    serial, parallel = _serial_result(pm, dm), _parallel_result(pm, dm)
-    assert serial.proven and parallel.proven
-    assert serial.dag.stats()["proven"] == parallel.dag.stats()["proven"]
+    narrow, wide = _serial_result(pm, dm), _wide_wave_result(pm, dm)
+    assert narrow.proven and wide.proven
+    assert narrow.dag.stats()["proven"] == wide.dag.stats()["proven"]
 
 
 # ---- (P3 / §9 #1) OpenEvolve FALLBACK DECOMPOSER: fires ONLY on stuck nodes, only commits bound ----
@@ -1222,14 +1587,16 @@ def test_evolve_fallback_rejects_non_goal_bound_blueprint():
     assert res.trace.by_kind("evolve_fallback_rejected")
 
 
-def test_evolve_fallback_unavailable_is_graceful_noop():
-    # A fallback that reports itself unavailable (e.g. openevolve not installed) is a clean no-op.
+def test_configured_evolve_fallback_unavailable_fails_loudly():
+    # A configured fallback is an explicit stage; a post-supervision availability loss must not
+    # silently downgrade the run to a different execution profile.
     fb = _RecordingFallback(lambda g: (sketch(g, ["A"]), ["A"]), available=False)
     prover = DictProver({"A": valid_ledger("A")})
     decomp = DictDecomposer({})
-    res = _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
-                  evolve_fallback=fb, max_decomp_attempts=1).run("G")
-    assert not res.proven and fb.fired == []                 # unavailable -> never fired, no crash
+    with pytest.raises(RuntimeError, match="became unavailable"):
+        _driver(prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+                evolve_fallback=fb, max_decomp_attempts=1).run("G")
+    assert fb.fired == []
 
 
 # ==================================================================================================
@@ -1338,10 +1705,10 @@ def test_v5_real_scheduler_visits_deep_critical_chain_no_later_than_shallow_high
     assert visited[0] == "D3"
 
 
-def test_v5_scheduler_preserves_serial_parallel_result_parity():
+def test_v5_scheduler_preserves_serial_wave_cap_result_parity():
     """The depth-primary critical-path order is a SCHEDULING change only (an AND-node needs EVERY child,
     so results are order-independent). Proving G whose children include both a deep chain and a shallow
-    high-fan-in lemma must reach the SAME PROVEN result whether the fan-out is serial (cap=1) or wide,
+    high-fan-in lemma must reach the SAME PROVEN result whether serial waves are narrow or wide,
     via the REAL run() path."""
     pm = {"D0": valid_ledger("D0"), "S": valid_ledger("S")}
     dm = {
@@ -1349,19 +1716,18 @@ def test_v5_scheduler_preserves_serial_parallel_result_parity():
         "D2": (sketch("D2", ["D1"]), ["D1"]),
         "D1": (sketch("D1", ["D0"]), ["D0"]),
     }
-    serial, parallel = _serial_result(pm, dm), _parallel_result(pm, dm)
-    assert serial.proven and parallel.proven
-    assert serial.dag.stats()["proven"] == parallel.dag.stats()["proven"]
+    narrow, wide = _serial_result(pm, dm), _wide_wave_result(pm, dm)
+    assert narrow.proven and wide.proven
+    assert narrow.dag.stats()["proven"] == wide.dag.stats()["proven"]
 
 
-def test_v5_and_fanout_emits_critical_path_depth():
-    """The REAL scheduler exposes the critical-path depth it ordered by (the and_fanout trace now carries
-    max_depth), so the depth-primary ordering is observable, not implicit."""
+def test_v5_serial_wave_plan_emits_critical_path_depth():
+    """The scheduler exposes the critical-path depth used by the serial wave plan."""
     pm = {"A": valid_ledger("A"), "B": valid_ledger("B"), "C": valid_ledger("C")}
     dm = {"G": (sketch("G", ["A", "B", "C"]), ["A", "B", "C"])}
-    res = _parallel_result(pm, dm)
+    res = _wide_wave_result(pm, dm)
     assert res.proven
-    ev = res.trace.by_kind("and_fanout")
+    ev = res.trace.by_kind("and_serial_waves")
     assert ev and "max_depth" in ev[0].data
 
 
@@ -1371,7 +1737,7 @@ def test_v5_and_fanout_emits_critical_path_depth():
 # A node_verifier=None DagDriver runs the BYTE-IDENTICAL pre-feature path (asserted below). When a
 # verifier is supplied, a LEAF about to be marked PROVEN-direct is routed through Lean and the FOUR
 # outcomes route deterministically:
-#   (i)   PASS (compiled + audit.passed)        -> PROVEN + node.lean_verified True
+#   (i)   PASS (compiled + authoritative audit receipt) -> PROVEN + node.lean_verified True
 #   (ii)  REJECT (compiled but audit rejected)  -> FAILED_ELEMENTARY (refutes elementarity)
 #   (iii) could-not-compile (no Lean produced)  -> soft PROVEN + node.lean_verified False
 #   (iv)  UNAVAILABLE (lean not installed)      -> EXHAUSTED (retryable)
@@ -1385,7 +1751,8 @@ from agent.gates.report import Finding, Severity, LAYER_LEAN  # noqa: E402
 
 def _verdict_pass() -> FormalizeAuditResult:
     """Outcome (i): compiled AND the Lean audit PASSED -> elementary_verified is True."""
-    audit = LeanAuditResult(verdict=LeanVerdict.PASS, findings=[])
+    audit = LeanAuditResult(
+        verdict=LeanVerdict.PASS, findings=[], provenance_verified=True)
     return FormalizeAuditResult(formalized=True, compiled=True, theorem_name="t",
                                 lean_source="theorem t : True := trivial", audit=audit)
 
@@ -1468,6 +1835,68 @@ def test_node_verifier_pass_marks_proven_and_lean_verified():
     assert ev and ev[0].data["outcome"] == "elementary_verified" and ev[0].data["lean_verified"] is True
 
 
+def test_content_passing_audit_without_provenance_cannot_stamp_lean_verified():
+    """A legacy report may pass content classification but is not a hard-success receipt."""
+    from agent.orchestrator.dag import goal_hash
+
+    audit = LeanAuditResult(verdict=LeanVerdict.PASS, findings=[])
+    verdict = FormalizeAuditResult(
+        formalized=True, compiled=True, theorem_name="t",
+        lean_source="theorem t : True := trivial", audit=audit)
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}),
+        node_verifier=ScriptedLeafVerifier(verdict),
+        lean_strict=True,
+    ).run("G")
+
+    assert audit.passed is True and audit.authoritative is False
+    assert not res.proven
+    assert res.dag.get(goal_hash("G")).state is NodeState.FAILED_GAP
+    assert res.trace.by_kind("node_lean")[0].data["outcome"] == \
+        "lean_provenance_unverified_strict"
+
+
+def test_node_verifier_requires_literal_true_for_lean_verified():
+    """A truthy string from an injected verifier cannot stamp the hard-success state."""
+    from types import SimpleNamespace
+    from agent.orchestrator.dag import goal_hash
+
+    verdict = SimpleNamespace(
+        lean_unavailable=False,
+        elementary_verified="false",
+        compiled=True,
+        audit=SimpleNamespace(passed=True),
+        lean_compiled_but_rejected=False,
+    )
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}),
+        node_verifier=ScriptedLeafVerifier(verdict),
+        lean_strict=True,
+    ).run("G")
+    assert not res.proven
+    assert res.dag.get(goal_hash("G")).state is NodeState.FAILED_GAP
+
+
+def test_malformed_rejection_helper_cannot_suppress_failed_audit():
+    """Concrete compiled+failed-audit evidence dominates a malformed convenience property."""
+    from types import SimpleNamespace
+    from agent.orchestrator.dag import goal_hash
+
+    verdict = SimpleNamespace(
+        lean_unavailable=False,
+        elementary_verified=False,
+        compiled=True,
+        audit=SimpleNamespace(passed=False),
+        lean_compiled_but_rejected="false",
+    )
+    res = _driver(
+        DictProver({"G": valid_ledger("G")}),
+        node_verifier=ScriptedLeafVerifier(verdict),
+    ).run("G")
+    assert not res.proven
+    assert res.dag.get(goal_hash("G")).state is NodeState.FAILED_ELEMENTARY
+
+
 # ---- (ii) REJECT -> FAILED_ELEMENTARY (refutes elementarity) ----
 
 def test_node_verifier_reject_refutes_to_failed_elementary():
@@ -1543,6 +1972,22 @@ def test_lean_strict_true_still_proves_a_compiling_audited_leaf():
     assert res.proven
     g = res.dag.get(goal_hash("G"))
     assert g.state is NodeState.LEAN_VERIFIED and g.lean_verified is True
+
+
+def test_lean_strict_verifier_exception_never_mints_soft_proven():
+    from agent.orchestrator.dag import goal_hash
+
+    class RaisingVerifier:
+        def __call__(self, _goal, _ledger):
+            raise RuntimeError("Lean transport failed")
+
+    res = _driver(DictProver({"G": valid_ledger("G")}),
+                  node_verifier=RaisingVerifier(), lean_strict=True).run("G")
+    assert not res.proven
+    node = res.dag.get(goal_hash("G"))
+    assert node.state is NodeState.EXHAUSTED and not node.lean_verified
+    events = res.trace.by_kind("node_lean")
+    assert events and events[0].data["outcome"] == "verifier_error_strict"
 
 
 def test_lean_strict_true_with_no_node_verifier_is_byte_identical_default():
@@ -1625,6 +2070,12 @@ def test_formalize_audit_result_outcome_helpers():
     assert _verdict_unavailable().lean_unavailable is True
     # The unavailable verdict is NOT misclassified as a (re-attemptable) non-compile.
     assert _verdict_unavailable().lean_could_not_formalize is False
+    unprovenanced = FormalizeAuditResult(
+        formalized=True, compiled=True,
+        audit=LeanAuditResult(verdict=LeanVerdict.PASS, findings=[]),
+    )
+    assert unprovenanced.lean_provenance_unverified is True
+    assert unprovenanced.lean_compiled_but_rejected is False
 
 
 # ==================================================================================================
@@ -1707,6 +2158,30 @@ def test_noncompiling_sketch_is_not_committed():
     ev = res.trace.by_kind("sketch_lean")
     assert ev and ev[0].data["outcome"] == "lean_could_not_formalize"
     assert ev[0].data["sketch_lean_verified"] is False
+
+
+def test_sketch_verifier_requires_literal_true_for_lean_verified():
+    from types import SimpleNamespace
+    from agent.orchestrator.dag import goal_hash
+
+    prover = DictProver({"A": valid_ledger("A")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A"]), ["A"])])
+    malformed = SimpleNamespace(
+        elementary_verified="false",
+        lean_unavailable=False,
+        lean_compiled_but_rejected=False,
+    )
+    sv = ScriptedSketchVerifier(malformed)
+    res = _driver(
+        prover,
+        decomposer=decomp,
+        reviewer=ScriptedReviewer([OK_REVIEW]),
+        sketch_verifier=sv,
+        max_decomp_attempts=1,
+    ).run("G")
+    assert not res.proven
+    node = res.dag.get(goal_hash("G"))
+    assert node.proof_kind is None and node.children == []
 
 
 def test_audit_rejected_sketch_is_not_committed():
@@ -2086,6 +2561,19 @@ def test_leaf_verify_subcap_zero_skips_all_lean_soft_proven():
     assert ev and ev[0].data["outcome"] == "node_verify_budget_exhausted"
 
 
+def test_lean_strict_leaf_subcap_zero_fails_closed():
+    from agent.orchestrator.dag import goal_hash
+
+    v = ScriptedLeafVerifier(_verdict_pass())
+    res = _driver(DictProver({"G": valid_ledger("G")}), node_verifier=v,
+                  lean_strict=True, budget=Budget(max_node_verify_calls=0)).run("G")
+    assert not res.proven and v.calls == []
+    node = res.dag.get(goal_hash("G"))
+    assert node.state is NodeState.EXHAUSTED and not node.lean_verified
+    events = res.trace.by_kind("node_lean")
+    assert events and events[0].data["outcome"] == "node_verify_budget_exhausted_strict"
+
+
 def test_sketch_verify_subcap_exhausted_soft_commits_without_lean():
     """A SET sub-cap also gates the AND-node sketch_verifier. With cap=0 the composition Lean check is
     SKIPPED and the decomposition SOFT-commits (sketch_lean_verified=False) via the existing gates — the
@@ -2105,6 +2593,20 @@ def test_sketch_verify_subcap_exhausted_soft_commits_without_lean():
     assert res.budget.node_verify_spent == 0
     ev = res.trace.by_kind("sketch_lean")
     assert ev and ev[0].data["outcome"] == "node_verify_budget_exhausted"
+
+
+def test_lean_strict_sketch_subcap_zero_rejects_unverified_composition():
+    prover = DictProver({"A": valid_ledger("A"), "B": valid_ledger("B")})
+    decomp = ScriptedDecomposer([(sketch("G", ["A", "B"]), ["A", "B"])])
+    sv = ScriptedSketchVerifier(_verdict_pass())
+    res = _driver(
+        prover, decomposer=decomp, reviewer=ScriptedReviewer([OK_REVIEW]),
+        sketch_verifier=sv, lean_strict=True, budget=Budget(max_node_verify_calls=0),
+        max_decomp_attempts=1,
+    ).run("G")
+    assert not res.proven and sv.calls == []
+    events = res.trace.by_kind("sketch_lean")
+    assert events and events[0].data["outcome"] == "node_verify_budget_exhausted_strict"
 
 
 def test_node_verify_subcap_separate_from_llm_calls():
@@ -2214,24 +2716,27 @@ def test_refute_for_enforcement_enforce_false_admits_elementarity_only():
         d._refute_for_enforcement("not a ledger at all", "G")
 
 
-# ---- end-to-end: enforce=False admits a non-elementary-but-goal-bound challenger as the PROVEN ledger ----
+# ---- end-to-end: enforcement off still requires logical review before challenger admission ----
 
 def test_enforce_false_admits_non_elementary_challenger_as_proven_ledger():
     """enforce_elementarity=False: a non-elementary (denylist-prose) but goal-bound AutoReason challenger
-    the judges PREFER — which the DEFAULT _authoritative_elementary gate REJECTS (incumbent held, see
-    test_non_elementary_challenger_is_rejected_by_admissibility_gate) — is now ADMITTED and DISPLACES the
-    incumbent: the node is PROVEN carrying the non-elementary ledger (the FAILED_ELEMENTARY -> soft PROVEN
-    downgrade, applied at the admissibility chokepoint)."""
+    the comparator prefers may displace only after the independent proof judge confirms ``no_gaps``.
+    The judge's negative elementarity dimension is ignored by this profile, but logical review is never
+    bypassed. This is the reviewed counterpart to the unresolved-review rejection above."""
     from agent.orchestrator.dag import goal_hash
     incumbent = valid_ledger("G")
     challenger = non_elementary_ledger("G")              # denylist 'class group', goal-bound
     refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
+    proof_judge = ScriptedJudge("logic", [
+        JudgeVerdict("logic", elementary=True, no_gaps=True),
+        JudgeVerdict("logic", elementary=False, no_gaps=True),
+    ])
     res = _driver(DictProver({"G": incumbent}), refiner=refiner,
-                  enforce_elementarity=False).run("G")
+                  judges=[proof_judge], enforce_elementarity=False).run("G")
     assert res.proven
     g = res.dag.get(goal_hash("G"))
     assert g.state is NodeState.PROVEN
-    assert g.proof == challenger, "with elementarity OFF the non-elementary challenger is admitted"
+    assert g.proof == challenger, "a logically reviewed challenger may ignore elementarity when OFF"
 
 
 def test_enforce_true_default_rejects_the_same_non_elementary_challenger():
@@ -2242,7 +2747,8 @@ def test_enforce_true_default_rejects_the_same_non_elementary_challenger():
     incumbent = valid_ledger("G")
     challenger = non_elementary_ledger("G")
     refiner = _refiner_with(challenger, challenger, {incumbent: 1.0, challenger: 100.0})
-    res = _driver(DictProver({"G": incumbent}), refiner=refiner).run("G")   # default: enforce True
+    res = _driver(DictProver({"G": incumbent}), refiner=refiner,
+                  judges=[passing_proof_judge()]).run("G")   # default: enforce True
     g = res.dag.get(goal_hash("G"))
     assert g.proof == incumbent, "enforcement ON rejects the non-elementary challenger"
     assert g.proof != challenger
@@ -2257,7 +2763,7 @@ def test_enforce_false_still_rejects_off_goal_challenger():
     off_goal = mismatched_ledger("G", proved="H")        # concludes H, not the requested goal G
     refiner = _refiner_with(off_goal, off_goal, {incumbent: 1.0, off_goal: 100.0})
     res = _driver(DictProver({"G": incumbent}), refiner=refiner,
-                  enforce_elementarity=False).run("G")
+                  judges=[passing_proof_judge()], enforce_elementarity=False).run("G")
     assert res.proven
     g = res.dag.get(goal_hash("G"))
     assert g.proof == incumbent, "a non-goal-bound challenger must be rejected even with elementarity off"
@@ -2358,6 +2864,26 @@ def test_run_context_threads_to_root_and_child_provers():
     # The decomposer feedback for G also carries the clause (standing prefix on the decomposer path).
     assert "G" in decomp.feedback_by_goal
     assert any(clause in item for fb in decomp.feedback_by_goal["G"] for item in fb)
+
+
+def test_run_context_is_part_of_memo_certificate_identity():
+    """A proof minted under one citable-input policy must be re-proved under another policy."""
+    prover = _FeedbackRecordingProver({"G": valid_ledger("G")})
+    driver = _driver(prover, budget=Budget(max_llm_calls=10))
+
+    under_a = driver.run("G", context="Only cite source A.")
+    assert under_a.proven and prover.calls == 1
+
+    under_b = driver.run("G", context="Only cite source B.")
+    assert under_b.proven and prover.calls == 2
+    assert under_b.dag is not under_a.dag
+    assert under_b.dag.cache_hits == 0
+
+    # An exact repeat of policy B can reuse B's certificate.
+    repeated_b = driver.run("G", context="Only cite source B.")
+    assert repeated_b.proven and prover.calls == 2
+    assert repeated_b.dag is under_b.dag
+    assert repeated_b.dag.cache_hits >= 1
 
 
 def test_run_without_context_is_byte_identical_child_feedback():

@@ -28,7 +28,7 @@ def minimal_ledger(**overrides):
         "claim": "A demo theorem.",
         "steps": [
             {"id": "s1", "claim": "A hypothesis.", "justification": "given", "depends_on": []},
-            {"id": "s2", "claim": "The theorem.", "justification": "conclusion",
+            {"id": "s2", "claim": "A demo theorem.", "justification": "conclusion",
              "depends_on": ["s1"]},
         ],
     }

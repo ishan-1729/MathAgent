@@ -137,6 +137,21 @@ class _StubServer:
         return True
 
 
+def test_sketch_audit_marks_post_preflight_unavailability(monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise lean_bridge.LeanUnavailable("Lean disappeared after preflight")
+
+    monkeypatch.setattr(fb.lean_bridge, "audit_lean_source", unavailable)
+    res = fb.formalize_sketch_and_audit(
+        PARENT, SKETCH, CHILDREN,
+        ScriptedFormalizer("theorem ma_target : True := trivial"),
+        toolkit=TOOLKIT,
+    )
+    assert res.compiled is False
+    assert res.lean_unavailable is True
+    assert res.lean_could_not_formalize is False
+
+
 def test_make_sketch_gate_compiled_audited_is_elementary_verified(monkeypatch):
     """A sketch that formalizes (stub formalizer) and whose audit PASSES (stub audit) yields a verdict
     with `.elementary_verified` True: the composition compiled and the body's deps/axioms are
@@ -144,7 +159,8 @@ def test_make_sketch_gate_compiled_audited_is_elementary_verified(monkeypatch):
     formalizer = ScriptedFormalizer("theorem ma_target (h0 : True) (h1 : True) : True := trivial")
 
     def fake_audit(source, name, **kw):
-        return LeanAuditResult(verdict=LeanVerdict.PASS, findings=[])
+        return LeanAuditResult(
+            verdict=LeanVerdict.PASS, findings=[], provenance_verified=True)
 
     monkeypatch.setattr(fb.lean_bridge, "audit_lean_source", fake_audit)
     gate = make_sketch_gate(formalizer, toolkit=TOOLKIT, server=_StubServer())

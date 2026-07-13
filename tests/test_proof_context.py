@@ -15,7 +15,7 @@ from agent.orchestrator.dag import (
     ProofDAG, goal_hash, semantic_goal_hash, proof_context_hash,
 )
 from agent.orchestrator.dag_driver import DagDriver, ScriptedReviewer, ReviewVerdict
-from agent.orchestrator.driver import ScriptedProver  # noqa: F401 (parity import)
+from agent.orchestrator.driver import JudgeVerdict, ScriptedJudge, ScriptedProver  # noqa: F401
 from agent.orchestrator.state import Budget, NodeState
 from agent.orchestrator.trace import RunTrace
 
@@ -55,7 +55,7 @@ def test_proof_context_hash_is_stable_and_deterministic():
     a = proof_context_hash(TOOLKIT)
     b = proof_context_hash(load_toolkit())   # a fresh identical load
     assert a == b
-    assert isinstance(a, str) and len(a) == 16
+    assert isinstance(a, str) and len(a) == 64
 
 
 def test_proof_context_hash_ignores_key_reordering():
@@ -98,6 +98,22 @@ def test_proof_context_hash_changes_when_axiom_whitelist_changes():
     base = proof_context_hash(tk)
     tk2 = replace(tk, lean_axiom_whitelist=tk.lean_axiom_whitelist + ["sorryAx"])
     assert proof_context_hash(tk2) != base
+
+
+def test_proof_context_hash_includes_exact_per_run_permissions():
+    a = proof_context_hash(TOOLKIT, run_context="Only cite source A")
+    b = proof_context_hash(TOOLKIT, run_context="Only cite source B")
+    assert a != b
+    assert a == proof_context_hash(load_toolkit(), run_context="Only cite source A")
+    assert proof_context_hash(TOOLKIT, run_context=None) != \
+        proof_context_hash(TOOLKIT, run_context="")
+
+
+def test_proof_context_hash_includes_execution_policy_receipt():
+    assert proof_context_hash(TOOLKIT, policy_context="review=strict") != \
+        proof_context_hash(TOOLKIT, policy_context="review=soft")
+    assert proof_context_hash(TOOLKIT, policy_context=None) != \
+        proof_context_hash(TOOLKIT, policy_context="")
 
 
 # ---- ProofDAG split-keyed memo: same context => share (hit); changed context => miss ----
@@ -162,6 +178,24 @@ def test_assemble_and_stats_do_not_report_a_context_stale_proven():
     assert dag.nodes[goal_hash("L")].state is NodeState.PROVEN
 
 
+def test_stale_child_cannot_mint_parent_in_new_context():
+    # Commit the parent plan and prove its child under A, then retarget the DAG before promotion. The
+    # raw child state remains PROVEN, but its A receipt must not discharge a B parent certificate.
+    dag = ProofDAG(context="aaaaaaaaaaaaaaaa")
+    dag.commit_decomposition("G", "sketch", ["A"])
+    dag.mark_proven_direct("A", valid_ledger("A"))
+    dag.context = "bbbbbbbbbbbbbbbb"
+
+    with pytest.raises(ValueError, match="current context"):
+        dag.mark_proven_via_children("G")
+    assert not dag.is_proven("G")
+
+    # Re-earning the child under B makes composition valid and stamps the parent with B's receipt.
+    dag.mark_proven_direct("A", valid_ledger("A"))
+    parent = dag.mark_proven_via_children("G")
+    assert parent.proven and parent.proof_context == "bbbbbbbbbbbbbbbb"
+
+
 def test_context_none_is_context_agnostic_back_compat():
     # A context-agnostic DAG (legacy callers) shares by goal identity only, never invalidates.
     dag = ProofDAG()  # context=None
@@ -183,15 +217,128 @@ def test_driver_stamps_context_on_proven_node():
     res = d.run("G")
     assert res.proven
     node = res.dag.get(res.dag.get_or_create("G").key)
-    assert node.proof_context == d.context_hash == proof_context_hash(TOOLKIT)
+    assert node.proof_context == d.context_hash == proof_context_hash(
+        TOOLKIT, policy_context=d.policy_context)
 
 
 def test_driver_dag_context_matches_toolkit():
     d = _driver(DictProver({}))
-    assert d.dag.context == proof_context_hash(TOOLKIT)
+    assert d.dag.context == proof_context_hash(TOOLKIT, policy_context=d.policy_context)
 
 
 def test_two_drivers_same_toolkit_share_context():
     a = _driver(DictProver({}))
     b = _driver(DictProver({}))
     assert a.context_hash == b.context_hash       # identical toolkit -> identical, shareable context
+
+
+def test_driver_reuses_certificate_only_under_identical_run_permissions():
+    prover = DictProver({"G": valid_ledger("G")})
+    driver = _driver(prover)
+
+    first = driver.run("G", context="Only cite source A")
+    assert first.proven and prover.calls == 1
+    first_dag = first.dag
+
+    same = driver.run("G", context="Only cite source A")
+    assert same.proven and prover.calls == 1       # same permission receipt -> legitimate memo hit
+    assert same.dag is first_dag
+
+    changed = driver.run("G", context="Only cite source B")
+    assert changed.proven and prover.calls == 2    # changed permissions -> prover invoked again
+    assert changed.dag is not first_dag            # no prior success/failure can short-circuit
+    assert driver.context_hash == proof_context_hash(
+        TOOLKIT, run_context="Only cite source B", policy_context=driver.policy_context)
+    assert driver.trace.by_kind("memo_context_reset")
+
+
+def test_changed_run_permissions_also_clear_cached_failures():
+    prover = DictProver({})
+    driver = _driver(prover, ralph_episodes=1)
+    failed = driver.run("G", context="Only cite source A")
+    assert not failed.proven
+
+    # The proof source becomes available only in the next permission context. A FAILED node cached
+    # under A must not short-circuit the B run before the prover is invoked.
+    prover.mapping["G"] = valid_ledger("G")
+    calls_before = prover.calls
+    retried = driver.run("G", context="Only cite source B")
+    assert retried.proven
+    assert prover.calls == calls_before + 1
+
+
+def test_tightened_elementarity_policy_invalidates_cached_proven():
+    prover = DictProver({"G": valid_ledger("G")})
+    judge = ScriptedJudge("logic", [
+        JudgeVerdict("logic", elementary=False, no_gaps=True),
+    ])
+    driver = _driver(prover, judges=[judge], enforce_elementarity=False, ralph_episodes=1)
+
+    first = driver.run("G")
+    assert first.proven and prover.calls == 1
+    first_dag = first.dag
+
+    # Tightening a public policy flag must force a fresh proof/review, not return the old soft cert.
+    driver.enforce_elementarity = True
+    second = driver.run("G")
+    assert not second.proven and prover.calls == 2
+    assert second.dag is not first_dag
+    assert driver.trace.by_kind("memo_context_reset")
+
+
+def test_adding_node_verifier_invalidates_cached_proven():
+    from types import SimpleNamespace
+
+    prover = DictProver({"G": valid_ledger("G")})
+    driver = _driver(prover, ralph_episodes=1)
+    first = driver.run("G")
+    assert first.proven and prover.calls == 1
+
+    def rejecting_verifier(goal, ledger):
+        return SimpleNamespace(
+            lean_unavailable=False,
+            elementary_verified=False,
+            compiled=True,
+            audit=None,
+            lean_compiled_but_rejected=True,
+        )
+
+    driver.node_verifier = rejecting_verifier
+    second = driver.run("G")
+    assert not second.proven and prover.calls == 2
+    assert second.dag is not first.dag
+
+
+def test_mutated_authority_component_cannot_reuse_cached_proven():
+    """In-place verifier policy changes are invisible to object identity, so reruns re-verify."""
+    from types import SimpleNamespace
+
+    class MutableVerifier:
+        def __init__(self):
+            self.reject = False
+            self.calls = 0
+
+        def __call__(self, _goal, _ledger):
+            self.calls += 1
+            return SimpleNamespace(
+                lean_unavailable=False,
+                elementary_verified=not self.reject,
+                compiled=True,
+                audit=None,
+                lean_compiled_but_rejected=self.reject,
+            )
+
+    prover = DictProver({"G": valid_ledger("G")})
+    verifier = MutableVerifier()
+    driver = _driver(prover, node_verifier=verifier, ralph_episodes=1)
+
+    first = driver.run("G")
+    assert first.proven and verifier.calls == 1 and prover.calls == 1
+    first_context = driver.context_hash
+
+    verifier.reject = True
+    second = driver.run("G")
+    assert not second.proven
+    assert verifier.calls == 2 and prover.calls == 2
+    assert second.dag is not first.dag and driver.context_hash != first_context
+    assert driver.trace.by_kind("memo_context_reset")

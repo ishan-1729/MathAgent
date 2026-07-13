@@ -49,21 +49,29 @@ def main() -> int:
         print("  REJECT:", f)
 
     _rule("3. Flat driver: scripted prover repairs a rejected attempt, judge confirms -> PROVEN")
-    prover = ScriptedProver([json.dumps(PLANTED_NON_ELEMENTARY), json.dumps(good)])
+    goal = good["claim"]
+    # The flat certificate binds the theorem claim and operative conclusion. The example's
+    # human-friendly conclusion starts with "Hence", so normalize a private copy for this demo;
+    # ``problem`` correctly remains the dataset identifier ``squares_mod4``.
+    bound_good = json.loads(json.dumps(good))
+    for step in bound_good["steps"]:
+        if step.get("justification") == "conclusion":
+            step["claim"] = goal
+    prover = ScriptedProver([json.dumps(PLANTED_NON_ELEMENTARY), json.dumps(bound_good)])
     judge = ScriptedJudge("critic", [JudgeVerdict("critic", elementary=True, no_gaps=True,
                                                   confidence=0.9)])
     driver = FlatDriver(prover, judges=[judge], toolkit=toolkit, trace=RunTrace("demo-run"))
-    result = driver.run("squares_mod4")
+    result = driver.run(goal)
     print("final state:", result.state.value, "| attempts:", result.attempts,
           "| proven:", result.proven)
 
     _rule("Rendered run record")
     print(result.trace.render_run_record({
-        "problem": "squares_mod4",
-        "proof_status": "proven (gate-passed; Lean advisory)",
+        "problem": goal,
+        "proof_status": "soft_proven (deterministic gate only; no Layer-4 certificate)",
         "summary": "Repaired a non-elementary first attempt into an elementary case-split proof.",
         "scores": "gate: PASSED_DETERMINISTIC; judges: 1/1 pass",
-        "next_action": "wire a real LLM-backed Prover/Judge; add the Lean Layer-4 spike",
+        "next_action": "rerun with profiles/authoritative.yaml and live providers for Layer-4 certification",
     }))
     return 0 if result.proven else 1
 

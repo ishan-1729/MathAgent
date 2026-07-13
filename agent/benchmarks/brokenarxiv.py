@@ -30,13 +30,13 @@ answer/gold field and NO explicit perturbation-type label (falseness is implicit
 SAFETY: this module only parses data. It never `exec`/`eval`/`import`s any dataset content; a
 `statement` is inert text.
 
-Scoring a run requires a judge (the 0–2 rubric above) and is out of scope for v1 of the runner (which
-supports only --list/--dump for this dataset); the plumbing here is the dataset + oracle + a `Solver`
-Protocol + the `normalize_grade` helper so a real judged run can be slotted in later.
+The judge-free safety runner is ``scripts/run_brokenarxiv.py``. It measures gate-admitted bluffs
+directly and documents why its non-bluff buckets are coarser than the upstream prose-judge rubric.
 """
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Protocol, runtime_checkable
@@ -48,7 +48,12 @@ JUDGE_MAX = 2
 
 def normalize_grade(grade: int | float) -> float:
     """Map an upstream 0–2 judge grade onto [0, 1] (0→0.0, 1→0.5, 2→1.0), clamped to range."""
-    g = max(JUDGE_MIN, min(JUDGE_MAX, float(grade)))
+    if isinstance(grade, bool) or not isinstance(grade, (int, float)):
+        raise TypeError("grade must be a finite int or float")
+    g = float(grade)
+    if not math.isfinite(g):
+        raise ValueError("grade must be finite")
+    g = max(JUDGE_MIN, min(JUDGE_MAX, g))
     return (g - JUDGE_MIN) / (JUDGE_MAX - JUDGE_MIN)
 
 
@@ -80,39 +85,162 @@ class ScriptedBrokenSolver:
         return self.responses.get(statement, self.default)
 
 
+_MAX_DATASET_ROWS = 1_000_000
+_MAX_JSONL_LINE_BYTES = 1024 * 1024
+_MAX_DATASET_BYTES = 64 * 1024 * 1024
+_MAX_IDX_CHARS = 512
+_MAX_STATEMENT_CHARS = 100_000
+_MAX_METADATA_CHARS = 10_000
+_MAX_PROBLEM_TYPES = 64
+_MAX_PROBLEM_TYPE_CHARS = 256
+_ID_KEYS = ("problem_idx", "idx", "id", "problem_id")
+_STATEMENT_KEYS = ("problem", "statement", "false_statement", "perturbed_statement")
+_ORIGINAL_KEYS = ("original_problem", "original_statement", "true_statement")
+_KNOWN_FIELDS = frozenset({
+    *_ID_KEYS, *_STATEMENT_KEYS, *_ORIGINAL_KEYS,
+    "points", "source", "title", "authors", "problem_type",
+})
+
+
+class BrokenArxivDataError(ValueError):
+    """A BrokenArXiv release is ambiguous, malformed, or outside resource bounds."""
+
+
+def _json_object_no_duplicates(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise BrokenArxivDataError(f"duplicate JSON object key {key!r}")
+        obj[key] = value
+    return obj
+
+
 def _as_types(value) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [t.strip() for t in value.split(",") if t.strip()]
-    return [str(t).strip() for t in value if str(t).strip()]
+        values = [t.strip() for t in value.split(",") if t.strip()]
+    elif isinstance(value, (list, tuple)) and all(isinstance(t, str) for t in value):
+        values = [t.strip() for t in value if t.strip()]
+    else:
+        raise TypeError("problem_type must be a string, list of strings, or null")
+    if len(values) > _MAX_PROBLEM_TYPES:
+        raise ValueError(f"problem_type exceeds {_MAX_PROBLEM_TYPES} entries")
+    if any(len(value) > _MAX_PROBLEM_TYPE_CHARS for value in values):
+        raise ValueError(f"problem_type entry exceeds {_MAX_PROBLEM_TYPE_CHARS} characters")
+    folded = [value.casefold() for value in values]
+    if len(set(folded)) != len(folded):
+        raise ValueError("problem_type contains duplicate labels")
+    return values
 
 
 def _is_number_theory(types: Iterable[str]) -> bool:
     return any("number theory" in t.lower() for t in types)
 
 
+def _one_alias(row: dict, keys: tuple[str, ...], label: str):
+    present = [(key, row[key]) for key in keys if key in row and row[key] is not None]
+    if not present:
+        raise ValueError(f"missing required field {label}")
+    if len(present) != 1:
+        raise ValueError(f"multiple aliases supplied for {label}: {', '.join(k for k, _ in present)}")
+    return present[0][1]
+
+
+def _text(value, label: str, *, max_chars: int) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string")
+    result = value.strip()
+    if not result:
+        raise ValueError(f"{label} must not be blank")
+    if len(result) > max_chars:
+        raise ValueError(f"{label} exceeds {max_chars} characters")
+    return result
+
+
+def _normalize_row(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raise TypeError(f"row must be an object (got {type(raw).__name__})")
+    unknown = sorted(set(raw) - _KNOWN_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown field(s): {', '.join(map(str, unknown[:5]))}")
+    idx_value = _one_alias(raw, _ID_KEYS, "problem_idx")
+    if isinstance(idx_value, bool) or not isinstance(idx_value, (str, int)):
+        raise TypeError("problem_idx must be a string or integer")
+    idx = str(idx_value).strip()
+    if not idx:
+        raise ValueError("problem_idx must not be blank")
+    if len(idx) > _MAX_IDX_CHARS:
+        raise ValueError(f"problem_idx exceeds {_MAX_IDX_CHARS} characters")
+    statement = _text(
+        _one_alias(raw, _STATEMENT_KEYS, "problem"), "problem", max_chars=_MAX_STATEMENT_CHARS,
+    )
+    original = _text(
+        _one_alias(raw, _ORIGINAL_KEYS, "original_problem"), "original_problem",
+        max_chars=_MAX_STATEMENT_CHARS,
+    )
+    points = raw.get("points")
+    if isinstance(points, bool) or not isinstance(points, int) or points <= 0:
+        raise TypeError("points must be a positive integer")
+    normalized: dict[str, object] = {
+        "problem_idx": idx,
+        "problem": statement,
+        "original_problem": original,
+        "points": points,
+        "problem_type": tuple(_as_types(raw.get("problem_type"))),
+    }
+    for key in ("source", "title", "authors"):
+        value = raw.get(key)
+        if value is not None:
+            normalized[key] = _text(value, key, max_chars=_MAX_METADATA_CHARS)
+        else:
+            normalized[key] = None
+    return normalized
+
+
 class BrokenArxivDataset:
     """A loaded BrokenArXiv release. Raw items keep the held-out original/source; `problems()` strips them."""
 
-    def __init__(self, items: list[dict], *, release: str = ""):
-        self._items = items
-        self.release = release
+    def __init__(self, items: list[object], *, release: str = ""):
+        if not isinstance(items, list):
+            raise BrokenArxivDataError("BrokenArXiv items must be a list")
+        if not items:
+            raise BrokenArxivDataError("BrokenArXiv release contains no rows")
+        if len(items) > _MAX_DATASET_ROWS:
+            raise BrokenArxivDataError(f"BrokenArXiv release exceeds {_MAX_DATASET_ROWS} rows")
+        normalized: list[dict] = []
+        normalized_bytes = 0
+        seen: dict[str, int] = {}
+        for row_no, raw in enumerate(items, start=1):
+            try:
+                row = _normalize_row(raw)
+            except (TypeError, ValueError) as exc:
+                raise BrokenArxivDataError(f"malformed row {row_no}: {exc}") from exc
+            idx = str(row["problem_idx"])
+            if idx in seen:
+                raise BrokenArxivDataError(
+                    f"duplicate problem_idx {idx!r} at rows {seen[idx]} and {row_no}"
+                )
+            seen[idx] = row_no
+            normalized_bytes += len(json.dumps(
+                row, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8"))
+            if normalized_bytes > _MAX_DATASET_BYTES:
+                raise BrokenArxivDataError(
+                    f"BrokenArXiv normalized content exceeds {_MAX_DATASET_BYTES} bytes"
+                )
+            normalized.append(row)
+        self._items = normalized
+        self.release = str(release).strip()
 
     def __len__(self) -> int:
         return len(self._items)
 
     def _idx(self, it: dict) -> str:
-        for key in ("problem_idx", "idx", "id", "problem_id"):
-            if key in it and it[key] is not None:
-                return str(it[key])
-        return str(it.get("source", ""))
+        return str(it["problem_idx"])
 
     def _statement(self, it: dict) -> str:
-        for key in ("statement", "problem", "false_statement", "perturbed_statement"):
-            if key in it and it[key] is not None:
-                return str(it[key])
-        return ""
+        return str(it["problem"])
 
     def problems(self, *, number_theory_only: bool = False) -> list[BrokenProblem]:
         out: list[BrokenProblem] = []
@@ -132,17 +260,52 @@ class BrokenArxivDataset:
         out: dict[str, dict] = {}
         for it in self._items:
             out[self._idx(it)] = {
-                "original_statement": (it.get("original_problem") or it.get("original_statement")
-                                       or it.get("true_statement") or ""),
+                "original_statement": it["original_problem"],
                 "points": it.get("points"),
-                "source": it.get("source", ""),
+                "source": it.get("source"),
             }
         return out
 
     @classmethod
     def from_jsonl(cls, path: str | Path, release: str = "") -> "BrokenArxivDataset":
         p = Path(path)
-        items = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        items: list[object] = []
+        total_bytes = 0
+        with p.open("rb") as fh:
+            line_no = 0
+            while True:
+                raw = fh.readline(_MAX_JSONL_LINE_BYTES + 1)
+                if not raw:
+                    break
+                line_no += 1
+                if len(raw) > _MAX_JSONL_LINE_BYTES:
+                    raise BrokenArxivDataError(
+                        f"JSONL line {line_no} exceeds {_MAX_JSONL_LINE_BYTES} bytes"
+                    )
+                if not raw.strip():
+                    continue
+                total_bytes += len(raw)
+                if total_bytes > _MAX_DATASET_BYTES:
+                    raise BrokenArxivDataError(
+                        f"BrokenArXiv JSONL content exceeds {_MAX_DATASET_BYTES} bytes"
+                    )
+                if len(items) >= _MAX_DATASET_ROWS:
+                    raise BrokenArxivDataError(f"BrokenArXiv release exceeds {_MAX_DATASET_ROWS} rows")
+                try:
+                    items.append(json.loads(raw.decode("utf-8"),
+                                           object_pairs_hook=_json_object_no_duplicates))
+                except UnicodeDecodeError as exc:
+                    raise BrokenArxivDataError(
+                        f"invalid UTF-8 in {p} at line {line_no}: {exc}"
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    raise BrokenArxivDataError(
+                        f"invalid JSON in {p} at line {line_no}, column {exc.colno}: {exc.msg}"
+                    ) from exc
+                except BrokenArxivDataError as exc:
+                    raise BrokenArxivDataError(
+                        f"invalid JSON object in {p} at line {line_no}: {exc}"
+                    ) from exc
         return cls(items, release=release or p.stem)
 
     @classmethod
@@ -150,4 +313,16 @@ class BrokenArxivDataset:
                          cache_dir: Optional[str] = None) -> "BrokenArxivDataset":
         from datasets import load_dataset            # optional dep (mathagent[benchmark])
         ds = load_dataset(f"MathArena/{config}", split=split, cache_dir=cache_dir)
-        return cls([dict(r) for r in ds], release=config)
+        items: list[object] = []
+        total_bytes = 0
+        for row_no, raw in enumerate(ds, start=1):
+            if row_no > _MAX_DATASET_ROWS:
+                raise BrokenArxivDataError(f"BrokenArXiv release exceeds {_MAX_DATASET_ROWS} rows")
+            row = dict(raw)
+            total_bytes += len(json.dumps(row, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            if total_bytes > _MAX_DATASET_BYTES:
+                raise BrokenArxivDataError(
+                    f"BrokenArXiv HF content exceeds {_MAX_DATASET_BYTES} bytes"
+                )
+            items.append(row)
+        return cls(items, release=config)

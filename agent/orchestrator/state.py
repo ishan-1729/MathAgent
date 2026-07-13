@@ -43,7 +43,11 @@ class BudgetExceeded(Exception):
 
 @dataclass
 class Budget:
-    """Hard caps for a single problem run. Defaults mirror PLAN.md Section 4.3."""
+    """Hard caps for orchestrator-scheduled search/review work on one problem.
+
+    External verification and evolutionary controllers expose their own bounded controls; they do
+    not masquerade as calls charged by this scheduler.
+    """
 
     max_llm_calls: int = 150
     max_repair_iters: int = 6

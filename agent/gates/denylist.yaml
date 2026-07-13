@@ -226,6 +226,36 @@ lean_denylist_decls:
   - CuspForm
   - SlashInvariantForm
   - ClassGroup
+  # GALOIS THEORY / FIELD EXTENSIONS (2026-07-07 audit gap). The denylist had ZERO coverage of Galois
+  # machinery: only the incidental prose phrase "galois cohomology" existed, and no Lean decl or module
+  # entry banned Galois groups, splitting fields, intermediate fields, or radical solvability. A proof
+  # reaching an elementary NT statement via Galois theory (e.g. quadratic reciprocity through the Galois
+  # action, or a solvability argument) would pass the Layer-4 closure audit. These constructs build a
+  # NON-elementary field extension / automorphism group the integer-elementary fragment T excludes; the
+  # elementary toolkit forces the argument over Z / ZMod congruence. Decl-name entries + the
+  # Mathlib.FieldTheory.* module-family bans are belt-and-braces (older reports without a `module` field
+  # see only decl names). `Polynomial.Gal` / `IntermediateField.*` are dotted, scoping to those constructs.
+  #
+  # OVER-REJECTION REASONING (NOT yet live-audited — follow-up: a planted-Galois-proof CEGAR pass +
+  # a re-run of the certified battery, once the lake/Mathlib env is built): the shipped certified proofs
+  # are Int/Nat/ZMod congruence + descent. `ZMod p`'s field instance is constructed DIRECTLY
+  # (ZMod.instField), NOT as a `SplittingField`/`GaloisField` and NOT through `IsGalois`/`IntermediateField`,
+  # and `legendreSym` (elementary-by-fiat) is a quadratic character, not a Galois object — so the certified
+  # battery is not expected to transitively touch any token below. This reasoning must be confirmed live
+  # before relying on it; recorded here as an explicit open verification, per the section's discipline.
+  - IsGalois
+  - Polynomial.Gal
+  - IntermediateField
+  - IsSplittingField
+  - SplittingField
+  - GaloisField
+  - solvableByRad
+  - IsSolvableByRad
+  - Mathlib.FieldTheory.Galois
+  - Mathlib.FieldTheory.SplittingField
+  - Mathlib.FieldTheory.IntermediateField
+  - Mathlib.FieldTheory.AbelRuffini
+  - Mathlib.FieldTheory.KummerExtension
 
 lean_infrastructure_allowlist:
   - WellFounded.fix

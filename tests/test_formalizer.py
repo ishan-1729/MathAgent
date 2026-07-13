@@ -17,7 +17,8 @@ TOOLKIT = load_toolkit()
 
 VALID_LEDGER = json.dumps({"problem": "p", "claim": "For all integers n, n + 0 = n.", "steps": [
     {"id": "s1", "claim": "Let n be an integer.", "justification": "given", "depends_on": []},
-    {"id": "s2", "claim": "n + 0 = n.", "justification": "conclusion", "depends_on": ["s1"]}]})
+    {"id": "s2", "claim": "For all integers n, n + 0 = n.",
+     "justification": "conclusion", "depends_on": ["s1"]}]})
 
 BAD_LEDGER = json.dumps({"problem": "p", "claim": "c", "steps": [
     {"id": "s1", "claim": "x", "justification": "class_field_theory", "depends_on": []},
@@ -68,7 +69,7 @@ def test_codex_formalizer_no_code(monkeypatch):
 
 def _passing_audit():
     return LeanAuditResult(verdict=LeanVerdict.PASS, findings=[],
-                           report=DependencyReport("ma_target"))
+                           report=DependencyReport("ma_target"), provenance_verified=True)
 
 
 def _rejecting_audit():
@@ -103,6 +104,20 @@ def test_formalize_and_audit_compile_failure(monkeypatch):
     assert res.formalized and not res.compiled and "compile" in res.error
 
 
+def test_formalize_and_audit_marks_post_preflight_unavailability(monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise fb.lean_bridge.LeanUnavailable("Lean disappeared after preflight")
+
+    monkeypatch.setattr(fb.lean_bridge, "audit_lean_source", unavailable)
+    res = fb.formalize_and_audit(
+        VALID_LEDGER, fz.ScriptedFormalizer("theorem ma_target : True := trivial"),
+        toolkit=TOOLKIT,
+    )
+    assert res.compiled is False
+    assert res.lean_unavailable is True
+    assert res.lean_could_not_formalize is False
+
+
 def test_formalize_failure_short_circuits():
     res = fb.formalize_and_audit(VALID_LEDGER, fz.ScriptedFormalizer("", ok=False), toolkit=TOOLKIT)
     assert not res.formalized and not res.elementary_verified
@@ -130,6 +145,41 @@ def test_repair_loop_recovers(monkeypatch):
     assert res.attempts == 2                       # failed once, repaired, succeeded
     assert formalizer.repair_calls == 1            # one repair invocation
     assert "unknown identifier" in retriever.calls[0][1]  # the Lean error reached the retriever
+
+
+def test_verification_model_calls_are_reported_separately(monkeypatch):
+    from agent.gates.lean_bridge import LeanBridgeError
+    from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
+
+    calls = {"n": 0}
+
+    def audit(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LeanBridgeError("repair me")
+        return _passing_audit()
+
+    monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", audit)
+    formalizer = fz.ScriptedFormalizer(["bad", "good"], certification_trusted=True)
+    formalizer.model_call_cost = 1
+    checker = ScriptedFaithfulnessChecker(True, certification_trusted=True)
+    checker.model_call_cost = 4
+    result = fb.formalize_and_audit(
+        VALID_LEDGER, formalizer, toolkit=TOOLKIT, repair_iters=1,
+        faithfulness_checker=checker,
+    )
+    assert result.authoritative
+    assert result.model_calls == 6  # two formalizer invocations + four panel lenses
+    assert "model_calls=6" in result.summary()
+
+
+@pytest.mark.parametrize("repair_iters", [-1, 1001, True, 1.5])
+def test_repair_iterations_are_bounded(repair_iters):
+    with pytest.raises(ValueError, match="repair_iters"):
+        fb.formalize_and_audit(
+            VALID_LEDGER, fz.ScriptedFormalizer("theorem ma_target : True := trivial"),
+            toolkit=TOOLKIT, repair_iters=repair_iters,
+        )
 
 
 def test_repair_on_audit_reject(monkeypatch):
@@ -162,9 +212,11 @@ def test_full_verify_authoritative(monkeypatch):
     # Faithfulness FAILS CLOSED: authoritative requires a faithfulness panel that actually passed.
     from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
-    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial",
+                               certification_trusted=True)
     res = fb.full_verify(VALID_LEDGER, fr, toolkit=TOOLKIT,
-                         faithfulness_checker=ScriptedFaithfulnessChecker(True))
+                         faithfulness_checker=ScriptedFaithfulnessChecker(
+                             True, certification_trusted=True))
     assert res.gate.admitted_deterministically
     assert res.authoritative_elementary
 
@@ -196,9 +248,12 @@ def test_faithfulness_blocks_authoritative(monkeypatch):
 def test_faithfulness_pass_is_authoritative(monkeypatch):
     from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
-    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial")
+    fr = fz.ScriptedFormalizer("theorem ma_target : True := trivial",
+                               certification_trusted=True)
     res = fb.formalize_and_audit(VALID_LEDGER, fr, toolkit=TOOLKIT,
-                                 informal_claim="claim", faithfulness_checker=ScriptedFaithfulnessChecker(True))
+                                 informal_claim="claim",
+                                 faithfulness_checker=ScriptedFaithfulnessChecker(
+                                     True, certification_trusted=True))
     assert res.authoritative
 
 
@@ -216,8 +271,11 @@ def test_no_faithfulness_checker_blocks_authoritative(monkeypatch):
 def test_make_terminal_gate(monkeypatch):
     from agent.orchestrator.faithfulness import ScriptedFaithfulnessChecker
     monkeypatch.setattr("agent.gates.lean_bridge.audit_lean_source", lambda *a, **k: _passing_audit())
-    gate = fb.make_terminal_gate(fz.ScriptedFormalizer("theorem ma_target : True := trivial"),
-                                 toolkit=TOOLKIT, faithfulness_checker=ScriptedFaithfulnessChecker(True))
+    gate = fb.make_terminal_gate(
+        fz.ScriptedFormalizer("theorem ma_target : True := trivial",
+                              certification_trusted=True),
+        toolkit=TOOLKIT,
+        faithfulness_checker=ScriptedFaithfulnessChecker(True, certification_trusted=True))
     result = gate("root goal", "proof bundle text")
     assert result.authoritative
 

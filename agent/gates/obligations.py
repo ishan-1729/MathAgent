@@ -33,6 +33,55 @@ from agent.tools import numeric
 from agent.tools.numeric import NumericError
 
 
+# One ledger may contain many individually legal finite checks. Cap their combined worst-case work so
+# `steps.maxItems` cannot multiply a per-check allowance into billions of iterations.
+MAX_TOTAL_OBLIGATION_WORK = numeric.MAX_BOX_POINTS
+
+
+def _saturated_add(total: int, amount: int) -> int:
+    return min(MAX_TOTAL_OBLIGATION_WORK + 1, total + max(0, amount))
+
+
+def _estimate_step_work(ledger: Ledger, ob: dict, *, graph_cost: int) -> int:
+    """Conservative iteration estimate; malformed shapes stay cheap and are rejected by checkers."""
+    work = 0
+    cc = ob.get("case_cover")
+    if isinstance(cc, dict):
+        modulus = cc.get("modulus")
+        residues = cc.get("residues")
+        if isinstance(modulus, int) and not isinstance(modulus, bool) and modulus > 0:
+            work = _saturated_add(work, modulus)
+        if isinstance(residues, list):
+            work = _saturated_add(work, len(residues))
+
+    descent = ob.get("descent")
+    if isinstance(descent, dict) and (descent.get("measure_expr") or descent.get("next_expr")):
+        variables = descent.get("variables")
+        bounds = descent.get("sample_bounds")
+        if isinstance(variables, list) and isinstance(bounds, dict) and variables:
+            points = 1
+            valid_box = True
+            for variable in variables:
+                pair = bounds.get(variable)
+                if (not isinstance(pair, list) or len(pair) != 2
+                        or any(isinstance(v, bool) or not isinstance(v, int) for v in pair)
+                        or pair[1] < pair[0]):
+                    valid_box = False
+                    break
+                points *= pair[1] - pair[0] + 1
+                if points > MAX_TOTAL_OBLIGATION_WORK:
+                    points = MAX_TOTAL_OBLIGATION_WORK + 1
+                    break
+            if valid_box:
+                work = _saturated_add(work, points)
+
+    # reachable_from is graph-linear for every split-coprimality obligation. Account for that cost as
+    # well as numeric enumeration so many split steps cannot create quadratic work unnoticed.
+    if isinstance(ob.get("split_coprimality"), dict):
+        work = _saturated_add(work, graph_cost)
+    return work
+
+
 def _check_case_cover(step_id: str, ob: dict) -> list[Finding]:
     cc = ob.get("case_cover")
     if not cc:
@@ -190,9 +239,24 @@ def _check_split_coprimality(ledger: Ledger, step_id: str, ob: dict) -> list[Fin
 
 def check_obligations(ledger: Ledger, toolkit: Toolkit) -> list[Finding]:
     findings: list[Finding] = []
+    remaining_work = MAX_TOTAL_OBLIGATION_WORK
+    graph_cost = len(ledger.steps) + sum(len(step.depends_on) for step in ledger.steps)
     for s in ledger.steps:
         if not s.obligations:
             continue
+        estimated_work = _estimate_step_work(ledger, s.obligations, graph_cost=graph_cost)
+        if estimated_work > remaining_work:
+            findings.append(Finding(
+                LAYER_NUMERIC,
+                Severity.REJECT,
+                "obligation_work_budget_exceeded",
+                f"ledger-wide deterministic work budget {MAX_TOTAL_OBLIGATION_WORK} would be "
+                f"exceeded at step {s.id!r} (estimated {estimated_work}, remaining "
+                f"{remaining_work})",
+                s.id,
+            ))
+            continue
+        remaining_work -= estimated_work
         findings += _check_case_cover(s.id, s.obligations)
         findings += _check_descent(s.id, s.obligations)
         findings += _check_bounding(s.id, s.obligations)

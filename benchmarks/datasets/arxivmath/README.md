@@ -3,8 +3,9 @@
 **ArXivMath** is MathArena's arXiv-derived **final-answer** benchmark (ETH SRI Lab + INSAIT). Problems
 are reverse-engineered from very recent arXiv papers and refreshed monthly, so the set is
 **contamination-resistant** and postdates most training cutoffs. Vanilla **GPT-5.5-xHigh scores ~77.50%**
-on the `arxivmath-0326` (March 2026) release — a non-saturated target, so we use it to measure **how
-much the MathAgent harness adds on top of the base model**.
+on the `arxivmath-0326` (March 2026) release — a non-saturated target for final-answer baselines and the
+optional answer-refinement loop. The current runner does **not** execute the typed-ledger/Layer-4 proof
+harness, so no full-harness lift is claimed from these records.
 
 - Source / leaderboard: <https://matharena.ai/arxivmath/>
 - Platform paper: *Beyond Benchmarks: MathArena …* — [arXiv:2605.00674](https://arxiv.org/abs/2605.00674)
@@ -45,5 +46,25 @@ python -m pytest tests/test_arxivmath.py -q
 # mathagent[benchmark]); NT subset only, write a run record:
 python scripts/run_benchmark.py --hf-config arxivmath-0326 --nt-only --out benchmarks/datasets/arxivmath/runs
 ```
+
+Runs written with `--out` checkpoint every completed row and a separate fsynced receipt. If the
+process stops, stderr prints the retained `*.jsonl.incomplete` path. Resume with the same dataset,
+filter, and solver flags plus that path, for example:
+
+```sh
+python scripts/run_benchmark.py --hf-config arxivmath-0326 --nt-only \
+  --resume benchmarks/datasets/arxivmath/runs/arxivmath_0326_<stamp>.jsonl.incomplete
+```
+
+`--resume` fails before any model call unless the receipt, dataset hash and row prefix, solver mode,
+Git tree fingerprint, and Python/package versions all match. It reruns only the unpaid suffix. At
+completion the Markdown summary and JSONL are both prepared and fsynced; the summary is published
+first and the JSONL is the commit point, so this runner never publishes a final JSONL without its
+summary.
+
+The receipt and row checks detect accidental corruption and inconsistent rewrites; they are not a
+cryptographic signature against a filesystem owner who deliberately rewrites the receipt and every
+dependent row. The configured model/mode and Python/package versions are recorded, but the external
+Codex executable's build version is not currently machine-attested.
 
 See `manifest.yaml` for the default release and subset.

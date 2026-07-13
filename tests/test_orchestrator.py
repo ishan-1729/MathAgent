@@ -11,20 +11,20 @@ from agent.gates.toolkit import load_toolkit
 TOOLKIT = load_toolkit()
 
 GOOD = json.dumps({
-    "problem": "p", "claim": "c",
+    "problem": "p", "claim": "p",
     "steps": [
         {"id": "s1", "claim": "Let n be an integer.", "justification": "given", "depends_on": []},
-        {"id": "s2", "claim": "Therefore the claim holds.", "justification": "conclusion",
+        {"id": "s2", "claim": "p", "justification": "conclusion",
          "depends_on": ["s1"]},
     ],
 })
 
 BAD = json.dumps({
-    "problem": "p", "claim": "c",
+    "problem": "p", "claim": "p",
     "steps": [
         {"id": "s1", "claim": "Invoke the class group.", "justification": "class_field_theory",
          "depends_on": []},
-        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+        {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]},
     ],
 })
 
@@ -49,6 +49,39 @@ def test_good_proof_passing_judge():
     res = _driver(ScriptedProver([GOOD]), judges=[ScriptedJudge("J", [PASS])]).run("p")
     assert res.proven
     assert len(res.judge_verdicts) == 1 and res.judge_verdicts[0].passed
+
+
+def test_flat_judge_requires_literal_true_booleans():
+    malformed = JudgeVerdict(judge="J", elementary=True, no_gaps="false", notes=["malformed"])
+    res = _driver(
+        ScriptedProver([GOOD]),
+        judges=[ScriptedJudge("J", [malformed])],
+        budget=Budget(max_repair_iters=0, max_llm_calls=2),
+    ).run("p")
+    assert not res.proven and res.state is NodeState.FAILED_GAP
+    event = res.trace.by_kind("judge")[0]
+    assert event.data["passed"] is False and event.data["no_gaps"] is False
+
+
+def test_flat_driver_rejects_duck_typed_truthy_passed_verdict():
+    from types import SimpleNamespace
+
+    class MalformedJudge:
+        name = "J"
+
+        def review(self, _ledger):
+            return SimpleNamespace(
+                judge="J", elementary="false", no_gaps="false", passed="false",
+                notes=["malformed provider payload"],
+            )
+
+    res = _driver(
+        ScriptedProver([GOOD]), judges=[MalformedJudge()],
+        budget=Budget(max_repair_iters=0, max_llm_calls=2),
+    ).run("p")
+    assert not res.proven and res.state is NodeState.FAILED_GAP
+    event = res.trace.by_kind("judge")[0]
+    assert event.data["passed"] is False
 
 
 def test_repair_then_success():
@@ -90,6 +123,40 @@ def test_judge_repair_then_pass():
     res = _driver(ScriptedProver([GOOD]), judges=[judge]).run("p")
     assert res.proven
     assert res.attempts == 2
+
+
+def test_flat_prover_exception_is_bounded_and_retryable():
+    class RaisingThenGood:
+        def __init__(self):
+            self.calls = 0
+
+        def prove(self, _problem, feedback=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("provider timed out")
+            assert feedback and "timed out" in feedback[0]
+            return GOOD
+
+    res = _driver(
+        RaisingThenGood(), budget=Budget(max_repair_iters=1, max_llm_calls=2)
+    ).run("p")
+    assert res.proven and res.attempts == 2
+    assert res.trace.by_kind("prover_error")
+
+
+def test_flat_judge_exception_fails_closed_without_crashing():
+    class RaisingJudge:
+        name = "J"
+
+        def review(self, _ledger):
+            raise TimeoutError("judge timed out")
+
+    res = _driver(
+        ScriptedProver([GOOD]), judges=[RaisingJudge()],
+        budget=Budget(max_repair_iters=0, max_llm_calls=2),
+    ).run("p")
+    assert not res.proven and res.state is NodeState.EXHAUSTED
+    assert res.trace.by_kind("judge_error")
 
 
 def test_budget_exhaustion_zero_calls():

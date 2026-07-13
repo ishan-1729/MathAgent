@@ -34,7 +34,7 @@ def _descent_ledger(descent_ob):
         "steps": [
             {"id": "s1", "claim": "descend", "justification": "descent", "depends_on": [],
              "obligations": {"descent": descent_ob}},
-            {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s2", "claim": "c", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     }
 
@@ -67,9 +67,9 @@ def test_a1_integer_coefficients_still_work():
 # ---- A2: judge panel truncated by budget must NOT yield PROVEN ----
 
 def test_a2_truncated_judge_panel_is_exhausted_not_proven():
-    good = json.dumps({"problem": "p", "claim": "c", "steps": [
+    good = json.dumps({"problem": "p", "claim": "p", "steps": [
         {"id": "s1", "claim": "x", "justification": "given", "depends_on": []},
-        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]}]})
+        {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]}]})
     judge = ScriptedJudge("J", [JudgeVerdict("J", elementary=False, no_gaps=False)])
     res = FlatDriver(ScriptedProver([good]), judges=[judge], toolkit=TOOLKIT,
                      budget=Budget(max_llm_calls=1), trace=RunTrace("t")).run("p")
@@ -93,7 +93,7 @@ def test_a3a_descent_missing_sample_bound_rejects_not_crashes():
 def test_a3b_deep_acyclic_chain_does_not_recurse():
     # ~1500 deep > default recursion limit (1000); iterative cycle check must handle it.
     n = 1500
-    steps = [{"id": "s0", "claim": "thm", "justification": "conclusion", "depends_on": ["s1"]}]
+    steps = [{"id": "s0", "claim": "c", "justification": "conclusion", "depends_on": ["s1"]}]
     for i in range(1, n):
         steps.append({"id": f"s{i}", "claim": "x", "justification": "algebra",
                       "depends_on": [f"s{i+1}"]})
@@ -113,7 +113,7 @@ def test_a3_oversized_ledger_rejected_by_schema():
 def test_a3_self_loop_is_a_cycle():
     led = parse_ledger({"problem": "p", "claim": "c", "steps": [
         {"id": "a", "claim": "x", "justification": "algebra", "depends_on": ["a"]},
-        {"id": "c", "claim": "done", "justification": "conclusion", "depends_on": ["a"]}]})
+        {"id": "c", "claim": "c", "justification": "conclusion", "depends_on": ["a"]}]})
     assert "cycle" in {f.code for f in validate_structure(led, TOOLKIT)
                        if f.severity is Severity.REJECT}
 
@@ -121,10 +121,10 @@ def test_a3_self_loop_is_a_cycle():
 # ---- A4: NEEDS_REVIEW with no judges must NOT be PROVEN ----
 
 def test_a4_review_without_judges_not_proven():
-    review_ledger = json.dumps({"problem": "p", "claim": "c", "steps": [
+    review_ledger = json.dumps({"problem": "p", "claim": "p", "steps": [
         {"id": "s1", "claim": "bound it", "justification": "bounding", "depends_on": [],
          "obligations": {"bounding": {"inequality": "n < n+1", "strict": True}}},
-        {"id": "s2", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]}]})
+        {"id": "s2", "claim": "p", "justification": "conclusion", "depends_on": ["s1"]}]})
     res = FlatDriver(ScriptedProver([review_ledger]), judges=None, toolkit=TOOLKIT,
                      trace=RunTrace("t")).run("p")
     assert res.state is not NodeState.PROVEN
@@ -139,7 +139,7 @@ def test_a5_split_coprimality_must_be_ancestor():
         {"id": "x", "claim": "unrelated", "justification": "algebra", "depends_on": []},
         {"id": "sp", "claim": "split squares", "justification": "euclid_splitting",
          "depends_on": ["x"], "obligations": {"split_coprimality": {"coprimality_from": "g"}}},
-        {"id": "c", "claim": "done", "justification": "conclusion", "depends_on": ["sp"]}]}
+        {"id": "c", "claim": "c", "justification": "conclusion", "depends_on": ["sp"]}]}
     rep = evaluate(led, TOOLKIT)
     assert rep.rejected
     assert "split_coprimality_unrelated" in _codes(rep)
@@ -150,7 +150,7 @@ def test_a5_split_coprimality_ancestor_ok():
         {"id": "g", "claim": "gcd(p,q)=1", "justification": "gcd_coprimality", "depends_on": []},
         {"id": "sp", "claim": "split squares", "justification": "euclid_splitting",
          "depends_on": ["g"], "obligations": {"split_coprimality": {"coprimality_from": "g"}}},
-        {"id": "c", "claim": "done", "justification": "conclusion", "depends_on": ["sp"]}]}
+        {"id": "c", "claim": "c", "justification": "conclusion", "depends_on": ["sp"]}]}
     rep = evaluate(led, TOOLKIT)
     assert "split_coprimality_unrelated" not in _codes(rep)
 

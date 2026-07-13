@@ -9,6 +9,11 @@ compile/audit environment for the **Layer-4 dependency audit** (`agent/gates/lea
 `lake env lean` here so formalized `import Mathlib` proofs resolve). The Lean **extractor** lives at
 `agent/gates/lean/Audit.lean`.
 
+Every production report identifies the toolchain from the running Lean binary and carries the full SHA-256
+of this project's exact `lake-manifest.json`. The bridge compares the runtime toolchain with
+`lean-toolchain` and checks the pin/manifest before and after compilation (or persistent-server startup),
+so an environment label or concurrent manifest rewrite cannot spoof an authoritative receipt.
+
 Only the small project files are committed (`lakefile.toml`, `lean-toolchain`, `lake-manifest.json`,
 the lib sources). The heavy `.lake/` (toolchain, Mathlib clone, ~5GB of oleans) is git-ignored. To
 reproduce the build environment after cloning:

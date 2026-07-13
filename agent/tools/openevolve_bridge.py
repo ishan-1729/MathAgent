@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -181,6 +182,12 @@ class CallTelemetry:
 
 _TELEMETRY = CallTelemetry()
 
+# ``MATHAGENT_EVOLVE_GOAL`` is process-global while OpenEvolve may launch worker processes.  Serialize
+# complete runs so concurrent goals cannot overwrite one another between environment mutation and
+# worker spawn/read.  The re-entrant lock also covers goal-agnostic runs, preventing them from
+# accidentally inheriting another run's temporary goal.
+_EVOLVE_ENV_LOCK = threading.RLock()
+
 
 def call_telemetry() -> CallTelemetry:
     """The process-wide call-telemetry sink (per-call cost/time for tuning the rank-aware weights)."""
@@ -206,8 +213,8 @@ def _canonical_form(text: str) -> str:
 
       * If the text parses as a ledger: ``goal_hash(claim)`` plus, for every step, a normalized tuple
         ``(goal_hash(claim), justification, sorted(depends_on), canonical(obligations))``. This folds
-        all whitespace/indent/key-order/notation differences the goal_hash canonicalization already
-        folds, so an equivalent-but-perturbed refined ledger maps to the SAME fingerprint.
+        JSON layout/key-order and whitespace differences, but deliberately preserves notation and
+        wording because the authority-bearing goal identity does not guess semantic equivalence.
       * Otherwise (non-ledger text): a whitespace/JSON-normalized fallback — parse as JSON and re-dump
         with sorted keys + no incidental whitespace if possible, else collapse runs of whitespace —
         so an appended newline or reflowed JSON still canonicalizes identically.
@@ -1281,9 +1288,12 @@ def make_gate_evaluator(toolkit, goal: Optional[str] = None):
 
     def _evaluate(program_path: str) -> dict[str, float]:
         try:
-            with open(program_path, "r", encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError:
+            with open(program_path, "rb") as fh:
+                raw = fh.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError("evolved ledger exceeds 4 MiB")
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeError, ValueError):
             return {"combined_score": HARD_ZERO, "step_count": 0.0, "subgoal_depth": 0.0,
                     "modulus_band": 0.0, "strategy_class": float(_STRATEGY_CLASSES.index("other")),
                     "goal_bound": 0.0}
@@ -1344,9 +1354,12 @@ def gate_ledger_evaluator(program_path):
             goal = env_goal
 
     try:
-        with open(program_path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
+        with open(program_path, "rb") as fh:
+            raw = fh.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("evolved ledger exceeds 4 MiB")
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError, ValueError):
         return {"combined_score": 0.0, "step_count": 0.0, "subgoal_depth": 0.0,
                 "modulus_band": 0.0, "strategy_class": 5.0, "goal_bound": 0.0}
 
@@ -1386,9 +1399,12 @@ def witness_spec_evaluator(program_path):
     from agent.tools.openevolve_bridge import score_witness_spec
 
     try:
-        with open(program_path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
+        with open(program_path, "rb") as fh:
+            raw = fh.read(256 * 1024 + 1)
+        if len(raw) > 256 * 1024:
+            raise ValueError("evolved witness spec exceeds 256 KiB")
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError, ValueError):
         return {"combined_score": 0.0, "modulus_band": 0.0, "box_coverage": 0.0}
 
     lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
@@ -1626,24 +1642,25 @@ def _run_openevolve(*, initial_program, evaluator, config, iterations, output_di
 
     from openevolve.api import run_evolution
 
-    prev = os.environ.get("MATHAGENT_EVOLVE_GOAL")
-    if goal is not None:
-        os.environ["MATHAGENT_EVOLVE_GOAL"] = goal
-    try:
-        return run_evolution(
-            initial_program=initial_program,
-            evaluator=evaluator,
-            config=config,
-            iterations=iterations,
-            output_dir=output_dir,
-            cleanup=output_dir is None,
-        )
-    finally:
+    with _EVOLVE_ENV_LOCK:
+        prev = os.environ.get("MATHAGENT_EVOLVE_GOAL")
         if goal is not None:
-            if prev is None:
-                os.environ.pop("MATHAGENT_EVOLVE_GOAL", None)
-            else:
-                os.environ["MATHAGENT_EVOLVE_GOAL"] = prev
+            os.environ["MATHAGENT_EVOLVE_GOAL"] = goal
+        try:
+            return run_evolution(
+                initial_program=initial_program,
+                evaluator=evaluator,
+                config=config,
+                iterations=iterations,
+                output_dir=output_dir,
+                cleanup=output_dir is None,
+            )
+        finally:
+            if goal is not None:
+                if prev is None:
+                    os.environ.pop("MATHAGENT_EVOLVE_GOAL", None)
+                else:
+                    os.environ["MATHAGENT_EVOLVE_GOAL"] = prev
 
 
 def evolve_sketches(
@@ -1697,7 +1714,11 @@ def evolve_sketches(
     # archive. Fail loud if a caller tries (keeps the two stages strictly one-directional).
     for s in seeds:
         _BARRIER.assert_not_refined(s)
-    initial_program = seeds[0]  # OpenEvolve seeds the population from a single initial program
+    # OpenEvolve's current ``List[str]`` input means *lines of one program*, not multiple programs:
+    # its preparation path joins the list with newlines. Passing several JSON ledgers therefore
+    # creates one invalid concatenated artifact rather than island seeds. Until a pinned multi-program
+    # database API is integrated, use one complete seed deterministically and never concatenate.
+    initial_program = seeds[0]
 
     result = _run_openevolve(
         initial_program=initial_program,
@@ -1708,7 +1729,7 @@ def evolve_sketches(
         goal=goal,
     )
 
-    best_text = result.best_code or initial_program
+    best_text = result.best_code or seeds[0]
     # Strip EVOLVE-BLOCK comment scaffolding OpenEvolve adds around the seed.
     lines = [ln for ln in best_text.splitlines() if not ln.lstrip().startswith("#")]
     best_text = ("\n".join(lines).strip()) or best_text
@@ -1746,6 +1767,8 @@ def evolve_prove(
     iterations: int = 20,
     llm=None,
     claude_cfg: Optional[ClaudeConfig] = None,
+    breadth_model: str = "sonnet",
+    depth_model: str = "opus",
     breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
     depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
     rank_signal: Optional[RankSignal] = None,
@@ -1772,6 +1795,7 @@ def evolve_prove(
     """
     best_text, fitness, metrics = evolve_sketches(
         goal, toolkit, llm=llm, claude_cfg=claude_cfg,
+        breadth_model=breadth_model, depth_model=depth_model,
         breadth_weight=breadth_weight, depth_weight=depth_weight, rank_signal=rank_signal,
         iterations=iterations, seed_sketches=seed_sketches, retriever=retriever,
         num_islands=num_islands,
@@ -1795,6 +1819,8 @@ def evolve_witnesses(
     *,
     llm=None,
     claude_cfg: Optional[ClaudeConfig] = None,
+    breadth_model: str = "sonnet",
+    depth_model: str = "opus",
     breadth_weight: float = _DEFAULT_BREADTH_WEIGHT,
     depth_weight: float = _DEFAULT_DEPTH_WEIGHT,
     iterations: int = 20,
@@ -1820,12 +1846,14 @@ def evolve_witnesses(
 
     config = build_evolve_config(
         llm=llm, claude_cfg=claude_cfg,
+        breadth_model=breadth_model, depth_model=depth_model,
         breadth_weight=breadth_weight, depth_weight=depth_weight,
         iterations=iterations, num_islands=num_islands, feature_bins=feature_bins,
         feature_dimensions=["modulus_band", "box_coverage"],
     )
 
     seeds = seed_specs or [_default_witness_seed(goal)]
+    # As above, a list is interpreted upstream as lines of one program, not independent seeds.
     initial_program = seeds[0]
 
     result = _run_openevolve(
@@ -1837,7 +1865,7 @@ def evolve_witnesses(
         goal=None,  # witness scoring is goal-agnostic (it grounds the construction, not the claim)
     )
 
-    best_text = result.best_code or initial_program
+    best_text = result.best_code or seeds[0]
     lines = [ln for ln in best_text.splitlines() if not ln.lstrip().startswith("#")]
     best_text = ("\n".join(lines).strip()) or best_text
     return best_text, float(result.best_score), dict(result.metrics or {})

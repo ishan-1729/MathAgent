@@ -10,8 +10,19 @@ dependencies = [
     "pydantic>=2",
 ]
 
+[project.scripts]
+mathagent-prove = "scripts.prove:main"
+
 [project.optional-dependencies]
-test = ["pytest>=8.0", "hypothesis>=6.0"]
+# The wheel smoke test builds and installs the distribution without network/build isolation, so its
+# packaging frontend/backend are explicit test dependencies (uv-created environments omit pip by default).
+test = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+    "pip>=24.0",
+    "setuptools>=68",
+    "wheel>=0.43",
+]
 # Neural retrieval backend (bi-encoder + optional cross-encoder reranker). CPU-friendly.
 neural = ["sentence-transformers>=2.2", "numpy>=1.24"]
 # ArXivMath benchmark loader (HuggingFace datasets).
@@ -30,32 +41,26 @@ packages = [
     "agent.tools",
     "agent.orchestrator",
     "agent.benchmarks",
+    "profiles",
+    # Regular package backing the installed ``mathagent-prove`` console entry point.
+    "scripts",
+    # Namespace package preserving the path expected by the installed Lean bridge.
+    "formal.lean.mathagent_formal",
 ]
 
 [tool.setuptools.package-data]
-"agent.gates" = ["*.yaml", "*.json", "examples/*.json"]
-
-# Ship the RunProfile presets (profiles/ + profiles/ablation/) so an installed copy carries the
-# default/codex/solution-only/authoritative presets and the per-stage ablation profiles. They live at
-# the repo root (alongside scripts/), so they are registered as data-files rather than package-data.
-[tool.setuptools.data-files]
-"share/mathagent/profiles" = [
-    "profiles/default.yaml",
-    "profiles/codex.yaml",
-    "profiles/solution-only.yaml",
-    "profiles/authoritative.yaml",
-]
-"share/mathagent/profiles/ablation" = [
-    "profiles/ablation/no-decompose.yaml",
-    "profiles/ablation/no-review.yaml",
-    "profiles/ablation/no-h0.yaml",
-    "profiles/ablation/no-refine.yaml",
+"agent" = ["roles/*.md"]
+"agent.gates" = ["*.yaml", "*.json", "examples/*.json", "lean/*.lean"]
+"profiles" = ["*.yaml", "ablation/*.yaml"]
+"formal.lean.mathagent_formal" = [
+    "lakefile.toml",
+    "lake-manifest.json",
+    "lean-toolchain",
+    "MathagentFormal.lean",
+    "MathagentFormal/*.lean",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
-
-[tool.mathagent]
-status = "phase-1"

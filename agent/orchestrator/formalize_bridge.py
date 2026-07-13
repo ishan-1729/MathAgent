@@ -31,6 +31,9 @@ from agent.tools.formalizer import FormalizationResult
 
 @runtime_checkable
 class Formalizer(Protocol):
+    certification_trusted: bool
+    model_call_cost: int
+
     def formalize(self, ledger_text: str) -> FormalizationResult:
         ...
 
@@ -44,6 +47,9 @@ class SketchFormalizer(Protocol):
 
 @runtime_checkable
 class FaithfulnessChecker(Protocol):
+    certification_trusted: bool
+    model_call_cost: int
+
     def check(self, informal_claim: str, lean_source: str, theorem_name: str) -> FaithfulnessVerdict:
         ...
 
@@ -58,6 +64,10 @@ class FormalizeAuditResult:
     faithfulness: Optional[FaithfulnessVerdict] = None
     error: Optional[str] = None
     attempts: int = 1   # formalization attempts used (1 + repair iterations consumed)
+    # Actual provider-model calls made by this verification operation.  This is intentionally
+    # separate from the DAG/Ralph search budget: certification and evolution have their own bounded
+    # controls and must be observable rather than hidden inside the search-call counter.
+    model_calls: int = 0
     notes: list[str] = field(default_factory=list)
     # Read-only annotation (per-node gate, P0/P2): True iff the Lean toolchain was UNAVAILABLE (server
     # down / `lean` not installed) so no compile could even be attempted. Distinct from a compile that
@@ -65,11 +75,22 @@ class FormalizeAuditResult:
     # `authoritative` properties read it, so their semantics are unchanged (a result with
     # lean_unavailable=True has compiled=False and is therefore not elementary_verified, as before).
     lean_unavailable: bool = False
+    # Certification is a trust boundary, not merely a successful return value.  Test doubles and
+    # scripted providers are useful for exercising orchestration, but must opt in explicitly before
+    # they can mint an authoritative result.  Live formalizers/checkers advertise this capability;
+    # unknown components fail closed.
+    certification_trusted: bool = False
 
     @property
     def elementary_verified(self) -> bool:
-        """Compiled AND passed the Lean dependency/axiom audit."""
-        return bool(self.compiled and self.audit is not None and self.audit.passed)
+        """Compiled, passed the dependency audit, and carries derived build provenance.
+
+        A legacy/synthetic report may still be content-audited (`audit.passed`) for tooling, but it
+        cannot promote a node or terminal result without the production bridge's independently
+        derived runtime-toolchain + Lake-manifest receipt.
+        """
+        return bool(self.compiled is True and self.audit is not None
+                    and getattr(self.audit, "authoritative", False) is True)
 
     # ---- per-node-gate outcome classification (read-only; P2 driver routing) --------------------
     # The DAG driver's optional per-node verifier routes a LEAF on FOUR mutually-exclusive outcomes.
@@ -81,14 +102,29 @@ class FormalizeAuditResult:
         """Compiled, the audit RAN, and it REJECTED (sorry / denylist / non-whitelist axiom). This
         REFUTES elementarity for the leaf (a hard, fail-CLOSED signal), distinct from a proof that
         could not be formalized/compiled at all."""
-        return bool(self.compiled and self.audit is not None and not self.audit.passed)
+        return bool(self.compiled is True and self.audit is not None
+                    and self.audit.passed is not True)
+
+    @property
+    def lean_provenance_unverified(self) -> bool:
+        """Content passed, but no bridge-verified runtime/toolchain receipt backs the result.
+
+        This is an operational certification failure, not evidence that the proof is
+        non-elementary. It therefore must not be routed as ``lean_compiled_but_rejected`` or stamped
+        ``LEAN_VERIFIED``.
+        """
+        return bool(
+            self.compiled is True and self.audit is not None
+            and self.audit.passed is True
+            and getattr(self.audit, "authoritative", False) is not True
+        )
 
     @property
     def lean_could_not_formalize(self) -> bool:
         """The toolchain was available but the proof could not be turned into a compiling Lean term
         (no Lean produced, or a compile error). NOT a refutation of elementarity — a fail-OPEN signal:
         the leaf stays softly proven and is re-attemptable. Excludes the unavailable case."""
-        return bool(not self.lean_unavailable and not self.compiled)
+        return self.lean_unavailable is not True and self.compiled is not True
 
     @property
     def faithful(self) -> bool:
@@ -97,22 +133,56 @@ class FormalizeAuditResult:
         If faithfulness was never checked (`self.faithfulness is None`) this is False, so a
         compiling/audited proof of the WRONG statement is never silently treated as authoritative.
         """
-        return self.faithfulness is not None and self.faithfulness.faithful
+        return (self.faithfulness is not None
+                and self.faithfulness.faithful is True)
 
     @property
     def authoritative(self) -> bool:
         """The proof is authoritatively elementary: audited elementary AND a faithfulness panel
         ran and confirmed the statement faithfully captures the claim. Cannot be True unless a
-        faithfulness checker was supplied and passed (fail closed)."""
-        return self.elementary_verified and self.faithful
+        faithfulness checker was supplied and passed, and both certification components were trusted
+        (fail closed)."""
+        return (self.elementary_verified is True and self.faithful is True
+                and self.certification_trusted is True)
 
     def summary(self) -> str:
         if not self.formalized:
-            return "formalize: failed (no Lean produced)"
+            return f"formalize: failed (no Lean produced; model_calls={self.model_calls})"
         if not self.compiled:
-            return f"formalize: ok, compile/audit: failed ({self.error})"
+            return (f"formalize: ok, compile/audit: failed ({self.error}; "
+                    f"model_calls={self.model_calls})")
         f = "n/a" if self.faithfulness is None else self.faithfulness.summary()
-        return f"formalize: ok, compiled, {self.audit.summary()}, faithfulness[{f}], authoritative={self.authoritative}"
+        return (f"formalize: ok, compiled, {self.audit.summary()}, faithfulness[{f}], "
+                f"certification_trusted={self.certification_trusted}, "
+                f"model_calls={self.model_calls}, "
+                f"authoritative={self.authoritative}")
+
+
+def _certification_trusted(component: object | None) -> bool:
+    """Return whether *component* may participate in an authoritative certificate.
+
+    The default is deliberately false: an arbitrary duck-typed object must not gain authority just
+    because it implements the right method.  Production providers declare the capability explicitly,
+    while scripted fixtures opt in only in tests that are specifically exercising the trusted path.
+    """
+    return bool(component is not None and getattr(component, "certification_trusted", False) is True)
+
+
+def _model_call_cost(component: object | None) -> int:
+    """Declared provider calls per invocation (unknown/custom components conservatively report zero)."""
+    cost = getattr(component, "model_call_cost", 0) if component is not None else 0
+    if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
+        return 0
+    return cost
+
+
+_MAX_REPAIR_ITERS = 1000
+
+
+def _validate_repair_iters(repair_iters: int) -> None:
+    if (isinstance(repair_iters, bool) or not isinstance(repair_iters, int)
+            or not 0 <= repair_iters <= _MAX_REPAIR_ITERS):
+        raise ValueError(f"repair_iters must be an integer in [0, {_MAX_REPAIR_ITERS}]")
 
 
 def _claim_of(ledger_text: str) -> str:
@@ -137,14 +207,19 @@ def formalize_and_audit(ledger_text: str, formalizer: Formalizer,
     retrieved real Mathlib lemmas) back to the formalizer for another attempt. Pass a persistent
     `server` so each compile is ~0.1s instead of a full Mathlib reload.
     """
+    _validate_repair_iters(repair_iters)
     toolkit = toolkit or load_toolkit()
     if project_dir is None and server is None:
         project_dir = lean_bridge.find_mathlib_project()
     claim = informal_claim if informal_claim is not None else _claim_of(ledger_text)
+    certification_trusted = (_certification_trusted(formalizer)
+                             and _certification_trusted(faithfulness_checker))
 
+    model_calls = _model_call_cost(formalizer)
     fr = formalizer.formalize(ledger_text)
     if not fr.ok:
-        return FormalizeAuditResult(formalized=False, notes=fr.notes)
+        return FormalizeAuditResult(formalized=False, notes=fr.notes, model_calls=model_calls,
+                                    certification_trusted=certification_trusted)
     source, name = fr.lean_source, fr.theorem_name
     last_error: Optional[str] = None
 
@@ -156,12 +231,16 @@ def formalize_and_audit(ledger_text: str, formalizer: Formalizer,
                 project_dir=project_dir, timeout_s=timeout_s, server=server)
         except lean_bridge.LeanUnavailable as e:
             return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
-                                        lean_source=source, error=str(e), attempts=attempts)
+                                        lean_source=source, error=str(e), attempts=attempts,
+                                        model_calls=model_calls,
+                                        lean_unavailable=True,
+                                        certification_trusted=certification_trusted)
         except lean_bridge.LeanBridgeError as e:
             last_error = str(e)
             if i >= repair_iters:
                 break
             lemmas = retriever.retrieve(claim, last_error) if retriever is not None else []
+            model_calls += _model_call_cost(formalizer)
             fr2 = formalizer.formalize(ledger_text, prior_source=source,
                                        errors=[last_error], lemmas=lemmas)
             if not fr2.ok:
@@ -174,6 +253,7 @@ def formalize_and_audit(ledger_text: str, formalizer: Formalizer,
         if not audit.passed and i < repair_iters:
             last_error = "; ".join(str(f) for f in audit.rejects())
             lemmas = retriever.retrieve(claim, last_error) if retriever is not None else []
+            model_calls += _model_call_cost(formalizer)
             fr2 = formalizer.formalize(ledger_text, prior_source=source,
                                        errors=[last_error], lemmas=lemmas)
             if fr2.ok:
@@ -183,13 +263,17 @@ def formalize_and_audit(ledger_text: str, formalizer: Formalizer,
         # Accepted, or out of repair budget. Check statement faithfulness on the final proof.
         faith: Optional[FaithfulnessVerdict] = None
         if faithfulness_checker is not None:
+            model_calls += _model_call_cost(faithfulness_checker)
             faith = faithfulness_checker.check(claim, source, name)
         return FormalizeAuditResult(formalized=True, compiled=True, theorem_name=name,
                                     lean_source=source, audit=audit, faithfulness=faith,
-                                    attempts=attempts)
+                                    attempts=attempts, model_calls=model_calls,
+                                    certification_trusted=certification_trusted)
 
     return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
-                                lean_source=source, error=last_error, attempts=repair_iters + 1)
+                                lean_source=source, error=last_error, attempts=repair_iters + 1,
+                                model_calls=model_calls,
+                                certification_trusted=certification_trusted)
 
 
 @dataclass
@@ -204,7 +288,7 @@ class FullVerifyResult:
         # deterministic gate qualifies — `admitted_deterministically` also accepts NEEDS_REVIEW and is
         # therefore too weak for the authoritative verdict.
         return bool(self.gate.verdict is Verdict.PASSED_DETERMINISTIC
-                    and self.lean is not None and self.lean.authoritative)
+                    and self.lean is not None and self.lean.authoritative is True)
 
     def summary(self) -> str:
         g = self.gate.summary()
@@ -290,7 +374,8 @@ def make_node_gate(formalizer: Formalizer, toolkit: Optional[Toolkit] = None,
 
     A SIBLING of `make_terminal_gate` (whose semantics are untouched). It formalizes a SINGLE node's
     proof, compiles it, and runs the Layer-4 dependency/axiom audit — but per the open-decision default
-    its per-leaf AUTHORITY is `elementary_verified` ONLY (compiled AND audit.passed). It deliberately
+    its per-leaf AUTHORITY is `elementary_verified` ONLY (compiled, audit-passed, and carrying a
+    bridge-verified toolchain/manifest receipt). It deliberately
     passes `faithfulness_checker=None`: per-leaf statement-faithfulness is DEFERRED to the root terminal
     gate (`make_terminal_gate`), which checks the assembled proof faithfully captures the ROOT goal. A
     leaf only needs to be *audited elementary*; running an expensive faithfulness panel at every leaf
@@ -343,14 +428,17 @@ def formalize_sketch_and_audit(parent_goal: str, sketch_text: str, child_goals: 
     optional Lean-error repair loop. Mirrors `formalize_and_audit` but drives the formalizer's
     `formalize_sketch(parent_goal, sketch_text, child_goals)` path. The emitted theorem is SORRY-FREE
     (the children are HYPOTHESES, not sorries), so `audit_lean_source` is reused verbatim and
-    `.elementary_verified` means the COMPOSITION compiled AND the body's deps/axioms are elementary."""
+    `.elementary_verified` means the COMPOSITION compiled, the body's deps/axioms are elementary,
+    and the toolchain/manifest receipt was bridge-verified."""
+    _validate_repair_iters(repair_iters)
     toolkit = toolkit or load_toolkit()
     if project_dir is None and server is None:
         project_dir = lean_bridge.find_mathlib_project()
 
+    model_calls = _model_call_cost(formalizer)
     fr = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals)
     if not fr.ok:
-        return FormalizeAuditResult(formalized=False, notes=fr.notes)
+        return FormalizeAuditResult(formalized=False, notes=fr.notes, model_calls=model_calls)
     source, name = fr.lean_source, fr.theorem_name
     last_error: Optional[str] = None
 
@@ -362,12 +450,14 @@ def formalize_sketch_and_audit(parent_goal: str, sketch_text: str, child_goals: 
                 project_dir=project_dir, timeout_s=timeout_s, server=server)
         except lean_bridge.LeanUnavailable as e:
             return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
-                                        lean_source=source, error=str(e), attempts=attempts)
+                                        lean_source=source, error=str(e), attempts=attempts,
+                                        model_calls=model_calls, lean_unavailable=True)
         except lean_bridge.LeanBridgeError as e:
             last_error = str(e)
             if i >= repair_iters:
                 break
             lemmas = retriever.retrieve(parent_goal, last_error) if retriever is not None else []
+            model_calls += _model_call_cost(formalizer)
             fr2 = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals,
                                               prior_source=source, errors=[last_error], lemmas=lemmas)
             if not fr2.ok:
@@ -380,6 +470,7 @@ def formalize_sketch_and_audit(parent_goal: str, sketch_text: str, child_goals: 
         if not audit.passed and i < repair_iters:
             last_error = "; ".join(str(f) for f in audit.rejects())
             lemmas = retriever.retrieve(parent_goal, last_error) if retriever is not None else []
+            model_calls += _model_call_cost(formalizer)
             fr2 = formalizer.formalize_sketch(parent_goal, sketch_text, child_goals,
                                               prior_source=source, errors=[last_error], lemmas=lemmas)
             if fr2.ok:
@@ -388,13 +479,15 @@ def formalize_sketch_and_audit(parent_goal: str, sketch_text: str, child_goals: 
 
         faith: Optional[FaithfulnessVerdict] = None
         if faithfulness_checker is not None:
+            model_calls += _model_call_cost(faithfulness_checker)
             faith = faithfulness_checker.check(parent_goal, source, name)
         return FormalizeAuditResult(formalized=True, compiled=True, theorem_name=name,
                                     lean_source=source, audit=audit, faithfulness=faith,
-                                    attempts=attempts)
+                                    attempts=attempts, model_calls=model_calls)
 
     return FormalizeAuditResult(formalized=True, compiled=False, theorem_name=name,
-                                lean_source=source, error=last_error, attempts=repair_iters + 1)
+                                lean_source=source, error=last_error, attempts=repair_iters + 1,
+                                model_calls=model_calls)
 
 
 def make_sketch_gate(formalizer: SketchFormalizer, toolkit: Optional[Toolkit] = None,
@@ -409,7 +502,8 @@ def make_sketch_gate(formalizer: SketchFormalizer, toolkit: Optional[Toolkit] = 
     A SIBLING of `make_node_gate` (the LEAF gate, whose semantics are untouched). It formalizes the
     decomposition SKETCH as a SORRY-FREE Lean theorem proving the parent ASSUMING the children as
     hypotheses (the LEAP §2.2/§2.5 composition step), compiles it, and runs the Layer-4 audit. Per the
-    open-decision default its authority is `elementary_verified` ONLY (compiled AND audit.passed): the
+    open-decision default its authority is `elementary_verified` ONLY (compiled, audit-passed, and
+    provenance-verified): the
     sketch COMPILED (the composition is Lean-valid) AND the body's axioms/deps are elementary.
 
     It passes `faithfulness_checker=None`: composition-level faithfulness is DEFERRED to the root

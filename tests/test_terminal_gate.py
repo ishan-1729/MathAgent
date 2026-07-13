@@ -1,6 +1,9 @@
 """Tests for the DAG terminal gate (Layer 4 as the terminal authoritative gate) + proof bundling."""
 import json
 from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
 
 from agent.orchestrator.dag import ProofDAG
 from agent.orchestrator.dag_driver import DagDriver
@@ -28,6 +31,7 @@ class DictProver:
 @dataclass
 class FakeTerminal:
     authoritative: bool
+    certification_trusted: bool = False
     called_with: tuple = ()
 
 
@@ -58,7 +62,7 @@ def test_terminal_gate_called_on_proof():
     def gate(goal, proof_text):
         captured["goal"] = goal
         captured["proof_text"] = proof_text
-        return FakeTerminal(authoritative=True)
+        return FakeTerminal(authoritative=True, certification_trusted=True)
 
     res = DagDriver(DictProver({"G": _valid("G")}), toolkit=TOOLKIT, budget=Budget(),
                     trace=RunTrace("t"), terminal_gate=gate).run("G")
@@ -67,6 +71,30 @@ def test_terminal_gate_called_on_proof():
     assert "G" in captured["proof_text"]               # the bundle includes the goal
     assert res.terminal is not None and res.authoritative_elementary
     assert res.trace.by_kind("terminal_gate")
+
+
+def test_untrusted_duck_typed_terminal_cannot_mint_authority():
+    """Only the trusted certification boundary may mint the public authoritative bit."""
+    res = DagDriver(
+        DictProver({"G": _valid("G")}), toolkit=TOOLKIT, budget=Budget(), trace=RunTrace("t"),
+        terminal_gate=lambda _goal, _proof: FakeTerminal(authoritative=True),
+    ).run("G")
+    assert res.proven and not res.authoritative_elementary
+    event = res.trace.by_kind("terminal_gate")[-1]
+    assert event.data["authoritative"] is False
+    assert event.data["certification_trusted"] is False
+
+
+@pytest.mark.parametrize("malformed", ["false", 1, object()])
+def test_trusted_terminal_requires_literal_true_authority(malformed):
+    """A trusted boundary must not truthy-promote malformed provider output."""
+    res = DagDriver(
+        DictProver({"G": _valid("G")}), toolkit=TOOLKIT, budget=Budget(), trace=RunTrace("t"),
+        terminal_gate=lambda _goal, _proof: SimpleNamespace(
+            authoritative=malformed, certification_trusted=True),
+    ).run("G")
+    assert res.proven and not res.authoritative_elementary
+    assert res.trace.by_kind("terminal_gate")[-1].data["authoritative"] is False
 
 
 def test_terminal_gate_rejection_blocks_authoritative():
@@ -82,6 +110,16 @@ def test_no_terminal_gate_means_not_authoritative():
                     trace=RunTrace("t")).run("G")
     assert res.proven
     assert res.terminal is None and not res.authoritative_elementary
+
+
+def test_dag_result_sixth_positional_argument_remains_terminal():
+    """Backward compatibility: candidate metadata must not shift the exported positional API."""
+    from agent.orchestrator.dag_driver import DagResult
+
+    terminal = FakeTerminal(authoritative=False)
+    result = DagResult("G", True, ProofDAG(), RunTrace("compat"), Budget(), terminal)
+    assert result.terminal is terminal
+    assert result.candidate is None
 
 
 def test_terminal_gate_skipped_when_unproven():

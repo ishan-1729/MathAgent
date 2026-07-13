@@ -1,5 +1,10 @@
 # Codex-backed DAG harness — adapting AlphaProof_Nexus + LEAP
 
+> **Historical snapshot (2026-06).** This document records the original Codex-only prototype and its
+> then-current gaps; it is not the current build status or invocation guide. The provider-neutral
+> registry, population search, and Lean Layer-4 authority described in
+> [`system_design.md`](system_design.md) and [`build_status.md`](build_status.md) supersede it.
+
 This documents how MathAgent realizes **LEAP's AND-OR DAG + memoization** and the
 **AlphaProof_Nexus harness**, substituting **Codex / GPT-5.5-xHigh** for the proprietary AlphaProof
 prover. The deterministic gate (`agent/gates/`) stays authoritative; Codex is only the

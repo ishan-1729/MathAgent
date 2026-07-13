@@ -73,6 +73,56 @@ def test_parse_schema_violation_bad_id():
         parse_ledger(bad)
 
 
+def test_parse_rejects_newline_suffixed_id_despite_regex_dollar_semantics():
+    bad = minimal_ledger()
+    bad["steps"][0]["id"] = "s1\n"
+    with pytest.raises(LedgerError, match="invalid step id"):
+        parse_ledger(bad)
+
+
+def test_parse_rejects_cyclic_programmatic_container_before_schema_walk():
+    bad = minimal_ledger()
+    bad["cycle"] = bad
+    with pytest.raises(LedgerError, match="acyclic JSON tree"):
+        parse_ledger(bad)
+
+
+def test_parse_enforces_aggregate_container_bound(monkeypatch):
+    import agent.gates.ledger as ledger_mod
+    monkeypatch.setattr(ledger_mod, "_MAX_LEDGER_CONTAINER_ITEMS", 5)
+    with pytest.raises(LedgerError, match="containers exceed"):
+        parse_ledger(minimal_ledger())
+
+
+def test_parse_preflights_oversized_steps_before_jsonschema(monkeypatch):
+    import agent.gates.ledger as ledger_mod
+
+    class _ForbiddenValidator:
+        def iter_errors(self, _obj):
+            raise AssertionError("oversized steps reached jsonschema error amplification")
+
+    monkeypatch.setattr(ledger_mod, "_VALIDATOR", _ForbiddenValidator())
+    bad = minimal_ledger()
+    bad["steps"] = [{} for _ in range(ledger_mod._MAX_LEDGER_STEPS + 1)]
+    with pytest.raises(LedgerError, match="steps.*exceeds"):
+        parse_ledger(bad)
+
+
+def test_parse_rejects_excessive_programmatic_nesting_before_schema():
+    import agent.gates.ledger as ledger_mod
+
+    bad = minimal_ledger()
+    nested = []
+    cursor = nested
+    for _ in range(ledger_mod._MAX_LEDGER_NESTING + 1):
+        child = []
+        cursor.append(child)
+        cursor = child
+    bad["unexpected"] = nested
+    with pytest.raises(LedgerError, match="nesting exceeds"):
+        parse_ledger(bad)
+
+
 def test_nfc_normalization():
     d = minimal_ledger()
     # 'e' + combining acute accent should normalize to precomposed 'é'.
@@ -150,7 +200,7 @@ def test_orphan_step_is_info_not_reject(toolkit):
         "steps": [
             {"id": "s1", "claim": "used", "justification": "given", "depends_on": []},
             {"id": "s2", "claim": "orphan", "justification": "algebra", "depends_on": []},
-            {"id": "s3", "claim": "done", "justification": "conclusion", "depends_on": ["s1"]},
+            {"id": "s3", "claim": "c", "justification": "conclusion", "depends_on": ["s1"]},
         ],
     }
     led = parse_ledger(d)
@@ -193,6 +243,21 @@ def test_goal_claim_mismatch_rejected(toolkit):
         "steps": [
             {"id": "s1", "claim": "n is even", "justification": "algebra", "depends_on": []},
             {"id": "s2", "claim": "n is even", "justification": "conclusion", "depends_on": ["s1"]},
+        ],
+    }
+    led = parse_ledger(d)
+    assert "goal_claim_mismatch" in _codes(validate_structure(led, toolkit), Severity.REJECT)
+
+
+def test_arbitrary_goal_claim_mismatch_is_also_rejected(toolkit):
+    # A mismatch is invalid even when the terminal text does not duplicate a body step. The external
+    # goal binder is defense in depth, not a substitute for this ledger-local invariant.
+    d = {
+        "problem": "p", "claim": "n^2 is even",
+        "steps": [
+            {"id": "s1", "claim": "n is an integer", "justification": "given", "depends_on": []},
+            {"id": "s2", "claim": "an unrelated statement", "justification": "conclusion",
+             "depends_on": ["s1"]},
         ],
     }
     led = parse_ledger(d)

@@ -1,16 +1,16 @@
 """Offline tests for agent/orchestrator/builder.py (W5).
 
-No CLI / model / Lean is ever invoked: every profile here is an explicit test/offline profile whose
-roles use the SCRIPTED provider (deterministic stubs), and elementarity stays soft/none so NO Lean gate
-is ever wired. We assert:
+No CLI, model, or real Lean process is ever invoked: profiles use SCRIPTED roles, and Lean wiring
+tests replace server/gate construction with deterministic sentinels. We assert:
 
   * build_driver runs validate_profile FIRST (an inadmissible profile raises SupervisorError BEFORE any
     role is resolved / component constructed);
-  * the DEFAULT profile yields a DagDriver whose injected components match the intended (byte-identical)
-    wiring: enforce_elementarity True, decomposer+reviewer present, no comparator/refiner/terminal/per-
+  * the DEFAULT profile yields a DagDriver whose injected components match the intended current
+    wiring: enforce_elementarity True, decomposer+reviewer+proof judge present, no comparator/refiner/terminal/per-
     node gates, h0 on, budgets mapped;
   * each StageProfile knob maps to the right injected param (decompose=False -> decomposer=None, etc.);
-  * elementarity policy threads enforce_elementarity (none -> False) without wiring Lean offline;
+  * elementarity policy threads enforcement and optional per-node Lean independently of terminal
+    authority;
   * build_and_run constructs + runs end-to-end on scripted parts.
 """
 import json
@@ -20,6 +20,7 @@ import pytest
 from agent.orchestrator.builder import build_driver, build_and_run
 from agent.orchestrator.dag_driver import DagDriver, DagResult
 from agent.orchestrator.run_profile import (
+    BudgetProfile,
     ElementarityLevel,
     Mode,
     ProviderKey,
@@ -72,17 +73,46 @@ def test_build_driver_validates_before_resolving_any_role(monkeypatch):
     assert called["resolve"] == 0, "no role may be resolved before the supervisor admits the profile"
 
 
+def test_build_driver_cannot_forward_model_copy_disabled_h0(monkeypatch):
+    called = {"resolve": 0}
+
+    def spy(*_args, **_kwargs):
+        called["resolve"] += 1
+        raise AssertionError("registry must not run for an unchecked profile")
+
+    monkeypatch.setattr(registry_mod, "resolve", spy)
+    stages = StageProfile().model_copy(update={"h0_consistency": False})
+    bad = _profile().model_copy(update={"stages": stages})
+    with pytest.raises(SupervisorError, match="schema revalidation"):
+        build_driver(bad)
+    assert called["resolve"] == 0
+
+
+def test_build_driver_cannot_forward_model_copy_invalid_budget(monkeypatch):
+    called = {"resolve": 0}
+
+    def spy(*_args, **_kwargs):
+        called["resolve"] += 1
+        raise AssertionError("registry must not run for an unchecked profile")
+
+    monkeypatch.setattr(registry_mod, "resolve", spy)
+    budgets = BudgetProfile().model_copy(update={"max_llm_calls": 0})
+    bad = _profile().model_copy(update={"budgets": budgets})
+    with pytest.raises(SupervisorError, match="schema revalidation"):
+        build_driver(bad)
+    assert called["resolve"] == 0
+
+
 def test_build_driver_admissible_profile_constructs_a_driver():
     d = build_driver(_profile())
     assert isinstance(d, DagDriver)
 
 
-# ---- the DEFAULT (soft) profile: BYTE-IDENTICAL pre-feature wiring ------------------------------
+# ---- the DEFAULT (soft) profile wiring ----------------------------------------------------------
 
-def test_default_profile_wiring_is_byte_identical():
-    """A default (soft-elementarity) offline profile yields a DagDriver wired exactly like the
-    pre-feature default: enforcement ON, decomposer+reviewer present, NO comparator/refiner/terminal/
-    per-node gates, NO warm Lean server, h0 on. (Only the scripted provider differs from a live run.)"""
+def test_default_profile_wiring():
+    """The default soft profile enables enforcement, decomposition review, and proof judging, with
+    no population/refinement/Lean gates or warm server. (Only the scripted provider differs here.)"""
     d = build_driver(_profile())
     # elementarity=soft -> enforce ON, no Lean gates of any kind.
     assert d.enforce_elementarity is True
@@ -91,7 +121,7 @@ def test_default_profile_wiring_is_byte_identical():
     assert d.lean_server is None
     assert d.lean_strict is False
     # default stages: decompose + review ON; population/refine/evolve OFF.
-    assert d.decomposer is not None and d.reviewer is not None
+    assert d.decomposer is not None and d.reviewer is not None and d.judges
     assert d.comparator is None and d.population_k == 0
     assert d.refiner is None
     assert d.evolve_fallback is None
@@ -103,11 +133,18 @@ def test_default_profile_budget_and_depth_mapping():
     BudgetProfile: max_llm_calls=60, max_depth=3, max_decomp_attempts=2, episodes=3)."""
     d = build_driver(_profile())
     assert d.budget.max_llm_calls == 60
-    assert d.budget.max_replan_depth == 2            # mapped from max_decomp_attempts
+    assert d.budget.max_replan_depth == 2
     assert d.budget.max_node_verify_calls is None    # default unlimited (byte-identical sub-cap)
     assert d.max_depth == 3
     assert d.max_decomp_attempts == 2
     assert d.ralph_episodes == 3
+
+
+def test_replan_budget_is_independent_from_per_node_decomposition_attempts():
+    d = build_driver(_profile(budgets=BudgetProfile(
+        max_decomp_attempts=7, max_replan_depth=3)))
+    assert d.max_decomp_attempts == 7
+    assert d.budget.max_replan_depth == 3
 
 
 def test_resolved_components_conform_to_role_protocols():
@@ -156,12 +193,18 @@ def test_refine_true_wires_a_revision_controller():
     assert isinstance(d.refiner, RevisionController)
 
 
-def test_h0_consistency_flag_threads_through():
+def test_refiner_judge_count_comes_from_stage_profile():
+    d = build_driver(_profile(stages=StageProfile(refine=True, judges=4)))
+    assert len(d.refiner.judges) == 4
+
+
+def test_h0_consistency_is_mandatory_and_cannot_be_disabled():
     assert build_driver(_profile(stages=StageProfile(h0_consistency=True))).h0_consistency is True
-    assert build_driver(_profile(stages=StageProfile(h0_consistency=False))).h0_consistency is False
+    with pytest.raises(ValueError, match="h0_consistency"):
+        StageProfile(h0_consistency=False)
 
 
-# ---- elementarity policy -> enforce_elementarity (no Lean wired offline) ------------------------
+# ---- elementarity policy -> enforcement + optional offline-sentinel Lean wiring -----------------
 
 def test_elementarity_none_disables_enforcement_no_lean_offline():
     """elementarity=none -> enforce_elementarity=False AND no Lean gate of any kind (the policy table's
@@ -179,6 +222,82 @@ def test_elementarity_soft_enforces_without_lean():
     assert d.terminal_gate is None and d.node_verifier is None
 
 
+def test_elementarity_soft_per_node_wires_both_node_gates_and_server(monkeypatch):
+    """A validated soft+per-node profile must attach and execute its requested Lean gates.
+
+    Keep the test offline by replacing validation/tool probes, server startup, and gate factories
+    with sentinels; this verifies the profile -> policy -> builder integration rather than Lean.
+    """
+    import agent.orchestrator.builder as builder_mod
+    from agent.orchestrator.run_profile import Role
+
+    class _Server:
+        def close(self):
+            pass
+
+    class _Prover:
+        def prove(self, goal, feedback=None):
+            return json.dumps({"problem": "p", "claim": goal, "steps": [
+                {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+                {"id": "s2", "claim": goal, "justification": "conclusion",
+                 "depends_on": ["s1"]},
+            ]})
+
+    class _Verified:
+        elementary_verified = True
+        lean_unavailable = False
+        compiled = True
+        audit = None
+
+    server = _Server()
+    calls = {"warm": 0, "gates": 0, "node": 0, "sketch": 0}
+
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    monkeypatch.setitem(
+        registry_mod.PROVIDERS,
+        (Role.prover, ProviderKey.scripted),
+        lambda _spec, _deps: _Prover(),
+    )
+
+    def _fake_warm():
+        calls["warm"] += 1
+        return server
+
+    def node_gate(_goal, _ledger):
+        calls["node"] += 1
+        return _Verified()
+
+    def sketch_gate(_goal, _sketch, _children):
+        calls["sketch"] += 1
+        return _Verified()
+
+    def _fake_node_gates(profile, toolkit, actual_server, **_kwargs):
+        calls["gates"] += 1
+        assert actual_server is server
+        return node_gate, sketch_gate
+
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", _fake_warm)
+    monkeypatch.setattr(builder_mod, "_make_node_gates", _fake_node_gates)
+
+    d = build_driver(_profile(
+        elementarity=ElementarityLevel.soft,
+        stages=StageProfile(review=False),
+        lean={"per_node": True, "server": True},
+    ))
+
+    assert calls == {"warm": 1, "gates": 1, "node": 0, "sketch": 0}
+    assert d.enforce_elementarity is True
+    assert d.terminal_gate is None
+    assert d.node_verifier is node_gate and d.sketch_verifier is sketch_gate
+    assert d.lean_server is server
+
+    result = d.run("G")
+    assert result.proven
+    assert calls == {"warm": 1, "gates": 1, "node": 1, "sketch": 0}
+    root = result.dag.get(result.dag.get_or_create("G").key)
+    assert root.lean_verified is True
+
+
 def test_elementarity_none_with_a_lean_flag_is_rejected_by_supervisor():
     """The supervisor (S4) rejects elementarity=none with any Lean flag set, BEFORE the builder wires
     anything — the contradiction never reaches the driver."""
@@ -188,22 +307,39 @@ def test_elementarity_none_with_a_lean_flag_is_rejected_by_supervisor():
         build_driver(bad)
 
 
-def test_direct_mode_with_authoritative_is_rejected_by_supervisor():
-    """The supervisor (S5) rejects mode=direct + elementarity=authoritative before construction."""
-    bad = _profile(mode=Mode.direct, elementarity=ElementarityLevel.authoritative)
-    with pytest.raises(SupervisorError):
-        build_driver(bad)
+def test_direct_mode_with_authoritative_wires_terminal_gate(monkeypatch):
+    """Direct-only execution can still certify its completed root through the terminal Layer-4 gate."""
+    import agent.orchestrator.builder as builder_mod
+    # This is a wiring-only test using scripted components. Production validation correctly rejects
+    # scripted certificate roles (pinned separately below), so bypass only that outer guard here.
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    profile = _profile(
+        mode=Mode.direct,
+        elementarity=ElementarityLevel.authoritative,
+        stages=StageProfile(decompose=False, review=False),
+        lean={"terminal": True},
+    )
+    d = build_driver(profile)
+    assert d.decomposer is None
+    assert d.terminal_gate is not None
 
 
 # ---- lean.server wiring (item 3): warm the persistent server ONLY when lean.server=True ---------
 
 def _authoritative_offline(**lean_kw):
-    """An offline AUTHORITATIVE profile (scripted roles) with a consistent LeanProfile: terminal=True
-    (S9 requires terminal == authoritative). The scripted formalizer keeps the terminal gate buildable
-    offline. Extra lean_kw override the LeanProfile fields (e.g. server=True/False)."""
+    """A scripted authoritative fixture used only by wiring tests that bypass validation.
+
+    Production validation rejects its scripted certificate roles; terminal=True merely keeps the
+    policy internally coherent. Extra keywords override LeanProfile fields for a particular wiring.
+    """
     lean = {"terminal": True}
     lean.update(lean_kw)
     return _profile(elementarity=ElementarityLevel.authoritative, lean=lean)
+
+
+def test_authoritative_scripted_certificate_roles_are_rejected():
+    with pytest.raises(SupervisorError, match="scripted"):
+        build_driver(_authoritative_offline())
 
 
 def test_terminal_gate_with_server_false_does_not_warm_lean_server(monkeypatch):
@@ -211,6 +347,7 @@ def test_terminal_gate_with_server_false_does_not_warm_lean_server(monkeypatch):
     NOT warm a persistent LeanServer (the gate is threaded server=None -> per-call lean fallback)."""
     import agent.orchestrator.builder as builder_mod
     calls = {"warm": 0}
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
     monkeypatch.setattr(builder_mod, "_warm_lean_server",
                         lambda: calls.__setitem__("warm", calls["warm"] + 1) or None)
     d = build_driver(_authoritative_offline(server=False))
@@ -224,6 +361,7 @@ def test_terminal_gate_with_server_true_warms_lean_server(monkeypatch):
     import agent.orchestrator.builder as builder_mod
     sentinel = object()
     calls = {"warm": 0}
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
 
     def _fake_warm():
         calls["warm"] += 1
@@ -234,6 +372,111 @@ def test_terminal_gate_with_server_true_warms_lean_server(monkeypatch):
     assert calls["warm"] == 1
     assert d.terminal_gate is not None
     assert d.lean_server is sentinel
+
+
+def test_required_server_returning_none_fails_instead_of_downgrading(monkeypatch):
+    import agent.orchestrator.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: None)
+    with pytest.raises(SupervisorError, match="refusing to downgrade"):
+        build_driver(_authoritative_offline(server=True))
+
+
+def test_warm_server_startup_exception_is_actionable_and_fail_closed(monkeypatch):
+    import agent.gates.lean_server as lean_server_mod
+    import agent.orchestrator.builder as builder_mod
+
+    class _BrokenServer:
+        def start(self):
+            raise RuntimeError("REPL handshake failed")
+
+    monkeypatch.setattr(lean_server_mod, "LeanServer", _BrokenServer)
+    with pytest.raises(SupervisorError, match="could not be started") as ei:
+        builder_mod._warm_lean_server()
+    assert isinstance(ei.value.__cause__, RuntimeError)
+
+
+def test_warm_server_is_closed_when_gate_construction_raises(monkeypatch):
+    import agent.orchestrator.builder as builder_mod
+
+    server = _StubServer()
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: server)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("terminal gate construction failed")
+
+    monkeypatch.setattr(builder_mod, "_make_terminal_gate", _boom)
+    with pytest.raises(RuntimeError, match="terminal gate construction failed"):
+        build_driver(_authoritative_offline(server=True))
+    assert server.closed == 1
+
+
+def _evolve_offline_profile(**kw):
+    kw.setdefault("stages", StageProfile(evolve_fallback=2))
+    return _profile(**kw)
+
+
+def test_required_evolve_fallback_unavailable_fails_closed(monkeypatch):
+    import agent.tools.openevolve_bridge as evolve_mod
+    import agent.orchestrator.builder as builder_mod
+
+    monkeypatch.setattr(
+        evolve_mod.OpenEvolveBackend,
+        "available",
+        staticmethod(lambda: False),
+    )
+    with pytest.raises(SupervisorError, match="became unavailable"):
+        builder_mod._resolve_evolve_fallback(_evolve_offline_profile(), object())
+
+
+def test_required_evolve_fallback_constructor_failure_fails_closed(monkeypatch):
+    import agent.tools.openevolve_bridge as evolve_mod
+    import agent.orchestrator.builder as builder_mod
+
+    class _BrokenBackend:
+        @staticmethod
+        def available():
+            return True
+
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("backend construction failed")
+
+    monkeypatch.setattr(evolve_mod, "OpenEvolveBackend", _BrokenBackend)
+    with pytest.raises(SupervisorError, match="could not be constructed") as ei:
+        builder_mod._resolve_evolve_fallback(_evolve_offline_profile(), object())
+    assert isinstance(ei.value.__cause__, RuntimeError)
+
+
+def test_evolve_fallback_does_not_borrow_ordinary_decomposer_config(monkeypatch):
+    import agent.tools.openevolve_bridge as evolve_mod
+    import agent.orchestrator.builder as builder_mod
+
+    seen = {}
+
+    class _CapturingBackend:
+        @staticmethod
+        def available():
+            return True
+
+        def __init__(self, _toolkit, claude_cfg, **kwargs):
+            seen["cfg"] = claude_cfg
+            seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(evolve_mod, "OpenEvolveBackend", _CapturingBackend)
+    roles = _scripted_roles().model_copy(update={
+        "decomposer": RoleSpec(
+            provider=ProviderKey.codex,
+            model="gpt-5.5",
+            timeout_s=17,
+        ),
+    })
+    profile = _evolve_offline_profile(roles=roles)
+    backend = builder_mod._resolve_evolve_fallback(profile, object())
+    assert isinstance(backend, _CapturingBackend)
+    assert seen["cfg"].model == "sonnet" and seen["cfg"].timeout_s == 600
+    assert seen["kwargs"]["generations"] == 2
 
 
 # ---- memo toggle (item 5): StageProfile.memo threads into the driver ----------------------------
@@ -280,6 +523,64 @@ def test_build_and_run_returns_a_dag_result():
     res = build_and_run(_profile(), "G")
     assert isinstance(res, DagResult)
     assert res.goal == "G"
+    assert res.resolved_roles["prover"]["provider"] == "scripted"
+    assert len(res.policy_digest or "") == 64
+    assert len(res.dag.context or "") == 64
+
+
+def test_actual_fallback_selection_survives_on_result(monkeypatch):
+    """A fixed declared profile hash can execute its fallback; the result records what ran."""
+    import agent.orchestrator.builder as builder_mod
+    from agent.orchestrator import supervisor
+    from agent.orchestrator.run_profile import Mode, RoleSpec, RolesProfile
+
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    monkeypatch.setattr(
+        supervisor, "_provider_available", lambda provider: provider is ProviderKey.codex,
+    )
+    spec = RoleSpec(provider=ProviderKey.claude, fallback=ProviderKey.codex)
+    profile = _profile(
+        mode=Mode.direct,
+        roles=RolesProfile(
+            prover=spec, decomposer=spec, reviewer=spec, comparator=spec, judge=spec,
+            formalizer=spec, faithfulness=spec, refiner=spec,
+        ),
+        stages=StageProfile(decompose=False, review=False),
+    )
+    declared_hash = profile.profile_hash
+    driver = build_driver(profile)
+    driver.prover = _GoalBoundProver()
+    result = driver.run("G")
+
+    assert profile.profile_hash == declared_hash
+    assert result.resolved_roles["prover"]["provider"] == "codex"
+    assert result.resolved_roles["prover"]["fallback_selected"] is True
+
+
+def test_build_driver_rejects_unconsumed_goal_dependent_presearch(monkeypatch):
+    import agent.orchestrator.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+    with pytest.raises(SupervisorError, match="build_and_run"):
+        build_driver(_profile(stages=StageProfile(evolve=1)))
+
+
+def test_build_and_run_feeds_presearch_seed_through_ordinary_driver(monkeypatch):
+    import agent.orchestrator.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
+
+    def seed(_profile, goal, **_kwargs):
+        return json.dumps({"problem": "p", "claim": goal, "steps": [
+            {"id": "s1", "claim": "setup", "justification": "given", "depends_on": []},
+            {"id": "s2", "claim": goal, "justification": "conclusion", "depends_on": ["s1"]},
+        ]})
+
+    monkeypatch.setattr(builder_mod, "_run_profile_presearch", seed)
+    result = build_and_run(
+        _profile(stages=StageProfile(evolve=1, review=False)), "G")
+    assert result.proven
+    assert result.dag.get_or_create("G").proof_kind == "direct"
 
 
 def test_build_and_run_proves_with_a_goal_bound_scripted_prover(monkeypatch):
@@ -291,7 +592,9 @@ def test_build_and_run_proves_with_a_goal_bound_scripted_prover(monkeypatch):
     saved = registry_mod.PROVIDERS[key]
     registry_mod.PROVIDERS[key] = lambda spec, deps: _GoalBoundProver()
     try:
-        res = build_and_run(_profile(), "G")
+        # This test isolates the prover path; disabling review avoids the independent scripted judge
+        # replacing that concern with its own canned verdict.
+        res = build_and_run(_profile(stages=StageProfile(review=False)), "G")
     finally:
         registry_mod.PROVIDERS[key] = saved
     assert res.proven is True
@@ -313,6 +616,7 @@ def test_build_and_run_closes_warm_lean_server_once(monkeypatch):
     We thread a stub server through the builder's warm path and assert it is closed once after run()."""
     import agent.orchestrator.builder as builder_mod
     stub = _StubServer()
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
     monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: stub)
     res = build_and_run(_authoritative_offline(server=True), "G")
     assert isinstance(res, DagResult)
@@ -324,6 +628,7 @@ def test_build_and_run_closes_warm_lean_server_even_when_run_raises(monkeypatch)
     exception propagates, but no repl.exe leaks)."""
     import agent.orchestrator.builder as builder_mod
     stub = _StubServer()
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
     monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: stub)
 
     def _boom(self, goal, *, context=None):
@@ -347,6 +652,7 @@ def test_driver_close_is_idempotent_and_never_raises(monkeypatch):
 
     import agent.orchestrator.builder as builder_mod
     srv = _RaisingServer()
+    monkeypatch.setattr(builder_mod, "validate_profile", lambda _profile: None)
     monkeypatch.setattr(builder_mod, "_warm_lean_server", lambda: srv)
     d = build_driver(_authoritative_offline(server=True))
     assert d.lean_server is srv
@@ -367,10 +673,10 @@ def test_build_and_run_forwards_toolkit_and_trace(monkeypatch):
     import agent.orchestrator.builder as builder_mod
     real_build = builder_mod.build_driver
 
-    def spy(profile, *, toolkit=None, trace=None):
+    def spy(profile, *, toolkit=None, trace=None, **kwargs):
         seen["toolkit"] = toolkit
         seen["trace"] = trace
-        return real_build(profile, toolkit=toolkit, trace=trace)
+        return real_build(profile, toolkit=toolkit, trace=trace, **kwargs)
 
     monkeypatch.setattr(builder_mod, "build_driver", spy)
     build_and_run(_profile(), "G", toolkit=tk, trace=trace)

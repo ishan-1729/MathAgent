@@ -76,6 +76,11 @@ def evaluate(source, toolkit: Optional[Toolkit] = None) -> GateReport:
     findings: list[Finding] = []
     try:
         findings += validate_structure(ledger, toolkit)   # Layer 1a (deterministic)
+        # A malformed graph/goal binding is already a conclusive rejection. Do not let an attacker
+        # append expensive numeric obligations to a structurally invalid ledger and force work that
+        # cannot affect the verdict.
+        if any(f.severity is Severity.REJECT for f in findings):
+            return GateReport(verdict=Verdict.REJECTED, findings=findings, ledger=ledger)
         findings += check_obligations(ledger, toolkit)    # Layer 1a/3 (deterministic)
         findings += scan_prose(ledger, toolkit)           # Layer 1b (soft)
     except Exception as e:  # backstop: the gate must never crash open -> fail closed (REJECT)

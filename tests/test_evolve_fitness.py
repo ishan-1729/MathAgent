@@ -705,21 +705,23 @@ def test_vacuous_restatement_is_hard_zero(tk):
     assert score_ledger(json.dumps(led), tk, goal=led["claim"])["combined_score"] == 0.0
 
 
-def test_goal_binding_is_deterministic_hash_not_text_identity(tk):
-    # Binding is goal_hash equality, which folds notation/synonyms/spacing (e.g. "modulo" -> "mod" and
-    # a trailing period) — so a restated-but-equivalent claim still binds — yet NEVER merges distinct
-    # statements (it does not rename variables or reorder operands). An equivalent restatement binds...
-    restated = {
-        "problem": "demo", "claim": "n^2 is congruent to 0 or 1 mod 4",
+def test_goal_binding_is_deterministic_conservative_identity(tk):
+    # Authority-bearing binding permits whitespace normalization but does not guess whether notation,
+    # synonyms, or punctuation preserve meaning.  The model is instructed to restate the exact goal.
+    goal = "n^2 is congruent to 0 or 1 modulo 4."
+    exact = {
+        "problem": "demo", "claim": goal,
         "steps": [
             {"id": "h", "claim": "n is an integer.", "justification": "given", "depends_on": []},
-            {"id": "c", "claim": "n^2 is congruent to 0 or 1 modulo 4.",
+            {"id": "c", "claim": goal,
              "justification": "conclusion", "depends_on": ["h"]},
         ],
     }
-    led = parse_ledger(json.dumps(restated))
-    assert binds_to_goal(led, "n^2 is congruent to 0 or 1 modulo 4.")
-    # ...while an off-by-meaning goal (n^3, not n^2) does not.
+    led = parse_ledger(json.dumps(exact))
+    assert binds_to_goal(led, "n^2  is congruent to 0 or 1 modulo 4.")
+    # A plausible paraphrase is deliberately a cache/binding miss; false misses cost only recomputation.
+    assert not binds_to_goal(led, "n^2 is congruent to 0 or 1 mod 4")
+    # An off-by-meaning goal (n^3, not n^2) also does not bind.
     assert not binds_to_goal(led, "n^3 is congruent to 0 or 1 modulo 4.")
 
 

@@ -136,7 +136,7 @@ def test_diverging_lemma_signatures_rejected():
     }
     res = check_children_consistency(["A", "B"], proofs)
     assert not res.consistent
-    assert res.conflicts[0].kind == "lemma_signature"
+    assert res.conflicts[0].kind == "relation"
 
 
 def test_conflict_only_needs_one_pair_among_many():
@@ -152,8 +152,8 @@ def test_conflict_only_needs_one_pair_among_many():
 
 
 # ==================================================================================================
-# R1-fix: three previously-missed contradictory-sibling classes are now REJECTED (symmetrized
-# stopword/family handling), WITHOUT introducing false positives.
+# R1-fix: phrasing-variant predicate contradictions are rejected without treating compatible
+# properties (including open+closed for clopen sets) as exclusive.
 # ==================================================================================================
 
 def test_predicate_phrasing_variance_even_vs_odd_number_rejected():
@@ -183,17 +183,24 @@ def test_prime_vs_composite_siblings_rejected():
     assert res.offending_overlap == "g"
 
 
-def test_open_vs_closed_siblings_rejected():
-    # (c) open/closed: a set assumed open by one child and closed by a sibling is a genuine
-    # mutually-exclusive contradiction (a set is not generally clopen).
+def test_open_vs_closed_siblings_are_compatible_for_clopen_sets():
+    # Open and closed are NOT mutually exclusive: clopen sets exist (for example, the empty set and
+    # the whole space). H0 must not reject a valid composition merely because both properties occur.
     proofs = {
         "A": ledger("A", ["S is open"]),
         "B": ledger("B", ["S is closed"]),
     }
     res = check_children_consistency(["A", "B"], proofs)
-    assert not res.consistent
-    assert res.reason == "conflict"
-    assert res.offending_overlap == "s"
+    assert res.consistent
+    assert res.reason is None
+
+
+def test_open_vs_closed_lemma_steps_are_also_clopen_compatible():
+    proofs = {
+        "A": ledger("A", [], lemmas=["S is open"]),
+        "B": ledger("B", [], lemmas=["S is closed"]),
+    }
+    assert check_children_consistency(["A", "B"], proofs).consistent
 
 
 def test_symmetrized_families_do_not_introduce_false_positives():
@@ -211,8 +218,8 @@ def test_symmetrized_families_do_not_introduce_false_positives():
 # ==================================================================================================
 # V4-fix: lemma signatures are keyed by RELATION + subjects. Independent relations on the same
 # subjects ('g<h' vs 'g|h') no longer collide into a SPURIOUS lemma_signature 0-cocycle conflict,
-# while genuinely mutually-exclusive relations ('g<h' vs 'g>h') and the property-family contradictions
-# (prime/composite, even/odd, open/closed) are STILL rejected.
+# while genuinely incompatible relations ('g<h' vs 'g>h') and true property-family contradictions
+# (prime/composite, even/odd) are STILL rejected.
 # ==================================================================================================
 
 def test_v4_compatible_relations_on_same_subjects_do_not_conflict():
@@ -246,7 +253,7 @@ def test_v4_same_relation_phrasing_variants_still_collide_and_agree():
 
 def test_v4_mutually_exclusive_relations_on_same_subjects_rejected():
     # CONTROL: genuinely mutually-exclusive relations on the same subjects ('g < h' vs 'g >= h') are a
-    # real order contradiction -> STILL rejected as a lemma_signature conflict on subjects {g,h}.
+    # real order contradiction -> STILL rejected as a normalized relation conflict on operands {g,h}.
     proofs = {
         "A": ledger("A", [], lemmas=["g < h"]),
         "B": ledger("B", [], lemmas=["g >= h"]),
@@ -254,18 +261,15 @@ def test_v4_mutually_exclusive_relations_on_same_subjects_rejected():
     res = check_children_consistency(["A", "B"], proofs)
     assert not res.consistent
     assert res.reason == "conflict"
-    assert res.conflicts[0].kind == "lemma_signature"
+    assert res.conflicts[0].kind == "relation"
     assert res.offending_overlap == "g|h"       # the conflicting subject overlap is NAMED
 
 
 def test_v4_property_family_contradictions_via_lemma_steps_still_rejected():
-    # The three V4-genuine contradiction classes must STILL be rejected even when asserted as LEMMA
-    # steps (not just assumptions): prime/composite, even vs 'odd number', open/closed are
-    # mutually-exclusive property families keyed by RELATION (the family member) + subject.
+    # Genuine property contradictions must STILL be rejected even when asserted as LEMMA steps.
     for a_lemma, b_lemma, subj in [
         ("g is prime", "g is composite", "g"),
         ("n is even", "n is an odd number", "n"),
-        ("S is open", "S is closed", "s"),
     ]:
         res = check_children_consistency(
             ["A", "B"], {"A": ledger("A", [], lemmas=[a_lemma]),
@@ -273,6 +277,87 @@ def test_v4_property_family_contradictions_via_lemma_steps_still_rejected():
         assert not res.consistent, f"{a_lemma!r} vs {b_lemma!r} must still be rejected"
         assert res.reason == "conflict"
         assert res.offending_overlap == subj
+
+
+def test_property_lemma_direct_negation_is_rejected():
+    proofs = {
+        "A": ledger("A", [], lemmas=["n is even"]),
+        "B": ledger("B", [], lemmas=["n is not even"]),
+    }
+    res = check_children_consistency(["A", "B"], proofs)
+    assert not res.consistent
+    assert res.conflicts[0].kind == "relation"
+
+
+def test_unknown_property_lemma_direct_negation_is_also_rejected():
+    proofs = {
+        "A": ledger("A", [], lemmas=["S is connected"]),
+        "B": ledger("B", [], lemmas=["S is not connected"]),
+    }
+    res = check_children_consistency(["A", "B"], proofs)
+    assert not res.consistent
+    assert res.conflicts[0].kind == "relation"
+
+
+def test_negated_property_lemma_does_not_false_conflict_with_compatible_member():
+    # On integers, odd implies not even. Dropping the negation from a lemma relation would falsely
+    # turn this compatible pair into the exclusive positive pair even vs odd.
+    proofs = {
+        "A": ledger("A", [], lemmas=["n is not even"]),
+        "B": ledger("B", [], lemmas=["n is odd"]),
+    }
+    assert check_children_consistency(["A", "B"], proofs).consistent
+
+
+def test_property_lemma_phrasing_variants_normalize_to_the_same_signature():
+    proofs = {
+        "A": ledger("A", [], lemmas=["n is even"]),
+        "B": ledger("B", [], lemmas=["n is an even number"]),
+    }
+    assert check_children_consistency(["A", "B"], proofs).consistent
+
+
+def test_strict_and_weak_order_constraints_are_compatible():
+    proofs = {
+        "A": ledger("A", [], lemmas=["g < h"]),
+        "B": ledger("B", [], lemmas=["g <= h"]),
+    }
+    assert check_children_consistency(["A", "B"], proofs).consistent
+
+
+def test_reversed_equivalent_order_constraints_are_compatible():
+    proofs = {
+        "A": ledger("A", [], lemmas=["g < h"]),
+        "B": ledger("B", [], lemmas=["h > g"]),
+    }
+    assert check_children_consistency(["A", "B"], proofs).consistent
+
+
+def test_atomic_assumption_order_contradiction_is_rejected():
+    # Regression: assumption extraction previously ignored symbolic inequalities entirely, so these
+    # contradictory premises produced a false H0 pass.
+    proofs = {
+        "A": ledger("A", ["x > 0"]),
+        "B": ledger("B", ["x <= 0"]),
+    }
+    res = check_children_consistency(["A", "B"], proofs)
+    assert not res.consistent
+    assert res.reason == "conflict"
+    assert res.offending_overlap == "0|x"
+    assert res.conflicts[0].kind == "relation"
+
+
+def test_global_order_intersection_rejects_pairwise_compatible_triple():
+    # Each pair has a model, but all three together do not: <= and >= force equality, contradicting !=.
+    proofs = {
+        "A": ledger("A", ["x <= y"]),
+        "B": ledger("B", ["x >= y"]),
+        "C": ledger("C", ["x != y"]),
+    }
+    res = check_children_consistency(["A", "B", "C"], proofs)
+    assert not res.consistent
+    assert res.offending_overlap == "x|y"
+    assert res.conflicts[0].kind == "relation"
 
 
 # ==================================================================================================
@@ -290,6 +375,14 @@ def test_all_unparseable_proofs_is_vacuous():
     res = check_children_consistency(["A", "B"], proofs)
     assert not res.consistent
     assert res.reason == "vacuous_check"
+
+
+def test_one_uninspectable_child_fails_closed_instead_of_being_ignored():
+    proofs = {"A": ledger("A", ["x > 0"]), "B": "not a ledger"}
+    res = check_children_consistency(["A", "B"], proofs)
+    assert not res.consistent
+    assert res.reason == "incomplete_check"
+    assert res.inspected_children == 1
 
 
 def test_parsed_but_no_overlap_is_a_real_pass_not_vacuous():
@@ -314,6 +407,12 @@ def test_extract_signature_picks_up_predicate_and_binding():
     assert sig.parsed
     assert sig.predicates["n"] == "even"
     assert sig.bindings["x"] == "5"
+
+
+def test_extract_signature_counts_atomic_comparison_as_content():
+    sig = extract_signature("A", ledger("A", ["x > 0"]))
+    assert sig.parsed and sig.has_content and sig.inspectable
+    assert sig.lemma_relations["0|x"] == {"<"}
 
 
 def test_extract_signature_unparsed_has_no_content():

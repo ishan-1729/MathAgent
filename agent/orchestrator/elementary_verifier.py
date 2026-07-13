@@ -27,7 +27,8 @@ Refutation rules (each names a specific offending step where possible):
                            required obligation is missing OR self-asserted-but-false (descent that
                            does not assert strictly_decreases & stays_in_domain; bounding with no
                            inequality; a relabeled step whose obligation was stripped).
-  3. goal binding        : the terminal conclusion does not bind to the requested goal.
+  3. goal binding        : the stated claim or unique terminal conclusion does not bind to the
+                           requested goal.
 
 Everything here is deterministic and prover-independent. It NEVER execs/evals/imports model output.
 """
@@ -39,7 +40,7 @@ from typing import Optional
 from agent.gates.ledger import Ledger, parse_ledger, LedgerError
 from agent.gates.scanner import ELASTIC_JUSTIFICATIONS
 from agent.gates.toolkit import Toolkit, load_toolkit
-from agent.orchestrator.dag import goal_hash
+from agent.orchestrator.goal_binding import goal_binding_mismatches
 
 
 @dataclass(frozen=True)
@@ -144,18 +145,19 @@ def _refute_undischarged_elastic(ledger: Ledger) -> list[Refutation]:
 
 
 def _refute_goal_binding(ledger: Ledger, goal: Optional[str]) -> list[Refutation]:
-    """The terminal conclusion must bind to the requested goal (when a goal is supplied)."""
+    """The stated claim and unique terminal conclusion must bind to the requested goal."""
     if goal is None:
         return []
+    mismatches = goal_binding_mismatches(ledger, goal)
+    if not mismatches:
+        return []
     conclusions = [s for s in ledger.steps if s.justification == "conclusion"]
-    if len(conclusions) != 1:
-        return [Refutation("goal_binding",
-                           f"ledger has {len(conclusions)} conclusion steps; expected exactly one")]
-    concl = conclusions[0]
-    if goal_hash(concl.claim) != goal_hash(goal):
-        return [Refutation("goal_binding",
-                           "conclusion does not bind to the requested goal", concl.id)]
-    return []
+    step_id = conclusions[0].id if len(conclusions) == 1 and "conclusion" in mismatches else None
+    return [Refutation(
+        "goal_binding",
+        "ledger does not bind to the requested goal: " + ", ".join(mismatches),
+        step_id,
+    )]
 
 
 def refute_elementary(source, toolkit: Optional[Toolkit] = None,

@@ -33,11 +33,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
 import json
+import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -45,22 +46,19 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.orchestrator.run_profile import RunProfile
-
-# Reuse prove.py's CATEGORICAL reporting-status mapping (the single source of truth) by path-loading the
-# script (scripts/ is not a package), the SAME trick ablate.py uses. This keeps problem-runner rows on
-# the identical certification ladder the CLI and the ablation harness report.
-_PROVE_PATH = Path(__file__).resolve().parent / "prove.py"
-_spec = importlib.util.spec_from_file_location("prove_cli_for_run_problems", _PROVE_PATH)
-_prove = importlib.util.module_from_spec(_spec)
-sys.modules["prove_cli_for_run_problems"] = _prove
-_spec.loader.exec_module(_prove)
-report_status = _prove.report_status
+from agent.orchestrator.reporting import (
+    report_status, result_audit_record, result_certification_state, result_has_candidate,
+    result_proof_context, result_role_provenance,
+)
+from scripts import _benchmark_artifacts as _artifacts
 
 # The ordered row schema (stable column order for CSV + diffable JSONL keys).
 ROW_FIELDS = [
-    "problem", "tier", "profile_name", "profile_hash", "elementarity", "proven", "reporting_status",
+    "problem", "tier", "profile_name", "profile_hash", "code_revision",
+    "toolkit_policy_sha256", "proof_context_sha256", "resolved_roles", "lean_audit",
+    "elementarity", "proven", "reporting_status",
     "authoritative_elementary", "calls_spent", "max_llm_calls", "wall_s", "nodes", "proven_nodes",
-    "injected_context", "contaminated", "error",
+    "injected_context", "contaminated", "error", "artifact_error",
 ]
 
 
@@ -318,6 +316,7 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None,
     row["tier"] = problem.tier
     row["profile_name"] = profile.name
     row["profile_hash"] = profile.profile_hash
+    row["code_revision"] = _artifacts.cached_code_revision(Path(__file__).resolve().parents[1])
     row["elementarity"] = profile.elementarity.value
     row["max_llm_calls"] = profile.budgets.max_llm_calls
     row["proven"] = False
@@ -328,14 +327,19 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None,
     try:
         # PURE statement as the goal; the citable-inputs clause via the keyword-only context channel.
         res = builder(profile, statement, context=context_clause)
-        row["proven"] = bool(getattr(res, "proven", False))
-        authoritative = bool(getattr(res, "authoritative_elementary", False))
+        policy_digest = getattr(res, "policy_digest", None)
+        row["toolkit_policy_sha256"] = (
+            policy_digest if isinstance(policy_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", policy_digest) else None
+        )
+        row["resolved_roles"] = result_role_provenance(res)
+        row["proof_context_sha256"] = result_proof_context(res)
+        proven, audited, authoritative, audit_record = result_certification_state(res)
+        row["lean_audit"] = audit_record
+        row["proven"] = proven
         row["authoritative_elementary"] = authoritative
-        # "formalized" = a terminal Layer-4 gate actually ran (its result is attached), regardless of
-        # whether it certified elementary; mirrors prove.py / ablate.py reporting.
-        formalized = getattr(res, "terminal", None) is not None
         row["reporting_status"] = report_status(
-            proven=row["proven"], formalized=formalized,
+            proven=row["proven"], has_candidate=result_has_candidate(res), audited=audited,
             authoritative_elementary=authoritative).label
         budget = getattr(res, "budget", None)
         if budget is not None:
@@ -348,7 +352,16 @@ def run_one(problem: Problem, profile: RunProfile, *, builder=None,
             # directly instead of re-deriving the success set by string-matching enum NAMES.
             row["proven_nodes"] = sum(1 for n in dag.nodes.values() if getattr(n, "proven", False))
         if ledgers_dir is not None:
-            _dump_ledgers(ledgers_dir, problem, profile, res)
+            # Artifact export is diagnostic and happens after the proof outcome is known.  A full disk,
+            # permissions error, or unserialisable proof object must not rewrite a valid run outcome.
+            try:
+                _dump_ledgers(
+                    ledgers_dir, problem, profile, res,
+                    proven=row["proven"],
+                    authoritative_elementary=row["authoritative_elementary"],
+                )
+            except Exception as e:  # noqa: BLE001 — outcome is already decided; preserve it faithfully
+                row["artifact_error"] = f"{type(e).__name__}: {e}"
     except Exception as e:  # noqa: BLE001 — one bad (problem, profile) must not abort the sweep.
         row["error"] = f"{type(e).__name__}: {e}"
         row["reporting_status"] = report_status(proven=False).label
@@ -376,9 +389,14 @@ def _ledger_filename(slug: str, profile: RunProfile) -> str:
     return f"{_slug(slug)}__{_slug(profile.name)}__{profile.profile_hash[:12]}.json"
 
 
-def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res) -> None:
+def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res, *,
+                  proven: bool, authoritative_elementary: bool) -> None:
     """Dump the run's proof artifacts to ``ledgers_dir/<slug>__<safe-name>__<hash12>.json`` (best-effort:
-    missing attributes dump as null — never raises into the sweep)."""
+    missing attributes dump as null — never raises into the sweep).
+
+    Outcome flags are the strict, already-adjudicated row values.  Raw custom-builder annotations are
+    diagnostic input, not authority, and must not make the artifact disagree with its benchmark row.
+    """
     ledgers_dir.mkdir(parents=True, exist_ok=True)
     tree = None
     pt = getattr(res, "proof_tree", None)
@@ -404,18 +422,25 @@ def _dump_ledgers(ledgers_dir: Path, problem: Problem, profile: RunProfile, res)
             summ = getattr(term, "summary", None)
             terminal = {
                 "summary": summ() if callable(summ) else str(term),
-                "authoritative_elementary": getattr(res, "authoritative_elementary", None),
+                "authoritative_elementary": authoritative_elementary,
             }
     except Exception:  # noqa: BLE001 — artifact capture must never break the sweep
         terminal = None
     out = ledgers_dir / _ledger_filename(problem.slug, profile)
-    out.write_text(json.dumps({
+    payload = json.dumps({
         "problem": problem.slug, "profile": profile.name,
         "profile_hash": profile.profile_hash,
-        "proven": bool(getattr(res, "proven", False)),
+        "code_revision": _artifacts.cached_code_revision(Path(__file__).resolve().parents[1]),
+        "toolkit_policy_sha256": getattr(res, "policy_digest", None),
+        "proof_context_sha256": result_proof_context(res),
+        "resolved_roles": result_role_provenance(res),
+        "lean_audit": result_audit_record(res),
+        "proven": proven,
         "terminal": terminal,
         "proof_tree": tree, "nodes": nodes,
-    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    }, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    with out.open("x", encoding="utf-8") as fh:
+        fh.write(payload)
 
 
 def _skip_row(slug: str, problem: Optional[Problem], reason: str) -> dict:
@@ -435,7 +460,8 @@ def _skip_row(slug: str, problem: Optional[Problem], reason: str) -> dict:
 
 def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
               profiles: list[RunProfile], out: Path, *, builder=None,
-              verbose: bool = True, ledgers_dir: Optional[Path] = None) -> list[dict]:
+              verbose: bool = True, ledgers_dir: Optional[Path] = None,
+              overwrite: bool = False) -> list[dict]:
     """Run every (ready problem x profile) pair, plus one skip/error row per non-ready or unparseable
     folder, write the rows to ``out``, and return them.
 
@@ -443,21 +469,19 @@ def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
     profile-independent thing to sweep). A non-ready folder emits ONE skip row. A ready folder emits one
     run row per profile.
 
-    Durability: JSONL rows are APPENDED to ``out`` as each run finishes (a live run can take minutes to
-    hours, and a process-level crash must not lose completed rows); the final write_rows pass then
-    rewrites the file atomically-in-effect with the complete, ordered set. CSV stays end-only (no
-    incremental append with a header). Progress lines are flushed so a piped stderr shows live state."""
+    JSONL rows are fsynced to a unique ``*.incomplete`` checkpoint as each run finishes.  On success
+    that validated checkpoint is published without rewriting it.  CSV is written and fsynced as a
+    complete private checkpoint before publication. Existing output is rejected by default and a
+    destination created during the run is never clobbered. Progress lines are flushed."""
+    out = Path(out)
     rows: list[dict] = []
     incremental = out.suffix.lower() != ".csv"
-    if incremental:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("", encoding="utf-8")     # start fresh; rows land as they complete
+    checkpoint = _start_output(out, overwrite=overwrite, incremental=incremental)
 
     def _emit(row: dict) -> None:
         rows.append(row)
         if incremental:
-            with out.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({k: row[k] for k in ROW_FIELDS}, sort_keys=True) + "\n")
+            _append_jsonl_row(checkpoint, row)
 
     for slug, problem, err in problems:
         if err is not None:                       # unparseable folder -> a single error row
@@ -479,30 +503,103 @@ def run_sweep(problems: list[tuple[str, Optional[Problem], Optional[str]]],
             _emit(row)
             if verbose:
                 tag = row["error"] or row["reporting_status"]
+                if row["artifact_error"]:
+                    tag += f"; artifact_error={row['artifact_error']}"
                 print(f"#   -> proven={row['proven']} status={tag} "
                       f"injected={row['injected_context']} wall={row['wall_s']}s",
                       file=sys.stderr, flush=True)
-    write_rows(rows, out)
+    if incremental:
+        _validate_jsonl_checkpoint(checkpoint, rows)
+    else:
+        _write_csv_checkpoint(rows, checkpoint)
+    _publish_output(checkpoint, out, overwrite=overwrite)
     if verbose:
         print(f"# wrote {len(rows)} rows -> {out}", file=sys.stderr, flush=True)
     return rows
 
 
 # --------------------------------------------------------------------------------------------------
-# Output writer (JSONL default; CSV by .csv suffix) — stable field order, diffable. Mirrors ablate.py.
+# Output writers (JSONL default; CSV by .csv suffix) — durable and no-clobber by default.
 # --------------------------------------------------------------------------------------------------
-def write_rows(rows: list[dict], out: Path) -> None:
+def _row_object(row: dict) -> dict:
+    return {key: row[key] for key in ROW_FIELDS}
+
+
+def _csv_row_object(row: dict) -> dict:
+    return {
+        key: (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+              if isinstance(value, (dict, list)) else value)
+        for key, value in _row_object(row).items()
+    }
+
+
+def _jsonl_line(row: dict) -> str:
+    return json.dumps(
+        _row_object(row), sort_keys=True, ensure_ascii=False, allow_nan=False,
+    ) + "\n"
+
+
+def _checkpoint_path(out: Path) -> Path:
+    return out.with_name(f"{out.name}.{uuid.uuid4().hex}.incomplete")
+
+
+def _start_output(out: Path, *, overwrite: bool, incremental: bool) -> Path:
+    """Reject existing evidence, then allocate a run-private recovery checkpoint."""
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.suffix.lower() == ".csv":
-        with out.open("w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
-            w.writeheader()
-            for row in rows:
-                w.writerow(row)
+    if (out.exists() or out.is_symlink()) and not overwrite:
+        raise FileExistsError(f"output already exists: {out}")
+    checkpoint = _checkpoint_path(out)
+    if incremental:
+        _artifacts.prepare_text_checkpoint(checkpoint, "")
+    return checkpoint
+
+
+def _append_jsonl_row(checkpoint: Path, row: dict) -> None:
+    """Append one newline-committed row and fsync it before the next paid run starts."""
+    with checkpoint.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(_jsonl_line(row))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _write_csv_checkpoint(rows: list[dict], checkpoint: Path) -> None:
+    """Create a complete fsynced CSV checkpoint; the destination is published only afterward."""
+    with checkpoint.open("x", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(_csv_row_object(row))
+        fh.flush()
+        os.fsync(fh.fileno())
+    _artifacts.fsync_directory(checkpoint.parent)
+
+
+def _validate_jsonl_checkpoint(checkpoint: Path, rows: list[dict]) -> None:
+    loaded, durable_size = _artifacts.load_checkpoint_rows(checkpoint, max_rows=len(rows))
+    expected = [json.loads(_jsonl_line(row)) for row in rows]
+    if durable_size != checkpoint.stat().st_size or loaded != expected:
+        raise ValueError("JSONL checkpoint changed or contains a partial row before publication")
+
+
+def _publish_output(checkpoint: Path, out: Path, *, overwrite: bool) -> None:
+    # Default publication is an atomic hard-link creation, so a destination that appears during the
+    # sweep wins and is never clobbered.  --force uses atomic replacement only after the checkpoint is
+    # complete and fsynced; a crash during the sweep therefore leaves old evidence untouched.
+    _artifacts.publish_single(checkpoint, out, overwrite=overwrite)
+
+
+def write_rows(rows: list[dict], out: Path, *, overwrite: bool = False) -> None:
+    """Safely publish a complete JSONL/CSV row set without clobbering evidence by default."""
+    out = Path(out)
+    incremental = out.suffix.lower() != ".csv"
+    checkpoint = _start_output(out, overwrite=overwrite, incremental=incremental)
+    if incremental:
+        for row in rows:
+            _append_jsonl_row(checkpoint, row)
+        _validate_jsonl_checkpoint(checkpoint, rows)
     else:
-        with out.open("w", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps({k: row[k] for k in ROW_FIELDS}, sort_keys=True) + "\n")
+        _write_csv_checkpoint(rows, checkpoint)
+    _publish_output(checkpoint, out, overwrite=overwrite)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -535,8 +632,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="a RunProfile YAML to run each problem under (repeatable)")
     ap.add_argument("--out", type=Path, default=Path("runs.jsonl"), metavar="PATH",
                     help="output file (.jsonl default, or .csv) — diffable per-(problem,profile) rows")
+    ap.add_argument("--force", action="store_true",
+                    help="atomically replace an existing --out file (default: preserve and reject)")
     ap.add_argument("--timeout-s", type=int, default=None, metavar="N",
-                    help="per-run wall-clock cap (seconds); overrides each profile's roles' timeout_s")
+                    help="per-provider-call timeout (seconds); overrides each profile role timeout_s")
     ap.add_argument("--quiet", action="store_true", help="suppress per-run progress on stderr")
     ap.add_argument("--ledgers-dir", type=Path, default=None, metavar="DIR",
                     help="dump each run's proof artifacts (proof tree + per-node winning ledgers) "
@@ -545,15 +644,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _apply_timeout(profile: RunProfile, timeout_s: Optional[int]) -> RunProfile:
-    """Return ``profile`` with every role's ``timeout_s`` capped to ``timeout_s`` (a per-run wall cap),
-    or the profile unchanged when ``timeout_s`` is None. A distinct copy so the cap is reproducible in
-    the recorded profile_hash."""
+    """Override every provider call timeout through full RunProfile validation."""
     if timeout_s is None:
         return profile
-    roles = profile.roles
-    updated = {name: getattr(roles, name).model_copy(update={"timeout_s": timeout_s})
-               for name in roles.model_fields}
-    return profile.model_copy(update={"roles": roles.model_copy(update=updated)})
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or not 1 <= timeout_s <= 86_400:
+        raise ValueError("--timeout-s must be an integer in [1, 86400]")
+    payload = profile.model_dump(mode="python")
+    for name in type(profile.roles).model_fields:
+        payload["roles"][name]["timeout_s"] = timeout_s
+    return RunProfile.model_validate(payload)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -568,8 +667,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not selected:
         print(f"ERROR: no problem folders found under {args.problems_dir}", file=sys.stderr)
         return 2
-    run_sweep(selected, profiles, args.out, verbose=not args.quiet,
-              ledgers_dir=args.ledgers_dir)
+    try:
+        run_sweep(selected, profiles, args.out, verbose=not args.quiet,
+                  ledgers_dir=args.ledgers_dir, overwrite=args.force)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     return 0
 
 

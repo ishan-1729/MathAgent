@@ -53,3 +53,25 @@ def test_render_run_record_has_headings():
     for heading in ["# Run Record", "## Run ID", "## Problem", "## Proof status", "## Trace"]:
         assert heading in md
     assert "squares_mod4" in md
+
+
+def test_render_summary_reflects_actual_event_kinds_not_flatdriver_line():
+    # FIX 5: the trace summary must derive from the ACTUAL event stream. The production DagDriver's
+    # vocabulary (prove_node/decompose/terminal_gate/...) differs from the retired FlatDriver's
+    # prove/gate/judge/final, so a rendered DagDriver run must reflect ITS kinds + total — never a fixed
+    # line whose 'gate' count is structurally always 0.
+    tr = RunTrace("dag-run")
+    tr.emit("prove_node"); tr.emit("prove_node"); tr.emit("decompose"); tr.emit("terminal_gate")
+    md = tr.render_run_record({})
+    assert "4 events" in md
+    assert "prove_node=2" in md
+    assert "decompose=1" in md
+    assert "terminal_gate=1" in md
+    # the retired hardcoded FlatDriver line (with its structurally-zero 'gate') is gone.
+    assert "gate=0" not in md
+    assert "judge=0" not in md
+
+
+def test_render_summary_handles_empty_trace():
+    tr = RunTrace("empty")
+    assert "0 events" in tr.render_run_record({})

@@ -4,7 +4,7 @@ MathAgent Layer-4 extractor.
 Defines a `#audit <decl>` command that prints, to stdout, a one-line JSON dependency report for a
 compiled declaration:
 
-    MATHAGENT_AUDIT_JSON {"theorem":"...","axioms":[...],
+    MATHAGENT_AUDIT_JSON {"theorem":"...","toolchain":"...","axioms":[...],
                           "constants":[{"name":...,"kind":...,"module":...}, ...]}
 
 `module` is the constant's DECLARING module (e.g. `Mathlib.Analysis.SpecialFunctions.Trigonometric.
@@ -18,7 +18,8 @@ The Python auditor (`agent/gates/lean_audit.py`) consumes that JSON and decides 
 `lean <file>.lean` to validate the pipeline without a Mathlib build.
 
 JSON is built with `Lean.Json` (no hand-escaping). The authoritative decision logic lives in the
-toolchain-independent, fully tested Python auditor.
+toolchain-independent, fully tested Python auditor. `toolchain` is derived from the running Lean binary;
+the Python bridge adds the independently-derived Lake-manifest receipt after validating this report.
 -/
 import Lean
 open Lean
@@ -50,7 +51,7 @@ private partial def closure (env : Environment) : List Name → NameSet → Name
     else
       let seen := seen.insert n
       match env.find? n with
-      | some ci => closure env (rest ++ (usedConsts ci).toList) seen
+      | some ci => closure env ((usedConsts ci).toList ++ rest) seen
       | none    => closure env rest seen
 
 /-- Build the one-line JSON dependency report for `declName`. -/
@@ -70,7 +71,13 @@ def auditJson (declName : Name) : CoreM String := do
                           ("module", Json.str mod)]
     | none    => none)).toArray
   let axArr : Array Json := (axioms.toList.map (fun a => Json.str a.toString)).toArray
-  let tc := (← IO.getEnv "MATHAGENT_TOOLCHAIN").getD ""
+  -- Derive the toolchain from the running Lean binary.  A caller-controlled environment variable is
+  -- not provenance: it could label a v4.x process as any other release.  `Lean.toolchain` is compiled
+  -- into release binaries; development builds may leave it empty, so retain their version + git hash.
+  let tc := if Lean.toolchain.isEmpty then
+    "lean4-dev:" ++ Lean.versionString ++ ":commit:" ++ Lean.githash
+  else
+    Lean.toolchain
   let obj := Json.mkObj [
     ("theorem",   Json.str declName.toString),
     ("toolchain", Json.str tc),

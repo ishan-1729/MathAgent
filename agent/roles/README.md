@@ -1,19 +1,28 @@
 # agent/roles/
 
-System prompts for the agents in the swarm. Each role is a separate prompt file (one responsibility each),
-so they can be versioned and A/B-tested independently. Keep them concise; load shared rules from
-`agent/instructions/` rather than duplicating.
+Human-readable prompt specifications for the swarm. **Only two roles have standalone files today** —
+`prover.md` and `critic_judge.md` — and those files are documentation, not files loaded dynamically by the
+live adapters. Production Claude/Codex prompts are constructed in `agent/tools/claude_roles.py`,
+`agent/tools/codex_prover.py`, and `agent/tools/formalizer.py`. `agent/instructions/` is likewise reference
+material and is not implicitly loaded into a model prompt.
 
-Planned roles (see `../PLAN.md` §4.2):
+Registry roles (see `../orchestrator/run_profile.py` and `../orchestrator/registry.py`):
 
 | Role | Job | Key inputs |
 | --- | --- | --- |
-| **Planner / Blueprinter** | Turn the problem into an informal strategy and an AND-OR sub-lemma DAG. | problem statement, `knowledge/methods/`, `knowledge/library/` |
-| **Prover** | Produce an elementary proof (or sub-proof) for one node. | one DAG node, retrieved methods/identities |
-| **Critic / Skeptic** | Adversarially attack a candidate proof for gaps and hidden non-elementary steps. | a candidate proof |
-| **Elementary Judge** | Soft pre-commit gate: is every step within the allowed toolkit? Prune violators before they enter the DAG. | a candidate step/decomposition + `agent/instructions/elementary_proof_rules.md` |
-| **Lean Liaison** | (advisory in v1) Draft Lean statements/sketches, read diagnostics, run the dependency audit. | informal proof, Lean tooling |
-| **Evaluator** | Score the run against `benchmarks/evaluation/metrics.md`; write the run record. | final artifact |
+| **Prover** | Produce a goal-bound step-ledger for one node; retry with gate/judge feedback. | goal, closed justification vocabulary, feedback/context |
+| **Decomposer / Blueprinter** | Produce a ledger sketch plus the exact child-goal set for an AND node. | goal, feedback/context |
+| **Decomposition reviewer** | Decide whether a proposed decomposition is useful and elementary before commit. | goal, sketch, child goals |
+| **Full-ledger judge** | Review a parsed direct proof for both elementarity and logical gaps inside the Ralph loop. | parsed ledger |
+| **Comparator** | Compare two decomposition candidates for population ranking. | candidate pair |
+| **Refiner** | Run the optional critic→author→synthesizer→judge incumbent tournament. | goal, incumbent ledger |
+| **Formalizer** | Translate a ledger or composition sketch to Lean and repair it from compiler/audit feedback. | ledger/sketch, errors, retrieved lemmas |
+| **Faithfulness checker** | Adversarially compare the Lean statement with the informal claim through four lenses. | informal claim, Lean source, theorem name |
 
-> The Elementary Judge is a **soft** lever (ranking/pruning) — it is *not* the authoritative gate. The
-> authoritative gate is the deterministic auditor in `agent/gates/`. See `../PLAN.md` §5.
+`stages.review=false` disables both the decomposition reviewer and the full-ledger judge; it does not
+change deterministic ledger validation. The refiner's judge panel is separately controlled by
+`stages.judges` and only exists when refinement is enabled.
+
+All reviewers and judges are **soft** search controls, not certification authorities. The terminal Lean
+dependency/axiom audit plus trusted statement-faithfulness path is authoritative. Scripted roles are test
+doubles and are untrusted for certification by default.
